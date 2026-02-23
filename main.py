@@ -37,7 +37,7 @@ async def analyze_stock(data: List[dict] = Body(...)):
 
     # 4. Retour des résultats à n8n
     return {
-"ticker": last_row.get('ticker'),
+"ticker": last_row.get('ticker', 'UNKNOWN').upper(),
         "date": last_row.get('date'),
         "rsi_14": round(rsi_value, 2),
         "vol_avg_20": round(vol_avg, 2),
