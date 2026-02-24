@@ -10,10 +10,15 @@ app = FastAPI()
 
 # Configuration de la base de données Railway
 DATABASE_URL = os.getenv('DATABASE_URL')
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL)
+if DATABASE_URL:
+    # Nettoyage de l'URL pour SQLAlchemy (Postgres -> Postgressql)
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(DATABASE_URL)
+else:
+    engine = None
+    print("ATTENTION : DATABASE_URL non trouvée. Le mode analyse sera indisponible.")
 
 @app.get("/")
 def home():
