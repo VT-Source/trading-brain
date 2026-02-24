@@ -2,3 +2,6 @@ fastapi
 uvicorn
 pandas
 pandas_ta
+sqlalchemy
+psycopg2-binary
+python-dotenv
