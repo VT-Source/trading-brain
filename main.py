@@ -22,7 +22,13 @@ else:
 
 @app.get("/")
 def home():
-    return {"status": "Service Trading Actif", "version": "1.3", "mode": "Hybrid DB-Centric"}
+   @app.get("/run-analysis")
+async def trigger_analysis():
+    try:
+        run_analysis() # C'est la fonction de calcul qu'on a créée
+        return {"status": "success", "message": "Analyse technique complétée"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 def run_analysis():
     """Fonction principale de calcul appelée par n8n via 'Execute Command'"""
