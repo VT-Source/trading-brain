@@ -8,33 +8,38 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 
-# Configuration de la base de données Railway
+# 1. Configuration de la base de données Railway
 DATABASE_URL = os.getenv('DATABASE_URL')
-
 if DATABASE_URL:
-    # Nettoyage de l'URL pour SQLAlchemy (Postgres -> Postgressql)
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     engine = create_engine(DATABASE_URL)
 else:
     engine = None
-    print("ATTENTION : DATABASE_URL non trouvée. Le mode analyse sera indisponible.")
+    print("ATTENTION : DATABASE_URL non trouvée.")
 
+# 2. Points d'entrée de l'API (FastAPI)
 @app.get("/")
 def home():
-   @app.get("/run-analysis")
+    return {"status": "Service Trading Actif", "version": "1.4"}
+
+@app.get("/run-analysis")
 async def trigger_analysis():
+    """Route appelée par n8n pour déclencher les calculs"""
     try:
-        run_analysis() # C'est la fonction de calcul qu'on a créée
+        run_analysis()
         return {"status": "success", "message": "Analyse technique complétée"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# 3. Logique de calcul
 def run_analysis():
-    """Fonction principale de calcul appelée par n8n via 'Execute Command'"""
-    print("Début de l'analyse technique via la base de données...")
+    if engine is None:
+        raise Exception("Connexion à la base de données impossible")
+
+    print("Début de l'analyse technique...")
     
-    # 1. Chargement des données depuis Postgres
+    # Lecture des données
     query = "SELECT * FROM actions_prix_historique ORDER BY ticker, date"
     df = pd.read_sql(query, engine)
     
@@ -42,22 +47,16 @@ def run_analysis():
         print("Erreur : La table est vide.")
         return
 
-    # 2. Calculs techniques (par groupe de ticker pour ne pas mélanger les actions)
-    # On utilise prix_ajuste pour le RSI !
+    # Calculs techniques par ticker
     df['rsi_14'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.rsi(x, length=14))
-    
-    # Moyenne de volume sur 20 jours
     df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20).mean())
 
-    # 3. Logique du Signal d'Achat (Calculé pour chaque ligne)
-    # Signal si RSI < 35 et Volume actuel > Moyenne 20 jours
+    # Signal d'Achat
     df['signal_achat'] = (df['rsi_14'] < 35) & (df['volume'] > df['vol_avg_20'])
 
-    # 4. Sauvegarde/Mise à jour de la table
-    # On utilise 'replace' pour mettre à jour toutes les colonnes d'un coup
+    # Mise à jour de la base
     df.to_sql('actions_prix_historique', engine, if_exists='replace', index=False)
-    print("Analyse terminée. Base de données mise à jour avec succès.")
+    print("Analyse terminée. Base mise à jour.")
 
 if __name__ == "__main__":
-    # Permet de lancer le script manuellement ou via n8n avec : python main.py
     run_analysis()
