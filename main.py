@@ -33,7 +33,7 @@ def run_analysis():
     
     try:
         # 1. Lecture
-        df = pd.read_sql("SELECT * FROM actions_prix_historique ORDER BY ticker, date", engine)
+        df = pd.read_sql('SELECT * FROM "public"."actions_prix_historique" ORDER BY ticker, date', engine)
         if df.empty: return
 
         # 2. Calculs techniques (Vectorisés)
