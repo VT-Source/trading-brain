@@ -84,18 +84,13 @@ def run_analysis():
 
         df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(get_bb_lower)
 
-       # --- Nouveaux Calculs de sécurité ---
-        df['prix_veille'] = df.groupby('ticker')['prix_ajuste'].shift(1)
-        df['rsi_veille'] = df.groupby('ticker')['rsi_14'].shift(1)
-
-        # --- SIGNAL D'ACHAT SÉCURISÉ ---
+        # --- Signal d'Achat Amélioré ---
+        # Conditions : RSI Bas + Volume Haut + Tendance Haussière (Prix > SMA200) + Extension Basse (Prix <= BB_Lower)
         df['signal_achat'] = (
-            (df['sma_200'].notnull()) &           # On a assez de données
-            (df['prix_ajuste'] > df['sma_200']) & # Tendance haussière LT
-            (df['rsi_veille'] < 30) &             # On ÉTAIT en survente...
-            (df['rsi_14'] >= 30) &                # ...mais on en SORT (Rebond)
-            (df['prix_ajuste'] > df['prix_veille']) & # Journée positive
-            (df['volume'] > df['vol_avg_20'] * 1.2)   # Volume de conviction
+            (df['rsi_14'] < 35) & 
+            (df['volume'] > df['vol_avg_20']) & 
+            (df['prix_ajuste'] > df['sma_200']) & 
+            (df['prix_ajuste'] <= df['bb_lower'])
         ).fillna(False)
 
         # --- Sauvegarde ---
@@ -121,3 +116,4 @@ def run_analysis():
 
     except Exception as e:
         print(f"❌ Erreur : {e}")
+
