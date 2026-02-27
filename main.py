@@ -1,11 +1,15 @@
 import os
 import time
 import requests
+import pickle
 import pandas as pd
 import pandas_ta as ta
 from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+
+# Import de ta fonction d'entraînement
+from train_model import train_brain
 
 load_dotenv()
 
@@ -13,7 +17,7 @@ app = FastAPI()
 
 # --- Configuration DB ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-ALPHA_VANTAGE_KEY = "6LSG483HD1NHNK2R" # Ta clé API
+ALPHA_VANTAGE_KEY = "6LSG483HD1NHNK2R"
 engine = None
 
 if DATABASE_URL:
@@ -26,47 +30,49 @@ if DATABASE_URL:
 @app.get("/")
 def home():
     return {
-        "status": "Service Trading Actif", 
-        "version": "3.2", 
-        "features": ["ML-Ready", "AlphaVantage-Sync", "Fix-Numpy-Types"]
+        "status": "Service Trading IA Actif", 
+        "version": "4.0", 
+        "features": ["Cloud-ML-Training", "AlphaVantage-Sync", "AI-Predictions"]
     }
 
-# --- ENDPOINT 1 : ANALYSE TECHNIQUE (Quotidien) ---
+# --- ENDPOINT 1 : ENTRAÎNEMENT ---
+@app.get("/train-model")
+async def trigger_training(background_tasks: BackgroundTasks):
+    background_tasks.add_task(train_brain)
+    return {"status": "processing", "message": "Entraînement du cerveau lancé en tâche de fond..."}
+
+# --- ENDPOINT 2 : SYNC METADATA ---
+@app.get("/sync-metadata")
+async def trigger_sync(background_tasks: BackgroundTasks):
+    from main import sync_metadata_logic # Import interne pour éviter les conflits
+    background_tasks.add_task(sync_metadata_logic)
+    return {"status": "processing", "message": "Synchronisation Alpha Vantage lancée..."}
+
+# --- ENDPOINT 3 : ANALYSE + PRÉDICTION IA ---
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_analysis_logic)
-    return {"status": "processing", "message": "Calculs techniques et Target ML lancés..."}
-
-# --- ENDPOINT 2 : SYNC METADATA (Hebdomadaire/Cron) ---
-@app.get("/sync-metadata")
-async def trigger_sync(background_tasks: BackgroundTasks):
-    background_tasks.add_task(sync_metadata_logic)
-    return {"status": "processing", "message": "Synchronisation des secteurs et P/E Ratios lancée..."}
+    return {"status": "processing", "message": "Analyse technique et Prédictions IA lancées..."}
 
 def sync_metadata_logic():
     if engine is None: return
-    print("🔄 Démarrage de la synchronisation Alpha Vantage...")
-    
-    # On cherche les tickers inconnus OU mis à jour il y a plus de 30 jours
+    print("🔄 Sync Alpha Vantage...")
     query = """
         SELECT DISTINCT ticker FROM actions_prix_historique
         WHERE ticker NOT IN (SELECT ticker FROM tickers_info)
         OR ticker IN (SELECT ticker FROM tickers_info WHERE derniere_maj < CURRENT_DATE - INTERVAL '30 days')
         LIMIT 20;
     """
-    
     try:
         with engine.connect() as conn:
             tickers = [row[0] for row in conn.execute(text(query))]
 
         for ticker in tickers:
-            print(f"🚀 Tentative pour {ticker}...")
             url = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}'
             r = requests.get(url)
             data = r.json()
 
             if "Symbol" in data:
-                # CORRECTION : Conversion explicite pour éviter l'erreur numpy.int64
                 m_cap_raw = pd.to_numeric(data.get("MarketCapitalization"), errors='coerce')
                 pe_ratio_raw = pd.to_numeric(data.get("PERatio"), errors='coerce')
 
@@ -77,84 +83,83 @@ def sync_metadata_logic():
                     "industrie": data.get("Industry"),
                     "pays": data.get("Country"),
                     "monnaie": data.get("Currency"),
-                    # On force le type Python standard int/float ou None
                     "market_cap": int(m_cap_raw) if pd.notnull(m_cap_raw) else None,
                     "pe_ratio": float(pe_ratio_raw) if pd.notnull(pe_ratio_raw) else None
                 }
-
                 with engine.begin() as conn:
                     conn.execute(text("""
                         INSERT INTO tickers_info (ticker, name, secteur, industrie, pays, monnaie, market_cap, pe_ratio, derniere_maj)
                         VALUES (:ticker, :name, :secteur, :industrie, :pays, :monnaie, :market_cap, :pe_ratio, CURRENT_DATE)
-                        ON CONFLICT (ticker) DO UPDATE SET
-                            pe_ratio = EXCLUDED.pe_ratio,
-                            market_cap = EXCLUDED.market_cap,
-                            derniere_maj = CURRENT_DATE;
+                        ON CONFLICT (ticker) DO UPDATE SET pe_ratio = EXCLUDED.pe_ratio, market_cap = EXCLUDED.market_cap, derniere_maj = CURRENT_DATE;
                     """), metadata)
-                print(f"✅ {ticker} synchronisé avec succès.")
-            else:
-                print(f"⚠️ Pas de données Symbol pour {ticker}. Réponse API : {data}")
-            
-            time.sleep(15) # Pause de sécurité pour la limite Alpha Vantage
-            
+                print(f"✅ {ticker} synchronisé.")
+            time.sleep(15)
     except Exception as e:
-        print(f"❌ Erreur Sync Metadata: {e}")
+        print(f"❌ Erreur Sync: {e}")
 
 def run_analysis_logic():
     if engine is None: return
-    print("🚀 Démarrage de l'analyse technique...")
+    print("🚀 Démarrage de l'analyse avec IA...")
     
     try:
-        query = 'SELECT * FROM public."actions_prix_historique" ORDER BY ticker, date'
+        # 1. Charger les données (Prix + Secteurs)
+        query = """
+            SELECT a.*, t.secteur, t.market_cap, t.pe_ratio 
+            FROM actions_prix_historique a
+            LEFT JOIN tickers_info t ON a.ticker = t.ticker
+            ORDER BY a.ticker, a.date
+        """
         df = pd.read_sql(query, engine)
         if df.empty: return
 
-        # Préparation
+        # 2. Calculs Techniques
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
-        df = df.sort_values(['ticker', 'date'])
-        df['prix_ajuste'] = pd.to_numeric(df['prix_ajuste'], errors='coerce')
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-
-        # Indicateurs
         df['rsi_14'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.rsi(x, length=14))
         df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20).mean())
         df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200).mean())
-        
-        def get_bb_lower(x):
-            if len(x) < 20: return pd.Series([None] * len(x))
-            return ta.bbands(x, length=20, std=2).iloc[:, 0]
-        df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(get_bb_lower)
-
+        df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.bbands(x, length=20, std=2).iloc[:, 0] if len(x) >= 20 else None)
         df['prix_veille'] = df.groupby('ticker')['prix_ajuste'].shift(1)
 
-        # Signal d'Achat
+        # 3. Charger le modèle IA depuis la base de données
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT model_data, columns_data FROM models_store WHERE model_name='trading_forest'")).fetchone()
+        
+        if res:
+            print("🧠 Modèle trouvé ! Prédiction en cours...")
+            model = pickle.loads(res[0])
+            model_cols = pickle.loads(res[1])
+
+            # Préparer les données pour le modèle (Features)
+            features_df = df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'secteur', 'market_cap', 'pe_ratio']].copy()
+            features_df = pd.get_dummies(features_df, columns=['secteur'])
+            
+            # Aligner les colonnes avec celles du modèle (ajouter les secteurs manquants)
+            for col in model_cols:
+                if col not in features_df.columns:
+                    features_df[col] = 0
+            features_df = features_df[model_cols] # Réordonner
+
+            # Prédire la probabilité de succès (0.0 à 1.0)
+            df['score_ia'] = model.predict_proba(features_df.fillna(0))[:, 1]
+        else:
+            print("⚠️ Aucun modèle trouvé dans models_store. Score IA = 0.")
+            df['score_ia'] = 0
+
+        # 4. Signal d'Achat (Indicateurs + Confiance IA > 60%)
         df['signal_achat'] = (
-            (df['rsi_14'] < 35) & 
-            (df['volume'] > df['vol_avg_20']) & 
-            (df['prix_ajuste'] > df['sma_200']) & 
-            (df['prix_ajuste'] <= df['bb_lower']) &
-            (df['prix_ajuste'] > df['prix_veille'])
+            (df['rsi_14'] < 35) & (df['prix_ajuste'] > df['sma_200']) & 
+            (df['prix_ajuste'] <= df['bb_lower']) & (df['score_ia'] >= 0.6)
         ).fillna(False)
 
-        # Target ML (+6% à 30 jours)
-        df['max_30j'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.shift(-30).rolling(window=30, min_periods=1).max())
-        df['target_ml'] = ((df['max_30j'] - df['prix_ajuste']) / df['prix_ajuste'] >= 0.06).astype(int)
-
-        # Sauvegarde via table temporaire pour performance
-        calc_cols = ['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'target_ml']
-        df[calc_cols].to_sql("_calc_tmp_v3", engine, if_exists='replace', index=False)
-
+        # 5. Sauvegarde
+        df[['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia']].to_sql("_tmp_v4", engine, if_exists='replace', index=False)
         with engine.begin() as conn:
             conn.execute(text("""
-                UPDATE public."actions_prix_historique" a
+                UPDATE actions_prix_historique a
                 SET rsi_14 = t.rsi_14, vol_avg_20 = t.vol_avg_20, sma_200 = t.sma_200, 
-                    bb_lower = t.bb_lower, signal_achat = t.signal_achat, target_ml = t.target_ml
-                FROM _calc_tmp_v3 t
-                WHERE a.ticker = t.ticker AND a.date = t.date;
+                    bb_lower = t.bb_lower, signal_achat = t.signal_achat, score_ia = t.score_ia
+                FROM _tmp_v4 t WHERE a.ticker = t.ticker AND a.date = t.date;
             """))
-            conn.execute(text('DROP TABLE IF EXISTS _calc_tmp_v3;'))
-
-        print("✅ Analyse technique et Target ML terminées.")
-
+        print("✅ Analyse et Prédictions terminées.")
     except Exception as e:
-        print(f"❌ Erreur Analyse: {e}")
+        print(f"❌ Erreur Analyse IA: {e}")
