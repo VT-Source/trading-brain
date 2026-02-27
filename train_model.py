@@ -1,70 +1,67 @@
 import pandas as pd
+import io
+import pickle
 from sqlalchemy import create_engine, text
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-import joblib
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Connexion DB (Même logique que main.py)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
+DATABASE_URL = os.getenv("DATABASE_URL").replace("postgres://", "postgresql://", 1)
 engine = create_engine(DATABASE_URL)
 
 def train_brain():
-    print("🧠 Récupération des données pour l'entraînement...")
+    print("🧠 Cloud Training : Chargement des données...")
     
-    # Jointure entre tes prix (indicateurs) et tes infos d'entreprise
     query = """
-        SELECT 
-            a.rsi_14, a.vol_avg_20, a.sma_200, a.bb_lower,
-            t.secteur, t.market_cap, t.pe_ratio,
-            a.target_ml
+        SELECT a.rsi_14, a.vol_avg_20, a.sma_200, a.bb_lower,
+               t.secteur, t.market_cap, t.pe_ratio, a.target_ml
         FROM actions_prix_historique a
         JOIN tickers_info t ON a.ticker = t.ticker
-        WHERE a.rsi_14 IS NOT NULL 
-          AND a.target_ml IS NOT NULL 
-          AND t.secteur IS NOT NULL
+        WHERE a.rsi_14 IS NOT NULL AND a.target_ml IS NOT NULL AND t.secteur IS NOT NULL
     """
     
     df = pd.read_sql(query, engine)
     
     if len(df) < 50:
-        print(f"⚠️ Pas assez de données ({len(df)} lignes). Continue à synchroniser tes tickers !")
+        print("❌ Données insuffisantes.")
         return
 
-    print(f"📊 Données chargées : {len(df)} lignes.")
-
-    # 1. Préparation : Transformer le texte (Secteur) en nombres (One-Hot Encoding)
-    # L'IA ne comprend pas "Technology", elle comprend 0 ou 1.
+    # Préparation
     df = pd.get_dummies(df, columns=['secteur'])
-    
-    # 2. Séparation Features (X) et Cible (y)
     X = df.drop('target_ml', axis=1)
     y = df['target_ml']
+    cols = list(X.columns)
 
-    # Sauvegarder la liste des colonnes pour que main.py sache dans quel ordre envoyer les données
-    model_columns = list(X.columns)
-    joblib.dump(model_columns, 'model_columns.joblib')
-
-    # 3. Entraînement
-    print("🏗️ Apprentissage du modèle (Random Forest)...")
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+    # Entraînement
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+    model = RandomForestClassifier(n_estimators=100, max_depth=10)
     model.fit(X_train, y_train)
-
-    # 4. Score
     score = model.score(X_test, y_test)
-    print(f"✅ Modèle prêt ! Précision : {round(score * 100, 2)}%")
 
-    # 5. Sauvegarde locale (sur le disque Railway temporaire ou ton PC)
-    joblib.dump(model, 'trading_model.joblib')
-    print("💾 Fichiers sauvegardés : trading_model.joblib et model_columns.joblib")
+    # --- SAUVEGARDE DANS LA DB (Format Binaire) ---
+    print(f"💾 Sauvegarde du modèle (Précision: {round(score*100, 2)}%)...")
+    
+    model_binary = pickle.dumps(model)
+    cols_binary = pickle.dumps(cols)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO models_store (model_name, model_data, columns_data, accuracy, updated_at)
+            VALUES ('trading_forest', :m_data, :c_data, :acc, CURRENT_TIMESTAMP)
+            ON CONFLICT (model_name) DO UPDATE SET
+                model_data = EXCLUDED.model_data,
+                columns_data = EXCLUDED.columns_data,
+                accuracy = EXCLUDED.accuracy,
+                updated_at = CURRENT_TIMESTAMP;
+        """), {"m_data": model_binary, "c_data": cols_binary, "acc": score})
+
+    print("✅ Cerveau sauvegardé dans la table models_store.")
+
+if __name__ == "__main__":
+    train_brain()
 
 if __name__ == "__main__":
     train_brain()
