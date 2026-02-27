@@ -6,3 +6,5 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 requests
+scikit-learn
+joblist
