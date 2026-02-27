@@ -1,4 +1,6 @@
 import os
+import time
+import requests
 import pandas as pd
 import pandas_ta as ta
 from fastapi import FastAPI, BackgroundTasks
@@ -7,11 +9,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CRUCIAL : Railway cherche cet objet 'app' ---
 app = FastAPI()
 
 # --- Configuration DB ---
 DATABASE_URL = os.getenv("DATABASE_URL")
+ALPHA_VANTAGE_KEY = "6LSG483HD1NHNK2R" # Ta clé API
 engine = None
 
 if DATABASE_URL:
@@ -19,46 +21,92 @@ if DATABASE_URL:
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     if DATABASE_URL.endswith("/") and "?" not in DATABASE_URL:
         DATABASE_URL = DATABASE_URL[:-1]
-
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        connect_args={"options": "-csearch_path=public"}
-    )
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 @app.get("/")
 def home():
-    return {"status": "Service Trading Actif", "version": "3.0", "features": ["ML-Ready", "SMA200", "Bollinger"]}
+    return {
+        "status": "Service Trading Actif", 
+        "version": "3.1", 
+        "features": ["ML-Ready", "AlphaVantage-Sync", "PE-Ratio-Tracking"]
+    }
 
+# --- ENDPOINT 1 : ANALYSE TECHNIQUE (Quotidien) ---
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_analysis)
-    return {"status": "processing", "message": "Calculs V3 (Préparation ML) lancés..."}
+    background_tasks.add_task(run_analysis_logic)
+    return {"status": "processing", "message": "Calculs techniques et Target ML lancés..."}
 
-def run_analysis():
-    if engine is None:
-        print("❌ Engine non initialisé")
-        return
+# --- ENDPOINT 2 : SYNC METADATA (Hebdomadaire/Cron) ---
+@app.get("/sync-metadata")
+async def trigger_sync(background_tasks: BackgroundTasks):
+    background_tasks.add_task(sync_metadata_logic)
+    return {"status": "processing", "message": "Synchronisation des secteurs et P/E Ratios lancée..."}
 
-    print("🚀 Démarrage de l'analyse (V3 - Machine Learning Preparation)...")
-    table_name = "actions_prix_historique"
-    schema_name = "public"
-
+def sync_metadata_logic():
+    if engine is None: return
+    print("🔄 Démarrage de la synchronisation Alpha Vantage...")
+    
+    # On cherche les tickers inconnus OU mis à jour il y a plus de 30 jours
+    query = """
+        SELECT DISTINCT ticker FROM actions_prix_historique
+        WHERE ticker NOT IN (SELECT ticker FROM tickers_info)
+        OR ticker IN (SELECT ticker FROM tickers_info WHERE derniere_maj < CURRENT_DATE - INTERVAL '30 days')
+        LIMIT 20;
+    """
+    
     try:
-        # 1. Lecture
-        query = f'SELECT * FROM {schema_name}."{table_name}" ORDER BY ticker, date'
-        df = pd.read_sql(query, engine)
-        if df.empty:
-            print("⚠️ Table vide.")
-            return
+        with engine.connect() as conn:
+            tickers = [row[0] for row in conn.execute(text(query))]
 
-        # 2. Préparation
+        for ticker in tickers:
+            url = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}'
+            r = requests.get(url)
+            data = r.json()
+
+            if "Symbol" in data:
+                metadata = {
+                    "ticker": data.get("Symbol"),
+                    "name": data.get("Name"),
+                    "secteur": data.get("Sector"),
+                    "industrie": data.get("Industry"),
+                    "pays": data.get("Country"),
+                    "monnaie": data.get("Currency"),
+                    "market_cap": pd.to_numeric(data.get("MarketCapitalization"), errors='coerce'),
+                    "pe_ratio": pd.to_numeric(data.get("PERatio"), errors='coerce')
+                }
+
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO tickers_info (ticker, name, secteur, industrie, pays, monnaie, market_cap, pe_ratio, derniere_maj)
+                        VALUES (:ticker, :name, :secteur, :industrie, :pays, :monnaie, :market_cap, :pe_ratio, CURRENT_DATE)
+                        ON CONFLICT (ticker) DO UPDATE SET
+                            pe_ratio = EXCLUDED.pe_ratio,
+                            market_cap = EXCLUDED.market_cap,
+                            derniere_maj = CURRENT_DATE;
+                    """), metadata)
+                print(f"✅ {ticker} synchronisé.")
+            
+            time.sleep(12) # Respect de la limite 5 req/min
+            
+    except Exception as e:
+        print(f"❌ Erreur Sync Metadata: {e}")
+
+def run_analysis_logic():
+    if engine is None: return
+    print("🚀 Démarrage de l'analyse technique...")
+    
+    try:
+        query = 'SELECT * FROM public."actions_prix_historique" ORDER BY ticker, date'
+        df = pd.read_sql(query, engine)
+        if df.empty: return
+
+        # Préparation
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
         df = df.sort_values(['ticker', 'date'])
         df['prix_ajuste'] = pd.to_numeric(df['prix_ajuste'], errors='coerce')
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
 
-        # 3. Calculs Techniques
+        # Indicateurs
         df['rsi_14'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.rsi(x, length=14))
         df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20).mean())
         df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200).mean())
@@ -68,10 +116,9 @@ def run_analysis():
             return ta.bbands(x, length=20, std=2).iloc[:, 0]
         df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(get_bb_lower)
 
-        # Sécurité de rebond (Prix > Prix Veille)
         df['prix_veille'] = df.groupby('ticker')['prix_ajuste'].shift(1)
 
-        # 4. Signal d'Achat (Tes critères validés + Rebond)
+        # Signal d'Achat
         df['signal_achat'] = (
             (df['rsi_14'] < 35) & 
             (df['volume'] > df['vol_avg_20']) & 
@@ -80,37 +127,25 @@ def run_analysis():
             (df['prix_ajuste'] > df['prix_veille'])
         ).fillna(False)
 
-        # 5. Calcul de la Target pour le ML (+6% à 30 jours)
-        # On regarde le futur : quel est le prix max sur les 30 prochains jours ?
-        df['max_30j'] = (
-            df.groupby('ticker')['prix_ajuste']
-            .transform(lambda x: x.shift(-30).rolling(window=30, min_periods=1).max())
-        )
-        # Target = 1 si le gain max futur a atteint +6%
+        # Target ML (+6% à 30 jours)
+        df['max_30j'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.shift(-30).rolling(window=30, min_periods=1).max())
         df['target_ml'] = ((df['max_30j'] - df['prix_ajuste']) / df['prix_ajuste'] >= 0.06).astype(int)
 
-        # 6. Sauvegarde via table temporaire
+        # Sauvegarde
         calc_cols = ['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'target_ml']
-        tmp_table = "_calc_tmp_ml"
-        
-        df[calc_cols].to_sql(tmp_table, engine, if_exists='replace', index=False, schema=schema_name)
+        df[calc_cols].to_sql("_calc_tmp_v3", engine, if_exists='replace', index=False)
 
         with engine.begin() as conn:
-            conn.execute(text(f"""
-                UPDATE {schema_name}."{table_name}" a
-                SET rsi_14 = t.rsi_14, 
-                    vol_avg_20 = t.vol_avg_20, 
-                    sma_200 = t.sma_200, 
-                    bb_lower = t.bb_lower, 
-                    signal_achat = t.signal_achat, 
-                    target_ml = t.target_ml
-                FROM {schema_name}."{tmp_table}" t
+            conn.execute(text("""
+                UPDATE public."actions_prix_historique" a
+                SET rsi_14 = t.rsi_14, vol_avg_20 = t.vol_avg_20, sma_200 = t.sma_200, 
+                    bb_lower = t.bb_lower, signal_achat = t.signal_achat, target_ml = t.target_ml
+                FROM _calc_tmp_v3 t
                 WHERE a.ticker = t.ticker AND a.date = t.date;
             """))
-            conn.execute(text(f'DROP TABLE IF EXISTS {schema_name}."{tmp_table}";'))
+            conn.execute(text('DROP TABLE IF EXISTS _calc_tmp_v3;'))
 
-        print(f"✅ Analyse terminée. Données prêtes pour le ML.")
+        print("✅ Analyse technique et Target ML terminées.")
 
     except Exception as e:
-        print(f"❌ Erreur : {e}")
-
+        print(f"❌ Erreur Analyse: {e}")
