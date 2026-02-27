@@ -4,6 +4,7 @@ import requests
 import pickle
 import pandas as pd
 import pandas_ta as ta
+import yfinance as yf # Ajout de la lib
 from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -32,7 +33,7 @@ def home():
     return {
         "status": "Service Trading IA Actif", 
         "version": "4.0", 
-        "features": ["Cloud-ML-Training", "AlphaVantage-Sync", "AI-Predictions"]
+        "features": ["Cloud-ML-Training", "YahooFinance-Sync", "AI-Predictions"]
     }
 
 # --- ENDPOINT 1 : ENTRAÎNEMENT ---
@@ -46,7 +47,7 @@ async def trigger_training(background_tasks: BackgroundTasks):
 async def trigger_sync(background_tasks: BackgroundTasks):
     from main import sync_metadata_logic # Import interne pour éviter les conflits
     background_tasks.add_task(sync_metadata_logic)
-    return {"status": "processing", "message": "Synchronisation Alpha Vantage lancée..."}
+    return {"status": "processing", "message": "Synchronisation Yahoo Finance lancée..."}
 
 # --- ENDPOINT 3 : ANALYSE + PRÉDICTION IA ---
 @app.get("/run-analysis")
@@ -56,44 +57,53 @@ async def trigger_analysis(background_tasks: BackgroundTasks):
 
 def sync_metadata_logic():
     if engine is None: return
-    print("🔄 Sync Alpha Vantage...")
+    print("🔄 Sync Yahoo Finance (Metadata)...")
     query = """
         SELECT DISTINCT ticker FROM actions_prix_historique
         WHERE ticker NOT IN (SELECT ticker FROM tickers_info)
         OR ticker IN (SELECT ticker FROM tickers_info WHERE derniere_maj < CURRENT_DATE - INTERVAL '30 days')
-        LIMIT 20;
+        LIMIT 100;
     """
     try:
         with engine.connect() as conn:
             tickers = [row[0] for row in conn.execute(text(query))]
 
-        for ticker in tickers:
-            url = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}'
-            r = requests.get(url)
-            data = r.json()
+        for ticker_symbol in tickers:
+            try:
+                # Utilisation de yfinance au lieu de requests.get(alphavantage)
+                stock = yf.Ticker(ticker_symbol)
+                data = stock.info
 
-            if "Symbol" in data:
-                m_cap_raw = pd.to_numeric(data.get("MarketCapitalization"), errors='coerce')
-                pe_ratio_raw = pd.to_numeric(data.get("PERatio"), errors='coerce')
+                if "symbol" in data or "longName" in data:
+                    m_cap_raw = data.get("marketCap")
+                    pe_ratio_raw = data.get("trailingPE")
 
-                metadata = {
-                    "ticker": data.get("Symbol"),
-                    "name": data.get("Name"),
-                    "secteur": data.get("Sector"),
-                    "industrie": data.get("Industry"),
-                    "pays": data.get("Country"),
-                    "monnaie": data.get("Currency"),
-                    "market_cap": int(m_cap_raw) if pd.notnull(m_cap_raw) else None,
-                    "pe_ratio": float(pe_ratio_raw) if pd.notnull(pe_ratio_raw) else None
-                }
-                with engine.begin() as conn:
-                    conn.execute(text("""
-                        INSERT INTO tickers_info (ticker, name, secteur, industrie, pays, monnaie, market_cap, pe_ratio, derniere_maj)
-                        VALUES (:ticker, :name, :secteur, :industrie, :pays, :monnaie, :market_cap, :pe_ratio, CURRENT_DATE)
-                        ON CONFLICT (ticker) DO UPDATE SET pe_ratio = EXCLUDED.pe_ratio, market_cap = EXCLUDED.market_cap, derniere_maj = CURRENT_DATE;
-                    """), metadata)
-                print(f"✅ {ticker} synchronisé.")
-            time.sleep(15)
+                    metadata = {
+                        "ticker": ticker_symbol,
+                        "name": data.get("longName"),
+                        "secteur": data.get("sector"),
+                        "industrie": data.get("industry"),
+                        "pays": data.get("country"),
+                        "monnaie": data.get("currency"),
+                        "market_cap": int(m_cap_raw) if m_cap_raw else None,
+                        "pe_ratio": float(pe_ratio_raw) if pe_ratio_raw else None
+                    }
+                    
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO tickers_info (ticker, name, secteur, industrie, pays, monnaie, market_cap, pe_ratio, derniere_maj)
+                            VALUES (:ticker, :name, :secteur, :industrie, :pays, :monnaie, :market_cap, :pe_ratio, CURRENT_DATE)
+                            ON CONFLICT (ticker) DO UPDATE SET 
+                                pe_ratio = EXCLUDED.pe_ratio, 
+                                market_cap = EXCLUDED.market_cap, 
+                                derniere_maj = CURRENT_DATE;
+                        """), metadata)
+                    print(f"✅ {ticker_symbol} synchronisé.")
+                
+                time.sleep(1) # Pause courte pour Yahoo
+            except Exception as e:
+                print(f"⚠️ Erreur ticker {ticker_symbol}: {e}")
+                
     except Exception as e:
         print(f"❌ Erreur Sync: {e}")
 
