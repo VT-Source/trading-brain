@@ -8,3 +8,4 @@ python-dotenv
 requests
 scikit-learn
 joblist
+yfinance
