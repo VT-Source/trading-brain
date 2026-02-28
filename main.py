@@ -31,8 +31,8 @@ if DATABASE_URL:
 def home():
     return {
         "status": "Service Trading IA Actif", 
-        "version": "4.2", 
-        "features": ["Anti-Deadlock-System", "Target-Labeling", "AI-Predictions"]
+        "version": "4.3", 
+        "features": ["Fix-Casting-Date", "Target-Labeling", "Anti-Deadlock"]
     }
 
 # --- ENDPOINT 1 : ENTRAÎNEMENT ---
@@ -109,24 +109,31 @@ def run_analysis_logic():
     print("🚀 Démarrage de l'analyse avec IA...")
     
     try:
-        # 1. Charger les données (Prix + Secteurs)
+        # 1. Charger les données
         query = """
             SELECT a.*, t.secteur, t.market_cap, t.pe_ratio 
             FROM actions_prix_historique a
             LEFT JOIN tickers_info t ON a.ticker = t.ticker
-            ORDER BY a.ticker, a.date
         """
         df = pd.read_sql(query, engine)
         if df.empty: 
             print("⚠️ Base de données vide.")
             return
 
+        # --- CORRECTION : FORMATAGE ET TRI ---
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        df = df.sort_values(['ticker', 'date'])
+        print(f"📊 Calcul des indicateurs sur {len(df)} lignes...")
+
         # 2. Calculs Techniques
-        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
         df['rsi_14'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.rsi(x, length=14))
-        df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20).mean())
-        df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200).mean())
-        df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.bbands(x, length=20, std=2).iloc[:, 0] if len(x) >= 20 else None)
+        df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20, min_periods=1).mean())
+        df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200, min_periods=10).mean())
+        
+        def get_bb(x):
+            if len(x) < 20: return pd.Series([None] * len(x), index=x.index)
+            return ta.bbands(x, length=20, std=2).iloc[:, 0]
+        df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(get_bb)
 
         # 3. Charger le modèle IA
         with engine.connect() as conn:
@@ -136,16 +143,12 @@ def run_analysis_logic():
             print("🧠 Modèle trouvé ! Prédiction en cours...")
             model = pickle.loads(res[0])
             model_cols = pickle.loads(res[1])
-
             features_df = df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'secteur', 'market_cap', 'pe_ratio']].copy()
             features_df = pd.get_dummies(features_df, columns=['secteur'])
-            
             for col in model_cols:
-                if col not in features_df.columns:
-                    features_df[col] = 0
-            features_df = features_df[model_cols]
-
-            df['score_ia'] = model.predict_proba(features_df.fillna(0))[:, 1]
+                if col not in features_df.columns: features_df[col] = 0
+            features_df = features_df[model_cols].fillna(0)
+            df['score_ia'] = model.predict_proba(features_df)[:, 1]
         else:
             print("⚠️ Aucun modèle trouvé. Score IA = 0.")
             df['score_ia'] = 0
@@ -156,24 +159,24 @@ def run_analysis_logic():
             (df['prix_ajuste'] <= df['bb_lower']) & (df['score_ia'] >= 0.6)
         ).fillna(False)
 
-        # --- ÉTAPE : CALCUL DU TARGET ML (VÉRITÉ TERRAIN) ---
-        print("🎯 Calcul du Target ML (+5% à 7 jours)...")
+        # 5. Calcul Target ML
+        print("🎯 Calcul du Target ML...")
         df['prix_futur'] = df.groupby('ticker')['prix_ajuste'].shift(-7)
-        df['gain_pct'] = (df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste']
-        df['target_ml'] = df['gain_pct'].apply(lambda x: 1 if x >= 0.05 else (0 if pd.notnull(x) else None))
+        df['target_ml'] = ((df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste'] >= 0.05).map({True: 1, False: 0})
 
-        # 5. SAUVEGARDE SÉCURISÉE (Anti-Deadlock)
-        print("💾 Préparation de la table temporaire...")
+        # 6. SAUVEGARDE SÉCURISÉE AVEC CASTING DE DATE
+        print("💾 Préparation de la sauvegarde...")
         cols_to_save = ['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia', 'target_ml']
         
-        # On écrit d'abord les résultats dans une table de transit
-        df[cols_to_save].to_sql("_tmp_analysis", engine, if_exists='replace', index=False)
+        # Copie propre pour la table temporaire
+        df_save = df[cols_to_save].copy()
+        df_save['date'] = df_save['date'].astype(str) # String ISO pour PostgreSQL
         
-        print("⚡ Verrouillage et mise à jour de la table principale...")
+        df_save.to_sql("_tmp_analysis", engine, if_exists='replace', index=False)
+        
+        print("⚡ Mise à jour de la table principale...")
         with engine.begin() as conn:
-            # On demande un accès exclusif court pour éviter les collisions avec n8n
             conn.execute(text("LOCK TABLE actions_prix_historique IN EXCLUSIVE MODE;"))
-            
             conn.execute(text("""
                 UPDATE actions_prix_historique a
                 SET rsi_14 = t.rsi_14, 
@@ -184,9 +187,9 @@ def run_analysis_logic():
                     score_ia = t.score_ia,
                     target_ml = t.target_ml
                 FROM _tmp_analysis t 
-                WHERE a.ticker = t.ticker AND a.date = t.date;
+                WHERE a.ticker = t.ticker AND a.date::DATE = t.date::DATE;
             """))
-        print("✅ Analyse, Labellisation et Prédictions terminées avec succès.")
+        print("✅ Analyse et mise à jour terminées avec succès.")
 
     except Exception as e:
-        print(f"❌ Erreur Analyse IA: {e}")
+        print(f"❌ Erreur critique Analyse: {e}")
