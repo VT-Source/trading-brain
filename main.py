@@ -31,8 +31,8 @@ if DATABASE_URL:
 def home():
     return {
         "status": "Service Trading IA Actif", 
-        "version": "4.3", 
-        "features": ["Fix-Casting-Date", "Target-Labeling", "Anti-Deadlock"]
+        "version": "4.5", 
+        "features": ["Force-Numeric-Calculation", "Target-Labeling-Fix", "Anti-Deadlock"]
     }
 
 # --- ENDPOINT 1 : ENTRAÎNEMENT ---
@@ -106,7 +106,7 @@ def sync_metadata_logic():
 
 def run_analysis_logic():
     if engine is None: return
-    print("🚀 Démarrage de l'analyse avec IA...")
+    print("🚀 Démarrage de l'analyse (Version 4.5 - Force Calcul)...")
     
     try:
         # 1. Charger les données
@@ -120,55 +120,72 @@ def run_analysis_logic():
             print("⚠️ Base de données vide.")
             return
 
-        # --- CORRECTION : FORMATAGE ET TRI ---
+        # --- NETTOYAGE ET TRI ---
         df['date'] = pd.to_datetime(df['date']).dt.date
         df = df.sort_values(['ticker', 'date'])
-        print(f"📊 Calcul des indicateurs sur {len(df)} lignes...")
-
-        # 2. Calculs Techniques
-        df['rsi_14'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.rsi(x, length=14))
-        df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20, min_periods=1).mean())
-        df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200, min_periods=10).mean())
         
-        def get_bb(x):
-            if len(x) < 20: return pd.Series([None] * len(x), index=x.index)
-            return ta.bbands(x, length=20, std=2).iloc[:, 0]
-        df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(get_bb)
+        # SÉCURITÉ : Forcer le format numérique (Crucial pour pandas_ta)
+        df['prix_ajuste'] = pd.to_numeric(df['prix_ajuste'], errors='coerce')
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        
+        print(f"📊 Données prêtes : {len(df)} lignes. Calcul des indicateurs...")
 
-        # 3. Charger le modèle IA
+        # 2. CALCULS TECHNIQUES (Méthode robuste avec lambdas sécurisées)
+        def compute_rsi(x):
+            try:
+                res = ta.rsi(x, length=14)
+                return res if res is not None else pd.Series([None] * len(x), index=x.index)
+            except:
+                return pd.Series([None] * len(x), index=x.index)
+
+        df['rsi_14'] = df.groupby('ticker')['prix_ajuste'].transform(compute_rsi)
+        
+        # SMA et Volume : Utilisation du rolling standard de Pandas (très fiable)
+        df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200, min_periods=10).mean())
+        df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20, min_periods=1).mean())
+        
+        # Bollinger :
+        def compute_bb_lower(x):
+            try:
+                if len(x) < 20: return pd.Series([None] * len(x), index=x.index)
+                bands = ta.bbands(x, length=20, std=2)
+                return bands.iloc[:, 0] if bands is not None else pd.Series([None] * len(x), index=x.index)
+            except:
+                return pd.Series([None] * len(x), index=x.index)
+        
+        df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(compute_bb_lower)
+
+        # 3. PRÉDICTION IA (Si modèle présent)
         with engine.connect() as conn:
             res = conn.execute(text("SELECT model_data, columns_data FROM models_store WHERE model_name='trading_forest'")).fetchone()
         
         if res:
-            print("🧠 Modèle trouvé ! Prédiction en cours...")
+            print("🧠 Modèle trouvé ! Prédiction...")
             model = pickle.loads(res[0])
             model_cols = pickle.loads(res[1])
             features_df = df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'secteur', 'market_cap', 'pe_ratio']].copy()
             features_df = pd.get_dummies(features_df, columns=['secteur'])
             for col in model_cols:
                 if col not in features_df.columns: features_df[col] = 0
-            features_df = features_df[model_cols].fillna(0)
-            df['score_ia'] = model.predict_proba(features_df)[:, 1]
+            df['score_ia'] = model.predict_proba(features_df[model_cols].fillna(0))[:, 1]
         else:
-            print("⚠️ Aucun modèle trouvé. Score IA = 0.")
+            print("ℹ️ Aucun modèle en DB. Score IA = 0.")
             df['score_ia'] = 0
 
-        # 4. Signal d'Achat
+        # 4. SIGNAL D'ACHAT ET TARGET ML
         df['signal_achat'] = (
-            (df['rsi_14'] < 35) & (df['prix_ajuste'] > df['sma_200']) & 
-            (df['prix_ajuste'] <= df['bb_lower']) & (df['score_ia'] >= 0.6)
+            (df['rsi_14'] < 35) & 
+            (df['prix_ajuste'] > df['sma_200']) & 
+            (df['score_ia'] >= 0.6)
         ).fillna(False)
 
-        # 5. Calcul Target ML
         print("🎯 Calcul du Target ML...")
         df['prix_futur'] = df.groupby('ticker')['prix_ajuste'].shift(-7)
         df['target_ml'] = ((df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste'] >= 0.05).map({True: 1, False: 0})
 
-        # 6. SAUVEGARDE SÉCURISÉE AVEC CASTING DE DATE
+        # 5. SAUVEGARDE SÉCURISÉE
         print("💾 Préparation de la sauvegarde...")
         cols_to_save = ['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia', 'target_ml']
-        
-        # Copie propre pour la table temporaire
         df_save = df[cols_to_save].copy()
         df_save['date'] = df_save['date'].astype(str) # String ISO pour PostgreSQL
         
@@ -184,12 +201,12 @@ def run_analysis_logic():
                     sma_200 = t.sma_200, 
                     bb_lower = t.bb_lower, 
                     signal_achat = t.signal_achat, 
-                    score_ia = t.score_ia,
+                    score_ia = t.score_ia, 
                     target_ml = t.target_ml
                 FROM _tmp_analysis t 
                 WHERE a.ticker = t.ticker AND a.date::DATE = t.date::DATE;
             """))
-        print("✅ Analyse et mise à jour terminées avec succès.")
+        print("✅ Analyse et mise à jour terminées avec succès !")
 
     except Exception as e:
-        print(f"❌ Erreur critique Analyse: {e}")
+        print(f"❌ Erreur critique lors de l'analyse : {e}")
