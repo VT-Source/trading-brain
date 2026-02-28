@@ -60,7 +60,7 @@ def sync_metadata_logic():
         SELECT DISTINCT ticker FROM actions_prix_historique
         WHERE ticker NOT IN (SELECT ticker FROM tickers_info)
         OR ticker IN (SELECT ticker FROM tickers_info WHERE derniere_maj < CURRENT_DATE - INTERVAL '30 days')
-        LIMIT 100;
+        LIMIT 500;
     """
     try:
         with engine.connect() as conn:
