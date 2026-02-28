@@ -4,7 +4,7 @@ import requests
 import pickle
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf # Ajout de la lib
+import yfinance as yf
 from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -18,7 +18,6 @@ app = FastAPI()
 
 # --- Configuration DB ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-ALPHA_VANTAGE_KEY = "6LSG483HD1NHNK2R"
 engine = None
 
 if DATABASE_URL:
@@ -32,8 +31,8 @@ if DATABASE_URL:
 def home():
     return {
         "status": "Service Trading IA Actif", 
-        "version": "4.0", 
-        "features": ["Cloud-ML-Training", "YahooFinance-Sync", "AI-Predictions"]
+        "version": "4.1", 
+        "features": ["Cloud-ML-Training", "YahooFinance-Sync", "AI-Predictions", "Target-Labeling"]
     }
 
 # --- ENDPOINT 1 : ENTRAÎNEMENT ---
@@ -45,7 +44,6 @@ async def trigger_training(background_tasks: BackgroundTasks):
 # --- ENDPOINT 2 : SYNC METADATA ---
 @app.get("/sync-metadata")
 async def trigger_sync(background_tasks: BackgroundTasks):
-    from main import sync_metadata_logic # Import interne pour éviter les conflits
     background_tasks.add_task(sync_metadata_logic)
     return {"status": "processing", "message": "Synchronisation Yahoo Finance lancée..."}
 
@@ -70,7 +68,6 @@ def sync_metadata_logic():
 
         for ticker_symbol in tickers:
             try:
-                # Utilisation de yfinance au lieu de requests.get(alphavantage)
                 stock = yf.Ticker(ticker_symbol)
                 data = stock.info
 
@@ -100,7 +97,7 @@ def sync_metadata_logic():
                         """), metadata)
                     print(f"✅ {ticker_symbol} synchronisé.")
                 
-                time.sleep(1) # Pause courte pour Yahoo
+                time.sleep(1)
             except Exception as e:
                 print(f"⚠️ Erreur ticker {ticker_symbol}: {e}")
                 
@@ -120,7 +117,9 @@ def run_analysis_logic():
             ORDER BY a.ticker, a.date
         """
         df = pd.read_sql(query, engine)
-        if df.empty: return
+        if df.empty: 
+            print("⚠️ Base de données vide.")
+            return
 
         # 2. Calculs Techniques
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
@@ -128,9 +127,8 @@ def run_analysis_logic():
         df['vol_avg_20'] = df.groupby('ticker')['volume'].transform(lambda x: x.rolling(window=20).mean())
         df['sma_200'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: x.rolling(window=200).mean())
         df['bb_lower'] = df.groupby('ticker')['prix_ajuste'].transform(lambda x: ta.bbands(x, length=20, std=2).iloc[:, 0] if len(x) >= 20 else None)
-        df['prix_veille'] = df.groupby('ticker')['prix_ajuste'].shift(1)
 
-        # 3. Charger le modèle IA depuis la base de données
+        # 3. Charger le modèle IA
         with engine.connect() as conn:
             res = conn.execute(text("SELECT model_data, columns_data FROM models_store WHERE model_name='trading_forest'")).fetchone()
         
@@ -139,49 +137,50 @@ def run_analysis_logic():
             model = pickle.loads(res[0])
             model_cols = pickle.loads(res[1])
 
-            # Préparer les données pour le modèle (Features)
             features_df = df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'secteur', 'market_cap', 'pe_ratio']].copy()
             features_df = pd.get_dummies(features_df, columns=['secteur'])
             
-            # Aligner les colonnes avec celles du modèle (ajouter les secteurs manquants)
             for col in model_cols:
                 if col not in features_df.columns:
                     features_df[col] = 0
-            features_df = features_df[model_cols] # Réordonner
+            features_df = features_df[model_cols]
 
-            # Prédire la probabilité de succès (0.0 à 1.0)
             df['score_ia'] = model.predict_proba(features_df.fillna(0))[:, 1]
         else:
-            print("⚠️ Aucun modèle trouvé dans models_store. Score IA = 0.")
+            print("⚠️ Aucun modèle trouvé. Score IA = 0.")
             df['score_ia'] = 0
 
-        # 4. Signal d'Achat (Indicateurs + Confiance IA > 60%)
+        # 4. Signal d'Achat
         df['signal_achat'] = (
             (df['rsi_14'] < 35) & (df['prix_ajuste'] > df['sma_200']) & 
             (df['prix_ajuste'] <= df['bb_lower']) & (df['score_ia'] >= 0.6)
         ).fillna(False)
 
-        # 4bis --- NOUVELLE ÉTAPE : CALCUL DU TARGET ML (VÉRITÉ TERRAIN) ---
-print("🎯 Calcul du Target ML (+5% à 7 jours)...")
-# 4bis.1. On récupère le prix dans 7 jours pour chaque ticker
-df['prix_futur'] = df.groupby('ticker')['prix_ajuste'].shift(-7)
-
-# 4bis.2. On calcule le gain en %
-df['gain_pct'] = (df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste']
-
-# 4bis.3. On crée la cible : 1 si gain >= 5%, sinon 0
-# Note : On met NaN si on n'a pas encore assez de recul (7 derniers jours)
-df['target_ml'] = df['gain_pct'].apply(lambda x: 1 if x >= 0.05 else (0 if pd.notnull(x) else None))
+        # --- NOUVELLE ÉTAPE : CALCUL DU TARGET ML (VÉRITÉ TERRAIN) ---
+        print("🎯 Calcul du Target ML (+5% à 7 jours)...")
+        df['prix_futur'] = df.groupby('ticker')['prix_ajuste'].shift(-7)
+        df['gain_pct'] = (df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste']
+        df['target_ml'] = df['gain_pct'].apply(lambda x: 1 if x >= 0.05 else (0 if pd.notnull(x) else None))
 
         # 5. Sauvegarde
-        df[['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia']].to_sql("_tmp_v4", engine, if_exists='replace', index=False)
+        # On inclut target_ml dans la table temporaire
+        cols_to_save = ['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia', 'target_ml']
+        df[cols_to_save].to_sql("_tmp_v4", engine, if_exists='replace', index=False)
+        
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE actions_prix_historique a
-                SET rsi_14 = t.rsi_14, vol_avg_20 = t.vol_avg_20, sma_200 = t.sma_200, 
-                    bb_lower = t.bb_lower, signal_achat = t.signal_achat, score_ia = t.score_ia
-                FROM _tmp_v4 t WHERE a.ticker = t.ticker AND a.date = t.date;
+                SET rsi_14 = t.rsi_14, 
+                    vol_avg_20 = t.vol_avg_20, 
+                    sma_200 = t.sma_200, 
+                    bb_lower = t.bb_lower, 
+                    signal_achat = t.signal_achat, 
+                    score_ia = t.score_ia,
+                    target_ml = t.target_ml
+                FROM _tmp_v4 t 
+                WHERE a.ticker = t.ticker AND a.date = t.date;
             """))
-        print("✅ Analyse et Prédictions terminées.")
+        print("✅ Analyse, Labellisation et Prédictions terminées.")
+
     except Exception as e:
         print(f"❌ Erreur Analyse IA: {e}")
