@@ -31,8 +31,8 @@ if DATABASE_URL:
 def home():
     return {
         "status": "Service Trading IA Actif", 
-        "version": "4.1", 
-        "features": ["Cloud-ML-Training", "YahooFinance-Sync", "AI-Predictions", "Target-Labeling"]
+        "version": "4.2", 
+        "features": ["Anti-Deadlock-System", "Target-Labeling", "AI-Predictions"]
     }
 
 # --- ENDPOINT 1 : ENTRAÎNEMENT ---
@@ -156,18 +156,24 @@ def run_analysis_logic():
             (df['prix_ajuste'] <= df['bb_lower']) & (df['score_ia'] >= 0.6)
         ).fillna(False)
 
-        # --- NOUVELLE ÉTAPE : CALCUL DU TARGET ML (VÉRITÉ TERRAIN) ---
+        # --- ÉTAPE : CALCUL DU TARGET ML (VÉRITÉ TERRAIN) ---
         print("🎯 Calcul du Target ML (+5% à 7 jours)...")
         df['prix_futur'] = df.groupby('ticker')['prix_ajuste'].shift(-7)
         df['gain_pct'] = (df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste']
         df['target_ml'] = df['gain_pct'].apply(lambda x: 1 if x >= 0.05 else (0 if pd.notnull(x) else None))
 
-        # 5. Sauvegarde
-        # On inclut target_ml dans la table temporaire
+        # 5. SAUVEGARDE SÉCURISÉE (Anti-Deadlock)
+        print("💾 Préparation de la table temporaire...")
         cols_to_save = ['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia', 'target_ml']
-        df[cols_to_save].to_sql("_tmp_v4", engine, if_exists='replace', index=False)
         
+        # On écrit d'abord les résultats dans une table de transit
+        df[cols_to_save].to_sql("_tmp_analysis", engine, if_exists='replace', index=False)
+        
+        print("⚡ Verrouillage et mise à jour de la table principale...")
         with engine.begin() as conn:
+            # On demande un accès exclusif court pour éviter les collisions avec n8n
+            conn.execute(text("LOCK TABLE actions_prix_historique IN EXCLUSIVE MODE;"))
+            
             conn.execute(text("""
                 UPDATE actions_prix_historique a
                 SET rsi_14 = t.rsi_14, 
@@ -177,10 +183,10 @@ def run_analysis_logic():
                     signal_achat = t.signal_achat, 
                     score_ia = t.score_ia,
                     target_ml = t.target_ml
-                FROM _tmp_v4 t 
+                FROM _tmp_analysis t 
                 WHERE a.ticker = t.ticker AND a.date = t.date;
             """))
-        print("✅ Analyse, Labellisation et Prédictions terminées.")
+        print("✅ Analyse, Labellisation et Prédictions terminées avec succès.")
 
     except Exception as e:
         print(f"❌ Erreur Analyse IA: {e}")
