@@ -161,6 +161,18 @@ def run_analysis_logic():
             (df['prix_ajuste'] <= df['bb_lower']) & (df['score_ia'] >= 0.6)
         ).fillna(False)
 
+        # 4bis --- NOUVELLE ÉTAPE : CALCUL DU TARGET ML (VÉRITÉ TERRAIN) ---
+print("🎯 Calcul du Target ML (+5% à 7 jours)...")
+# 4bis.1. On récupère le prix dans 7 jours pour chaque ticker
+df['prix_futur'] = df.groupby('ticker')['prix_ajuste'].shift(-7)
+
+# 4bis.2. On calcule le gain en %
+df['gain_pct'] = (df['prix_futur'] - df['prix_ajuste']) / df['prix_ajuste']
+
+# 4bis.3. On crée la cible : 1 si gain >= 5%, sinon 0
+# Note : On met NaN si on n'a pas encore assez de recul (7 derniers jours)
+df['target_ml'] = df['gain_pct'].apply(lambda x: 1 if x >= 0.05 else (0 if pd.notnull(x) else None))
+
         # 5. Sauvegarde
         df[['ticker', 'date', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia']].to_sql("_tmp_v4", engine, if_exists='replace', index=False)
         with engine.begin() as conn:
