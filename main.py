@@ -33,8 +33,8 @@ if DATABASE_URL:
 def home():
     return {
         "status": "Service Trading IA Actif", 
-        "version": "4.9.2", 
-        "features": ["Fix-Syntax", "Update-By-ID", "Massive-Data-Ready"]
+        "version": "4.9.3", 
+        "features": ["Chunk-Processing", "Memory-Optimized", "Massive-Data-Ready"]
     }
 
 # --- ENDPOINTS ---
@@ -51,7 +51,7 @@ async def trigger_sync(background_tasks: BackgroundTasks):
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_analysis_logic)
-    return {"status": "processing", "message": "Analyse technique lancée."}
+    return {"status": "processing", "message": "Analyse technique massive lancée..."}
 
 # --- LOGIQUE SYNC METADATA ---
 def sync_metadata_logic():
@@ -95,80 +95,111 @@ def sync_metadata_logic():
     except Exception as e:
         print(f"❌ Erreur Sync: {e}")
 
-# --- LOGIQUE ANALYSE ---
+# --- LOGIQUE ANALYSE MASSIVE (CHUNK MODE) ---
 def run_analysis_logic():
     if engine is None: return
-    print("🚀 Démarrage de l'analyse V4.9.2...")
+    print("🚀 Démarrage de l'analyse V4.9.3 (Optimisation Mémoire)...")
     
     try:
-        query = """
-            SELECT a.id, a.ticker, a.date, a.prix_ajuste, a.volume, 
-                   t.secteur, t.market_cap, t.pe_ratio 
-            FROM actions_prix_historique a 
-            LEFT JOIN tickers_info t ON a.ticker = t.ticker
-            ORDER BY a.ticker, a.date ASC
-        """
-        df = pd.read_sql(query, engine)
-        if df.empty: return
-
-        df['date'] = pd.to_datetime(df['date']).dt.date
-        df['prix_ajuste'] = pd.to_numeric(df['prix_ajuste'], errors='coerce')
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-        df = df.sort_values(['ticker', 'date']).dropna(subset=['prix_ajuste'])
-
-        def compute_technical_indicators(group):
-            # RSI
-            delta = group['prix_ajuste'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=7).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=7).mean()
-            rs = gain / (loss + 1e-9)
-            group['rsi_14'] = 100 - (100 / (1 + rs))
-            
-            # SMA & Volume
-            group['sma_200'] = group['prix_ajuste'].rolling(window=200, min_periods=1).mean()
-            group['vol_avg_20'] = group['volume'].rolling(window=20, min_periods=1).mean()
-            
-            # Bollinger
-            sma_20 = group['prix_ajuste'].rolling(window=20, min_periods=1).mean()
-            std_20 = group['prix_ajuste'].rolling(window=20, min_periods=1).std()
-            group['bb_lower'] = sma_20 - (std_20 * 2)
-            
-            # Target
-            group['prix_futur'] = group['prix_ajuste'].shift(-7)
-            group['target_ml'] = ((group['prix_futur'] - group['prix_ajuste']) / group['prix_ajuste'] >= 0.05).astype(float)
-            return group
-
-        df = df.groupby('ticker', group_keys=False).apply(compute_technical_indicators)
-
-        # Scoring IA
+        # 1. Récupérer TOUS les tickers uniques en base
         with engine.connect() as conn:
-            res = conn.execute(text("SELECT model_data, columns_data FROM models_store WHERE model_name='trading_forest'")).fetchone()
+            result = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique"))
+            all_tickers = [row[0] for row in result]
         
-        if res:
-            model = pickle.loads(res[0])
-            model_cols = pickle.loads(res[1])
-            features = pd.get_dummies(df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'secteur', 'market_cap', 'pe_ratio']], columns=['secteur'])
-            for col in model_cols:
-                if col not in features.columns: features[col] = 0
-            df['score_ia'] = model.predict_proba(features[model_cols].fillna(0))[:, 1]
-        else:
-            df['score_ia'] = 0
+        if not all_tickers:
+            print("⚠️ Aucun ticker trouvé en base.")
+            return
 
-        df['signal_achat'] = ((df['rsi_14'] < 35) & (df['score_ia'] >= 0.5)).fillna(False)
+        print(f"📈 {len(all_tickers)} tickers à traiter au total.")
 
-        # Sauvegarde
-        df_save = df[['id', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia', 'target_ml']].copy()
-        df_save.to_sql("_tmp_analysis", engine, if_exists='replace', index=False)
-        
-        with engine.begin() as conn:
-            conn.execute(text("LOCK TABLE actions_prix_historique IN EXCLUSIVE MODE;"))
-            conn.execute(text("""
-                UPDATE actions_prix_historique a
-                SET rsi_14 = t.rsi_14, vol_avg_20 = t.vol_avg_20, sma_200 = t.sma_200, 
-                    bb_lower = t.bb_lower, signal_achat = t.signal_achat, 
-                    score_ia = t.score_ia, target_ml = t.target_ml
-                FROM _tmp_analysis t WHERE a.id = t.id;
-            """))
-        print(f"✅ Terminé : {len(df_save)} lignes.")
+        # 2. Charger le modèle IA une seule fois pour tout le processus
+        model, model_cols = None, None
+        with engine.connect() as conn:
+            res_model = conn.execute(text("SELECT model_data, columns_data FROM models_store WHERE model_name='trading_forest'")).fetchone()
+            if res_model:
+                model = pickle.loads(res_model[0])
+                model_cols = pickle.loads(res_model[1])
+                print("🧠 Modèle IA chargé avec succès.")
+
+        # 3. Traiter par paquets de 20 tickers pour ne pas saturer la RAM
+        chunk_size = 20
+        total_processed_rows = 0
+
+        for i in range(0, len(all_tickers), chunk_size):
+            current_chunk = all_tickers[i:i + chunk_size]
+            print(f"📦 Traitement du paquet {i//chunk_size + 1}... ({current_chunk[0]}...)")
+
+            query = text("""
+                SELECT a.id, a.ticker, a.date, a.prix_ajuste, a.volume, 
+                       t.secteur, t.market_cap, t.pe_ratio 
+                FROM actions_prix_historique a 
+                LEFT JOIN tickers_info t ON a.ticker = t.ticker
+                WHERE a.ticker IN :tickers
+                ORDER BY a.ticker, a.date ASC
+            """)
+            
+            df = pd.read_sql(query, engine, params={"tickers": tuple(current_chunk)})
+            
+            if df.empty:
+                continue
+
+            # --- Nettoyage du chunk ---
+            df['date'] = pd.to_datetime(df['date']).dt.date
+            df['prix_ajuste'] = pd.to_numeric(df['prix_ajuste'], errors='coerce')
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+            df = df.sort_values(['ticker', 'date']).dropna(subset=['prix_ajuste'])
+
+            # --- Calculs techniques ---
+            def compute_group(group):
+                delta = group['prix_ajuste'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=7).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=7).mean()
+                rs = gain / (loss + 1e-9)
+                group['rsi_14'] = 100 - (100 / (1 + rs))
+                
+                group['sma_200'] = group['prix_ajuste'].rolling(window=200, min_periods=1).mean()
+                group['vol_avg_20'] = group['volume'].rolling(window=20, min_periods=1).mean()
+                
+                sma_20 = group['prix_ajuste'].rolling(window=20, min_periods=1).mean()
+                std_20 = group['prix_ajuste'].rolling(window=20, min_periods=1).std()
+                group['bb_lower'] = sma_20 - (std_20 * 2)
+                
+                group['prix_futur'] = group['prix_ajuste'].shift(-7)
+                group['target_ml'] = ((group['prix_futur'] - group['prix_ajuste']) / group['prix_ajuste'] >= 0.05).astype(float)
+                return group
+
+            df = df.groupby('ticker', group_keys=False).apply(compute_group)
+
+            # --- Scoring IA ---
+            if model:
+                # Gestion des secteurs pour le One-Hot Encoding
+                features = pd.get_dummies(df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'secteur', 'market_cap', 'pe_ratio']], columns=['secteur'])
+                for col in model_cols:
+                    if col not in features.columns:
+                        features[col] = 0
+                df['score_ia'] = model.predict_proba(features[model_cols].fillna(0))[:, 1]
+            else:
+                df['score_ia'] = 0
+
+            df['signal_achat'] = ((df['rsi_14'] < 35) & (df['score_ia'] >= 0.5)).fillna(False)
+
+            # --- Sauvegarde du chunk ---
+            df_save = df[['id', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower', 'signal_achat', 'score_ia', 'target_ml']].copy()
+            df_save.to_sql("_tmp_analysis_chunk", engine, if_exists='replace', index=False)
+            
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE actions_prix_historique a
+                    SET rsi_14 = t.rsi_14, vol_avg_20 = t.vol_avg_20, sma_200 = t.sma_200, 
+                        bb_lower = t.bb_lower, signal_achat = t.signal_achat, 
+                        score_ia = t.score_ia, target_ml = t.target_ml
+                    FROM _tmp_analysis_chunk t WHERE a.id = t.id;
+                """))
+            
+            total_processed_rows += len(df)
+            print(f"🟢 {total_processed_rows} lignes mises à jour...")
+
+        print(f"🏁 ANALYSE COMPLÈTE TERMINÉE. Total : {total_processed_rows} lignes.")
+
     except Exception as e:
-        print(f"❌ Erreur : {e}")
+        print(f"❌ Erreur critique : {e}")
