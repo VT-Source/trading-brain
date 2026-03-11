@@ -1,6 +1,3 @@
-
-Copier
-
 import os
 import time
 import joblib
