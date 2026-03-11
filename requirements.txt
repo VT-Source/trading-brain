@@ -24,7 +24,6 @@ vectorbt
 # --- Machine Learning ---
 scikit-learn
 joblib
-pybroker
 
 # --- Orchestration ---
 apscheduler
@@ -34,3 +33,6 @@ streamlit
 
 # --- Configuration ---
 python-dotenv
+
+# --- Non compatible Python 3.13 (à réintégrer Phase 2) ---
+# pybroker
