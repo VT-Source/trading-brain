@@ -1,11 +1,36 @@
+# ============================================================
+# requirements.txt — Trading Brain v3.1
+# VT-Source/trading-brain
+# ============================================================
+
+# --- API & Serveur ---
 fastapi
 uvicorn
-pandas
-pandas_ta
+
+# --- Base de données ---
 sqlalchemy
 psycopg2-binary
-python-dotenv
+
+# --- Données & Calculs ---
+pandas
+numpy
+yfinance
 requests
+
+# --- Analyse Technique & Backtest ---
+pandas_ta
+vectorbt
+
+# --- Machine Learning ---
 scikit-learn
 joblib
-yfinance
+pybroker
+
+# --- Orchestration ---
+apscheduler
+
+# --- Dashboard ---
+streamlit
+
+# --- Configuration ---
+python-dotenv
