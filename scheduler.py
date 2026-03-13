@@ -1,14 +1,18 @@
 # ============================================================
-# scheduler.py — Orchestration APScheduler v3.1
+# scheduler.py — Orchestration APScheduler v3.2
 # Trading Brain | VT-Source
 # ============================================================
-# Remplace le cron n8n pour les tâches Python.
-# n8n reste uniquement pour les notifications Telegram.
+# Jobs planifiés (automatiques) :
+#   06h00 lun-ven — Analyse incrémentale AT + ML
+#                   (charge 220j de contexte, sauvegarde 5j)
+#   06h30 lun-ven — Sync metadata Yahoo Finance
+#   Dimanche 02h00 — Réentraînement ML hebdomadaire
 #
-# Jobs planifiés :
-#   06h00 — Analyse technique + score ML (run_analysis_logic)
-#   06h30 — Sync metadata Yahoo Finance (sync_metadata_logic)
-#   Dimanche 02h00 — Réentraînement ML (train_brain)
+# ⚠️  /run-analysis-full N'EST PAS planifié ici.
+#     À appeler manuellement depuis Railway ou Postman :
+#       - Après un changement de logique AT
+#       - Après l'ajout d'un nouvel indicateur
+#       - Pour initialiser un nouveau ticker
 # ============================================================
 
 import logging
@@ -19,7 +23,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -27,13 +30,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# --- Import des fonctions métier ---
-# Importées ici pour éviter les imports circulaires
 try:
     from main import run_analysis_logic, sync_metadata_logic
 except ImportError as e:
     log.error(f"❌ Impossible d'importer main.py : {e}")
-    run_analysis_logic  = lambda: log.error("run_analysis_logic non disponible")
+    run_analysis_logic  = lambda **kw: log.error("run_analysis_logic non disponible")
     sync_metadata_logic = lambda: log.error("sync_metadata_logic non disponible")
 
 try:
@@ -44,20 +45,25 @@ except ImportError as e:
 
 
 # ============================================================
-# WRAPPERS — Gestion des erreurs pour chaque job
+# WRAPPERS
 # ============================================================
 
 def job_analyse():
-    log.info("🚀 Démarrage job : Analyse technique + score ML")
+    """
+    Analyse incrémentale quotidienne.
+    Charge 220 jours de contexte par ticker, ne sauvegarde que les 5 derniers jours.
+    NE PAS modifier pour appeler full=True — utiliser /run-analysis-full manuellement.
+    """
+    log.info("🚀 Job : Analyse incrémentale AT + ML (full=False)")
     try:
-        run_analysis_logic()
+        run_analysis_logic(full=False)
         log.info("✅ Job analyse terminé.")
     except Exception as e:
         log.error(f"❌ Erreur job analyse : {e}")
 
 
 def job_sync_metadata():
-    log.info("🔄 Démarrage job : Sync metadata Yahoo Finance")
+    log.info("🔄 Job : Sync metadata Yahoo Finance")
     try:
         sync_metadata_logic()
         log.info("✅ Job sync metadata terminé.")
@@ -66,10 +72,10 @@ def job_sync_metadata():
 
 
 def job_train_model():
-    log.info("🧠 Démarrage job : Réentraînement ML")
+    log.info("🧠 Job : Réentraînement ML hebdomadaire")
     try:
         train_brain()
-        log.info("✅ Job réentraînement ML terminé.")
+        log.info("✅ Job réentraînement terminé.")
     except Exception as e:
         log.error(f"❌ Erreur job réentraînement : {e}")
 
@@ -81,28 +87,27 @@ def job_train_model():
 def main():
     scheduler = BlockingScheduler(timezone="Europe/Brussels")
 
-    # --- Job 1 : Analyse AT + ML — chaque jour à 06h00 ---
+    # Job 1 : Analyse incrémentale — lun-ven à 06h00
     scheduler.add_job(
         job_analyse,
-        trigger=CronTrigger(hour=6, minute=0),
-        id="analyse_quotidienne",
-        name="Analyse technique + score ML",
+        trigger=CronTrigger(day_of_week="mon-fri", hour=6, minute=0),
+        id="analyse_incrementale",
+        name="Analyse incrémentale AT + ML",
         replace_existing=True,
-        misfire_grace_time=600  # Tolérance 10 min si Railway redémarre
+        misfire_grace_time=600
     )
 
-    # --- Job 2 : Sync metadata — chaque jour à 06h30 ---
+    # Job 2 : Sync metadata — lun-ven à 06h30
     scheduler.add_job(
         job_sync_metadata,
-        trigger=CronTrigger(hour=6, minute=30),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=6, minute=30),
         id="sync_metadata",
         name="Sync metadata Yahoo Finance",
         replace_existing=True,
         misfire_grace_time=600
     )
 
-    # --- Job 3 : Réentraînement ML — chaque dimanche à 02h00 ---
-    # À n'activer qu'après avoir validé signal_achat + target_ml
+    # Job 3 : Réentraînement ML — dimanche à 02h00
     scheduler.add_job(
         job_train_model,
         trigger=CronTrigger(day_of_week="sun", hour=2, minute=0),
@@ -113,9 +118,11 @@ def main():
     )
 
     log.info("⏰ Scheduler démarré — Jobs planifiés :")
-    log.info("   06h00 (lun-ven) → Analyse AT + ML")
-    log.info("   06h30 (lun-ven) → Sync metadata")
+    log.info("   06h00 (lun-ven) → Analyse incrémentale AT + ML")
+    log.info("   06h30 (lun-ven) → Sync metadata Yahoo Finance")
     log.info("   02h00 (dimanche) → Réentraînement ML")
+    log.info("")
+    log.info("   ⚠️  Recalcul complet : appel MANUEL via /run-analysis-full uniquement")
     log.info("   Timezone : Europe/Brussels")
 
     try:
