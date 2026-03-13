@@ -27,10 +27,9 @@ def train_brain():
     # --------------------------------------------------------
     # ÉTAPE 1 : Chargement — UNIQUEMENT les signaux AT
     # --------------------------------------------------------
-    # On entraîne le ML à prédire si UN SIGNAL AT va réussir
-    # Pas sur toutes les lignes — uniquement signal_achat = TRUE
     query = """
         SELECT a.rsi_14, a.vol_avg_20, a.sma_200, a.bb_lower,
+               a.rsi_slope, a.vol_ratio, a.dist_sma200, a.bb_position,
                t.secteur, t.market_cap, t.pe_ratio, a.target_ml
         FROM actions_prix_historique a
         JOIN tickers_info t ON a.ticker = t.ticker
@@ -49,8 +48,7 @@ def train_brain():
     if len(df) < 100:
         print(
             f"❌ Données insuffisantes ({len(df)} signaux AT avec target_ml).\n"
-            f"   → Vérifiez que signal_achat est calculé avec les 4 conditions AT\n"
-            f"   → Puis exécutez sql/target_ml.sql pour recalculer les targets"
+            f"   → Lancez /run-analysis puis target_ml.sql avant de réentraîner"
         )
         return
 
@@ -62,11 +60,15 @@ def train_brain():
     # ÉTAPE 2 : Nettoyage
     # --------------------------------------------------------
     df = df.replace([np.inf, -np.inf], np.nan)
-    df['rsi_14']    = df['rsi_14'].fillna(50)
-    df['pe_ratio']  = df['pe_ratio'].fillna(df['pe_ratio'].median())
-    df['market_cap']= df['market_cap'].fillna(df['market_cap'].median())
-    df['secteur']   = df['secteur'].fillna('Unknown')
-    df              = df.fillna(0)
+    df['rsi_14']     = df['rsi_14'].fillna(50)
+    df['rsi_slope']  = df['rsi_slope'].fillna(0)
+    df['vol_ratio']  = df['vol_ratio'].fillna(1)
+    df['dist_sma200']= df['dist_sma200'].fillna(0)
+    df['bb_position']= df['bb_position'].fillna(0)
+    df['pe_ratio']   = df['pe_ratio'].fillna(df['pe_ratio'].median())
+    df['market_cap'] = df['market_cap'].fillna(df['market_cap'].median())
+    df['secteur']    = df['secteur'].fillna('Unknown')
+    df               = df.fillna(0)
 
     # --------------------------------------------------------
     # ÉTAPE 3 : Préparation features
@@ -79,8 +81,6 @@ def train_brain():
     # --------------------------------------------------------
     # ÉTAPE 4 : Validation temporelle (TimeSeriesSplit)
     # --------------------------------------------------------
-    # TimeSeriesSplit respecte l'ordre chronologique des données
-    # Évite le data leakage (pas de données futures dans le train)
     tscv          = TimeSeriesSplit(n_splits=5)
     scores_test   = []
     scores_prec   = []
@@ -92,7 +92,6 @@ def train_brain():
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-        # max_depth réduit à 6 pour éviter l'overfitting
         clf = RandomForestClassifier(
             n_estimators=100,
             max_depth=6,
@@ -124,7 +123,6 @@ def train_brain():
     print(f"   Précision : {mean_prec}%  ← % de vrais positifs parmi les signaux ML")
     print(f"   Recall    : {mean_rec}%   ← % de succès AT détectés par le ML")
 
-    # Seuil de qualité minimal
     if mean_prec < 52:
         print(f"⚠️  Précision < 52% — modèle peu fiable.")
         print(f"   → Vérifiez la définition de signal_achat et target_ml")
@@ -159,7 +157,7 @@ def train_brain():
         print(f"❌ Erreur sauvegarde joblib : {e}")
         return
 
-    # Sauvegarde des métriques en base pour le dashboard
+    # Sauvegarde des métriques en base — float() pour éviter np.float64
     try:
         with engine.begin() as conn:
             conn.execute(text("""
@@ -174,18 +172,18 @@ def train_brain():
             """), {
                 "placeholder" : b"joblib_file",
                 "placeholder2": b"joblib_file",
-                "acc"         : float(mean_prec / 100)
+                "acc"         : float(mean_prec / 100)  # ← corrigé np.float64
             })
-        print(f"📊 Métriques sauvegardées en base "
-              f"(précision CV : {mean_prec}%)")
+        print(f"📊 Métriques sauvegardées en base (précision CV : {mean_prec}%)")
     except Exception as e:
         print(f"⚠️ Sauvegarde métriques en base : {e}")
 
     print(f"\n✅ Modèle 'trading_forest' prêt.")
-    print(f"   Dataset    : {len(df)} signaux AT uniquement")
-    print(f"   Features   : {len(cols)} colonnes")
+    print(f"   Dataset     : {len(df)} signaux AT uniquement")
+    print(f"   Features    : {len(cols)} colonnes")
     print(f"   Précision CV: {mean_prec}% | Score final : {round(final_score*100,2)}%")
     print(f"   ⚠️  Si score final >> précision CV → overfitting résiduel normal")
 
 if __name__ == "__main__":
     train_brain()
+
