@@ -8,7 +8,6 @@ from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
  
-# Import de la fonction d'entraînement depuis train_model.py
 try:
     from train_model import train_brain
 except ImportError:
@@ -30,31 +29,60 @@ MODEL_PATH = "models/trading_forest.joblib"
 COLS_PATH  = "models/trading_forest_cols.joblib"
  
 # ============================================================
+# Contexte nécessaire pour chaque indicateur glissant :
+#   SMA_200  → 200 jours
+#   RSI_14   → 14 jours
+#   BB_lower → 20 jours
+#   vol_avg  → 20 jours
+# On charge 220 jours pour avoir la SMA_200 correcte + marge.
+# On ne sauvegarde que les 5 derniers jours (nouveaux / modifiés).
+# ============================================================
+INCREMENTAL_LOOKBACK_DAYS = 220   # jours à charger pour le contexte
+INCREMENTAL_SAVE_DAYS     = 5     # jours à réécrire en base
+ 
+# ============================================================
 # ENDPOINTS API
 # ============================================================
  
 @app.get("/")
 def home():
     return {
-        "status": "Service Trading IA Actif",
-        "version": "5.4.1",
+        "status"          : "Service Trading IA Actif",
+        "version"         : "5.5.0",
         "engine_connected": engine is not None
     }
  
 @app.get("/train-model")
 async def trigger_training(background_tasks: BackgroundTasks):
     background_tasks.add_task(train_brain)
-    return {"status": "processing", "message": "Entraînement v3.3 lancé."}
+    return {"status": "processing", "message": "Entraînement lancé en arrière-plan."}
  
 @app.get("/sync-metadata")
 async def trigger_sync(background_tasks: BackgroundTasks):
     background_tasks.add_task(sync_metadata_logic)
     return {"status": "processing", "message": "Synchronisation Yahoo lancée."}
  
+# --- Endpoint quotidien (scheduler 06h00) ---
+# Charge 220 jours de contexte, ne sauvegarde que les 5 derniers jours.
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_analysis_logic)
-    return {"status": "processing", "message": "Analyse massive lancée..."}
+    background_tasks.add_task(run_analysis_logic, full=False)
+    return {
+        "status" : "processing",
+        "message": f"Analyse incrémentale lancée (contexte {INCREMENTAL_LOOKBACK_DAYS}j, sauvegarde {INCREMENTAL_SAVE_DAYS}j)."
+    }
+ 
+# --- Endpoint recalcul complet (action manuelle uniquement) ---
+# À appeler après un changement de logique AT, ajout d'indicateur,
+# ou pour initialiser un nouveau ticker.
+# NE PAS planifier dans le scheduler.
+@app.get("/run-analysis-full")
+async def trigger_full_analysis(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_analysis_logic, full=True)
+    return {
+        "status" : "processing",
+        "message": "⚠️ Recalcul COMPLET lancé sur tout l'historique (action manuelle)."
+    }
  
 # ============================================================
 # LOGIQUE SYNC METADATA
@@ -63,10 +91,9 @@ async def trigger_analysis(background_tasks: BackgroundTasks):
 def sync_metadata_logic():
     if engine is None: return
     print("🔄 Sync Yahoo Finance (Metadata)...")
-    query = "SELECT DISTINCT ticker FROM actions_prix_historique LIMIT 500;"
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(query))
+            result  = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique LIMIT 500;"))
             tickers = [row[0] for row in result]
  
         for ticker_symbol in tickers:
@@ -104,45 +131,61 @@ def sync_metadata_logic():
         print(f"❌ Erreur Sync: {e}")
  
 # ============================================================
-# LOGIQUE ANALYSE MASSIVE
+# LOGIQUE ANALYSE — INCRÉMENTALE ET COMPLÈTE
 # ============================================================
  
-def run_analysis_logic():
+def run_analysis_logic(full: bool = False):
     if engine is None: return
-    print("🚀 Démarrage Analyse v5.4.1...")
+ 
+    mode = "COMPLET" if full else "INCRÉMENTAL"
+    print(f"🚀 Démarrage Analyse v5.5.0 — mode {mode}...")
  
     try:
         # 1. Liste des tickers
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique"))
+            result      = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique"))
             all_tickers = [row[0] for row in result]
  
         if not all_tickers: return
+        print(f"   {len(all_tickers)} tickers trouvés en base.")
  
-        # 2. Chargement du modèle
+        # 2. Chargement du modèle ML
         model, model_cols = None, None
         if os.path.exists(MODEL_PATH) and os.path.exists(COLS_PATH):
             model      = joblib.load(MODEL_PATH)
             model_cols = joblib.load(COLS_PATH)
             print("✅ Modèle ML chargé.")
  
-        # 3. Traitement par chunks
+        # 3. Définition de la fenêtre de chargement
+        if full:
+            # Recalcul complet : tout l'historique disponible
+            date_filter = ""
+            date_params = {}
+        else:
+            # Mode incrémental : charge 220 jours de contexte
+            # (200j pour SMA_200 + 20j de marge)
+            date_filter = "AND a.date >= :date_from"
+            date_params = {"date_from": (pd.Timestamp.today() - pd.Timedelta(days=INCREMENTAL_LOOKBACK_DAYS)).date()}
+ 
+        # 4. Traitement par chunks
         chunk_size   = 50
         total_chunks = (len(all_tickers) - 1) // chunk_size + 1
  
         for i in range(0, len(all_tickers), chunk_size):
             tickers_chunk = all_tickers[i:i + chunk_size]
  
-            query = text("""
+            query = text(f"""
                 SELECT a.id, a.ticker, a.date, a.prix_cloture, a.prix_ajuste, a.volume,
                        t.secteur, t.market_cap, t.pe_ratio
                 FROM actions_prix_historique a
                 LEFT JOIN tickers_info t ON a.ticker = t.ticker
                 WHERE a.ticker IN :tickers
+                {date_filter}
                 ORDER BY a.ticker, a.date ASC
             """)
  
-            df = pd.read_sql(query, engine, params={"tickers": tuple(tickers_chunk)})
+            params = {"tickers": tuple(tickers_chunk), **date_params}
+            df     = pd.read_sql(query, engine, params=params)
             if df.empty: continue
  
             df['prix_ajuste'] = df['prix_ajuste'].fillna(df['prix_cloture'])
@@ -153,17 +196,17 @@ def run_analysis_logic():
                 price = group['prix_ajuste']
                 vol   = group['volume']
  
-                # --- RSI 14 ---
+                # RSI 14
                 delta = price.diff()
                 gain  = delta.where(delta > 0, 0).rolling(14).mean()
                 loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
                 group['rsi_14'] = 100 - (100 / (1 + gain / (loss + 1e-9)))
  
-                # --- Moyennes mobiles ---
+                # Moyennes mobiles
                 group['sma_200'] = price.rolling(200, min_periods=1).mean()
                 group['sma_50']  = price.rolling(50,  min_periods=1).mean()
  
-                # --- Bandes de Bollinger ---
+                # Bandes de Bollinger
                 sma_20            = price.rolling(20).mean()
                 std_20            = price.rolling(20).std()
                 bb_upper          = sma_20 + (std_20 * 2)
@@ -171,26 +214,26 @@ def run_analysis_logic():
                 bb_range          = (bb_upper - group['bb_lower']).replace(0, np.nan)
                 group['bb_position'] = (price - group['bb_lower']) / bb_range
  
-                # --- Volume moyen 20j ---
+                # Volume moyen 20j
                 group['vol_avg_20'] = vol.rolling(20).mean()
  
-                # --- Features ML — calculées ET sauvegardées en base ---
+                # Features ML
                 group['rsi_slope']   = group['rsi_14'].diff(3)
                 group['vol_ratio']   = vol / (group['vol_avg_20'] + 1e-9)
                 group['dist_sma200'] = (price - group['sma_200']) / (group['sma_200'] + 1e-9)
  
-                # --- Régime de marché (BULL / BEAR / NEUTRE) ---
+                # Régime de marché
                 group['regime_marche'] = np.where(
                     price > group['sma_50'] * 1.02, 'BULL',
                     np.where(price < group['sma_50'] * 0.98, 'BEAR', 'NEUTRE')
                 )
  
                 # ============================================================
-                # SIGNAL ACHAT — 4 conditions AT conformes PROJECT_STATUS v3.1
-                # Condition 1 : RSI < 35            (survente)
-                # Condition 2 : Prix > SMA_200       (tendance haussière long terme)
-                # Condition 3 : Volume > Vol_avg_20  (confirmation marché)
-                # Condition 4 : Prix < BB_lower      (opportunité rebond Bollinger)
+                # SIGNAL ACHAT — 4 conditions AT (PROJECT_STATUS v3.1)
+                # 1. RSI < 35            : survente
+                # 2. Prix > SMA_200      : tendance haussière long terme
+                # 3. Volume > vol_avg_20 : confirmation d'intérêt marché
+                # 4. Prix < BB_lower     : opportunité de rebond Bollinger
                 # ============================================================
                 group['signal_achat'] = (
                     (group['rsi_14'] < 35) &
@@ -202,26 +245,37 @@ def run_analysis_logic():
  
             df = df.groupby('ticker', group_keys=False).apply(compute_indicators)
  
-            # 4. Score ML
+            # 5. Score ML
             if model is not None:
                 feat_df = pd.get_dummies(df, columns=['secteur', 'regime_marche'])
                 for col in model_cols:
                     if col not in feat_df.columns:
                         feat_df[col] = 0
-                X_input = feat_df[model_cols].fillna(0).replace([np.inf, -np.inf], 0)
+                X_input          = feat_df[model_cols].fillna(0).replace([np.inf, -np.inf], 0)
                 df['confiance_ml'] = model.predict_proba(X_input)[:, 1]
             else:
                 df['confiance_ml'] = 0.0
  
-            # 5. Sauvegarde — toutes les features ML incluses
-            # Table temporaire unique par chunk pour éviter les collisions de concurrence
-            tmp_table = f"_tmp_update_{i}"
+            # 6. Filtrage des lignes à sauvegarder
+            # Mode incrémental : uniquement les 5 derniers jours
+            # Mode complet     : tout ce qui a été calculé
+            if not full:
+                save_from = pd.Timestamp.today() - pd.Timedelta(days=INCREMENTAL_SAVE_DAYS)
+                df_to_save = df[pd.to_datetime(df['date']) >= save_from].copy()
+            else:
+                df_to_save = df.copy()
+ 
+            if df_to_save.empty:
+                continue
+ 
+            # 7. Sauvegarde — table temporaire unique par chunk
+            tmp_table  = f"_tmp_update_{i}"
             cols_to_save = [
                 'id', 'rsi_14', 'sma_200', 'bb_lower', 'bb_position',
                 'vol_avg_20', 'regime_marche', 'signal_achat', 'confiance_ml',
                 'rsi_slope', 'vol_ratio', 'dist_sma200'
             ]
-            df_update = df[[c for c in cols_to_save if c in df.columns]].copy()
+            df_update = df_to_save[[c for c in cols_to_save if c in df_to_save.columns]].copy()
             df_update.to_sql(tmp_table, engine, if_exists='replace', index=False)
  
             with engine.begin() as conn:
@@ -243,8 +297,10 @@ def run_analysis_logic():
                 """))
                 conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
  
-            print(f"🟢 Chunk {i // chunk_size + 1} / {total_chunks} traité.")
+            rows_saved = len(df_update)
+            print(f"🟢 Chunk {i // chunk_size + 1}/{total_chunks} — {rows_saved} lignes sauvegardées.")
  
-        print("🏁 Analyse massive terminée.")
+        print(f"🏁 Analyse {mode} terminée.")
+ 
     except Exception as e:
-        print(f"❌ Erreur run_analysis_logic : {e}")
+        print(f"❌ Erreur run_analysis_logic (full={full}) : {e}")
