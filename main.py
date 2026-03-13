@@ -38,7 +38,7 @@ COLS_PATH  = "models/trading_forest_cols.joblib"
 def home():
     return {
         "status": "Service Trading IA Actif",
-        "version": "5.0.0",
+        "version": "5.1.0",
         "architecture": "AT-signal → ML-confirm → NLP-veto"
     }
 
@@ -83,14 +83,14 @@ def sync_metadata_logic():
                 data  = stock.info
                 if "symbol" in data:
                     metadata = {
-                        "ticker"  : ticker_symbol,
-                        "name"    : data.get("longName"),
-                        "secteur" : data.get("sector"),
+                        "ticker"   : ticker_symbol,
+                        "name"     : data.get("longName"),
+                        "secteur"  : data.get("sector"),
                         "industrie": data.get("industry"),
-                        "pays"    : data.get("country"),
-                        "monnaie" : data.get("currency"),
+                        "pays"     : data.get("country"),
+                        "monnaie"  : data.get("currency"),
                         "market_cap": data.get("marketCap"),
-                        "pe_ratio": data.get("trailingPE")
+                        "pe_ratio" : data.get("trailingPE")
                     }
                     with engine.begin() as conn:
                         conn.execute(text("""
@@ -101,8 +101,8 @@ def sync_metadata_logic():
                                 (:ticker, :name, :secteur, :industrie, :pays, :monnaie,
                                  :market_cap, :pe_ratio, CURRENT_DATE)
                             ON CONFLICT (ticker) DO UPDATE SET
-                                pe_ratio    = EXCLUDED.pe_ratio,
-                                market_cap  = EXCLUDED.market_cap,
+                                pe_ratio     = EXCLUDED.pe_ratio,
+                                market_cap   = EXCLUDED.market_cap,
                                 derniere_maj = CURRENT_DATE;
                         """), metadata)
                 time.sleep(1)
@@ -112,13 +112,18 @@ def sync_metadata_logic():
         print(f"❌ Erreur Sync: {e}")
 
 # ============================================================
-# LOGIQUE ANALYSE MASSIVE v5.0.0
+# LOGIQUE ANALYSE MASSIVE v5.1.0
 # Architecture : AT signal → ML confirm → log signaux
+# Nouveautés v5.1.0 : 4 features contextuelles supplémentaires
+#   - rsi_slope    : tendance du RSI sur 3 jours
+#   - vol_ratio    : force du volume vs moyenne
+#   - dist_sma200  : distance relative au SMA200
+#   - bb_position  : position dans les bandes de Bollinger
 # ============================================================
 
 def run_analysis_logic():
     if engine is None: return
-    print("🚀 Démarrage de l'analyse v5.0.0 (AT → ML → Log)...")
+    print("🚀 Démarrage de l'analyse v5.1.0 (AT → ML → Log)...")
 
     try:
         # --- Récupération de tous les tickers ---
@@ -164,12 +169,16 @@ def run_analysis_logic():
             df['prix_ajuste'] = pd.to_numeric(df['prix_ajuste'], errors='coerce')
             df = df.dropna(subset=['prix_ajuste']).sort_values(['ticker', 'date'])
 
-            # --- CALCULS TECHNIQUES PAR TICKER ---
+            # --------------------------------------------------------
+            # CALCULS TECHNIQUES PAR TICKER
+            # --------------------------------------------------------
             def compute_group(group):
                 if len(group) < 14: return group
 
                 price = group['prix_ajuste']
                 vol   = group['volume']
+
+                # --- Indicateurs de base ---
 
                 # RSI 14
                 delta = price.diff()
@@ -183,16 +192,42 @@ def run_analysis_logic():
                 # Volume moyen 20j
                 group['vol_avg_20'] = vol.rolling(20, min_periods=1).mean()
 
-                # Bollinger Band inférieure
-                sma_20           = price.rolling(20, min_periods=1).mean()
-                std_20           = price.rolling(20, min_periods=1).std()
+                # Bollinger Bands
+                sma_20            = price.rolling(20, min_periods=1).mean()
+                std_20            = price.rolling(20, min_periods=1).std()
                 group['bb_lower'] = sma_20 - (std_20 * 2)
+                bb_upper          = sma_20 + (std_20 * 2)
+
+                # --- Features contextuelles v5.1.0 ---
+
+                # Tendance du RSI sur 3 jours (positif = RSI qui remonte)
+                group['rsi_slope'] = group['rsi_14'].diff(3)
+
+                # Force du volume : ratio volume actuel / moyenne 20j
+                # > 1.0 = volume supérieur à la moyenne
+                group['vol_ratio'] = vol / (group['vol_avg_20'] + 1e-9)
+
+                # Distance relative au SMA200
+                # Positif = prix au-dessus de la SMA200
+                # Ex: 0.05 = prix 5% au-dessus de la SMA200
+                group['dist_sma200'] = (
+                    (price - group['sma_200']) / (group['sma_200'] + 1e-9)
+                )
+
+                # Position dans les bandes de Bollinger
+                # 0.0 = prix sur la bande basse
+                # 1.0 = prix sur la bande haute
+                # Négatif = prix sous la bande basse (signal fort)
+                bb_range             = bb_upper - group['bb_lower']
+                group['bb_position'] = (
+                    (price - group['bb_lower']) / (bb_range + 1e-9)
+                )
 
                 # --------------------------------------------------------
                 # COUCHE 1 — SIGNAL D'ACHAT AT (4 conditions cumulatives)
                 # --------------------------------------------------------
                 group['signal_achat'] = (
-                    (group['rsi_14']    < 35)               # Survente
+                    (group['rsi_14']    < 35)                # Survente
                     & (price            > group['sma_200'])  # Tendance haussière
                     & (vol              > group['vol_avg_20'])# Confirmation volume
                     & (price            < group['bb_lower'])  # Rebond Bollinger
@@ -213,8 +248,10 @@ def run_analysis_logic():
             # COUCHE 2 — SCORE ML (confirmation du signal AT)
             # --------------------------------------------------------
             if model is not None:
+                # Features enrichies avec les 4 nouvelles colonnes
                 feat_df = pd.get_dummies(
                     df[['rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower',
+                        'rsi_slope', 'vol_ratio', 'dist_sma200', 'bb_position',
                         'secteur', 'market_cap', 'pe_ratio']],
                     columns=['secteur']
                 )
@@ -233,8 +270,8 @@ def run_analysis_logic():
             # --------------------------------------------------------
             # LOGGING DANS signaux_log (traçabilité)
             # --------------------------------------------------------
-            today        = pd.Timestamp.today().date()
-            df_today     = df[df['date'] == str(today)].copy()
+            today    = pd.Timestamp.today().date()
+            df_today = df[df['date'] == str(today)].copy()
 
             if not df_today.empty:
                 log_rows = []
@@ -284,6 +321,7 @@ def run_analysis_logic():
             # --------------------------------------------------------
             cols_to_save = [
                 'id', 'rsi_14', 'vol_avg_20', 'sma_200', 'bb_lower',
+                'rsi_slope', 'vol_ratio', 'dist_sma200', 'bb_position',
                 'signal_achat', 'confiance_ml', 'target_ml'
             ]
             df_save = df[cols_to_save].copy()
@@ -322,3 +360,4 @@ def run_analysis_logic():
 
     except Exception as e:
         print(f"❌ Erreur critique : {e}")
+
