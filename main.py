@@ -8,12 +8,12 @@ from fastapi import FastAPI, BackgroundTasks
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
-# Import de l'entraînement
+# Import de la fonction d'entraînement depuis train_model.py
 try:
     from train_model import train_brain
 except ImportError:
     def train_brain():
-        print("⚠️ Fonction train_brain non trouvée.")
+        print("⚠️ Fonction train_brain non trouvée dans train_model.py")
 
 load_dotenv()
 
@@ -30,31 +30,31 @@ MODEL_PATH = "models/trading_forest.joblib"
 COLS_PATH  = "models/trading_forest_cols.joblib"
 
 # ============================================================
-# ENDPOINTS
+# ENDPOINTS API
 # ============================================================
 
 @app.get("/")
 def home():
     return {
         "status": "Service Trading IA Actif",
-        "version": "5.3.0",
-        "architecture": "AT-signal → ML-confirm (Régime) → NLP-veto"
+        "version": "5.3.1",
+        "syntax_check": "Corrected"
     }
 
 @app.get("/train-model")
 async def trigger_training(background_tasks: BackgroundTasks):
     background_tasks.add_task(train_brain)
-    return {"status": "processing", "message": "Entraînement v3.3 lancé."}
+    return {"status": "processing", "message": "Entraînement v3.3 lancé en arrière-plan."}
 
 @app.get("/sync-metadata")
 async def trigger_sync(background_tasks: BackgroundTasks):
     background_tasks.add_task(sync_metadata_logic)
-    return {"status": "processing", "message": "Sync Yahoo Finance lancée."}
+    return {"status": "processing", "message": "Synchronisation Yahoo Finance lancée."}
 
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_analysis_logic)
-    return {"status": "processing", "message": "Analyse massive v5.3.0 lancée..."}
+    return {"status": "processing", "message": "Analyse massive lancée..."}
 
 # ============================================================
 # LOGIQUE SYNC METADATA
@@ -62,15 +62,4 @@ async def trigger_analysis(background_tasks: BackgroundTasks):
 
 def sync_metadata_logic():
     if engine is None: return
-    print("🔄 Sync Yahoo Finance (Metadata)...")
-    query = """
-        SELECT DISTINCT ticker FROM actions_prix_historique
-        WHERE ticker NOT IN (SELECT ticker FROM tickers_info)
-        OR ticker IN (
-            SELECT ticker FROM tickers_info
-            WHERE derniere_maj < CURRENT_DATE - INTERVAL '30 days'
-        )
-        LIMIT 500;
-    """
-    try:
-        with engine
+    print("
