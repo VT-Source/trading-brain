@@ -174,7 +174,7 @@ def train_brain():
             """), {
                 "placeholder" : b"joblib_file",
                 "placeholder2": b"joblib_file",
-                "acc"         : mean_prec / 100
+                "acc"         : float(mean_prec / 100)
             })
         print(f"📊 Métriques sauvegardées en base "
               f"(précision CV : {mean_prec}%)")
