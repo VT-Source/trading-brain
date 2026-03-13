@@ -37,7 +37,7 @@ COLS_PATH  = "models/trading_forest_cols.joblib"
 def home():
     return {
         "status": "Service Trading IA Actif",
-        "version": "5.4.0",
+        "version": "5.4.1",
         "engine_connected": engine is not None
     }
  
@@ -109,7 +109,7 @@ def sync_metadata_logic():
  
 def run_analysis_logic():
     if engine is None: return
-    print("🚀 Démarrage Analyse v5.4.0...")
+    print("🚀 Démarrage Analyse v5.4.1...")
  
     try:
         # 1. Liste des tickers
@@ -127,7 +127,9 @@ def run_analysis_logic():
             print("✅ Modèle ML chargé.")
  
         # 3. Traitement par chunks
-        chunk_size = 50
+        chunk_size   = 50
+        total_chunks = (len(all_tickers) - 1) // chunk_size + 1
+ 
         for i in range(0, len(all_tickers), chunk_size):
             tickers_chunk = all_tickers[i:i + chunk_size]
  
@@ -162,24 +164,22 @@ def run_analysis_logic():
                 group['sma_50']  = price.rolling(50,  min_periods=1).mean()
  
                 # --- Bandes de Bollinger ---
-                sma_20           = price.rolling(20).mean()
-                std_20           = price.rolling(20).std()
-                bb_upper         = sma_20 + (std_20 * 2)
+                sma_20            = price.rolling(20).mean()
+                std_20            = price.rolling(20).std()
+                bb_upper          = sma_20 + (std_20 * 2)
                 group['bb_lower'] = sma_20 - (std_20 * 2)
-                # Position relative dans les bandes (0 = bas, 1 = haut) — feature ML
-                bb_range         = (bb_upper - group['bb_lower']).replace(0, np.nan)
+                bb_range          = (bb_upper - group['bb_lower']).replace(0, np.nan)
                 group['bb_position'] = (price - group['bb_lower']) / bb_range
  
                 # --- Volume moyen 20j ---
                 group['vol_avg_20'] = vol.rolling(20).mean()
  
-                # --- Features ML supplémentaires ---
+                # --- Features ML — calculées ET sauvegardées en base ---
                 group['rsi_slope']   = group['rsi_14'].diff(3)
                 group['vol_ratio']   = vol / (group['vol_avg_20'] + 1e-9)
                 group['dist_sma200'] = (price - group['sma_200']) / (group['sma_200'] + 1e-9)
  
                 # --- Régime de marché (BULL / BEAR / NEUTRE) ---
-                # FIX : valeurs alignées avec train_model.py
                 group['regime_marche'] = np.where(
                     price > group['sma_50'] * 1.02, 'BULL',
                     np.where(price < group['sma_50'] * 0.98, 'BEAR', 'NEUTRE')
@@ -187,11 +187,11 @@ def run_analysis_logic():
  
                 # ============================================================
                 # SIGNAL ACHAT — 4 conditions AT conformes PROJECT_STATUS v3.1
+                # Condition 1 : RSI < 35            (survente)
+                # Condition 2 : Prix > SMA_200       (tendance haussière long terme)
+                # Condition 3 : Volume > Vol_avg_20  (confirmation marché)
+                # Condition 4 : Prix < BB_lower      (opportunité rebond Bollinger)
                 # ============================================================
-                # Condition 1 : RSI < 35 (survente)
-                # Condition 2 : Prix > SMA_200 (tendance haussière long terme)
-                # Condition 3 : Volume > Vol_avg_20 (confirmation marché)
-                # Condition 4 : Prix < BB_lower (opportunité rebond Bollinger)
                 group['signal_achat'] = (
                     (group['rsi_14'] < 35) &
                     (price > group['sma_200']) &
@@ -205,7 +205,6 @@ def run_analysis_logic():
             # 4. Score ML
             if model is not None:
                 feat_df = pd.get_dummies(df, columns=['secteur', 'regime_marche'])
-                # Aligner les colonnes sur celles utilisées à l'entraînement
                 for col in model_cols:
                     if col not in feat_df.columns:
                         feat_df[col] = 0
@@ -214,12 +213,13 @@ def run_analysis_logic():
             else:
                 df['confiance_ml'] = 0.0
  
-            # 5. Sauvegarde — table temporaire unique par run pour éviter les collisions
-            # FIX : nom unique basé sur le chunk pour éviter les conflits de concurrence
+            # 5. Sauvegarde — toutes les features ML incluses
+            # Table temporaire unique par chunk pour éviter les collisions de concurrence
             tmp_table = f"_tmp_update_{i}"
             cols_to_save = [
                 'id', 'rsi_14', 'sma_200', 'bb_lower', 'bb_position',
-                'vol_avg_20', 'regime_marche', 'signal_achat', 'confiance_ml'
+                'vol_avg_20', 'regime_marche', 'signal_achat', 'confiance_ml',
+                'rsi_slope', 'vol_ratio', 'dist_sma200'
             ]
             df_update = df[[c for c in cols_to_save if c in df.columns]].copy()
             df_update.to_sql(tmp_table, engine, if_exists='replace', index=False)
@@ -234,14 +234,16 @@ def run_analysis_logic():
                         vol_avg_20    = t.vol_avg_20,
                         regime_marche = t.regime_marche,
                         signal_achat  = t.signal_achat,
-                        score_ia      = t.confiance_ml
+                        score_ia      = t.confiance_ml,
+                        rsi_slope     = t.rsi_slope,
+                        vol_ratio     = t.vol_ratio,
+                        dist_sma200   = t.dist_sma200
                     FROM {tmp_table} t
                     WHERE a.id = t.id
                 """))
-                # Nettoyage immédiat de la table temporaire
                 conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
  
-            print(f"🟢 Chunk {i // chunk_size + 1} / {(len(all_tickers) - 1) // chunk_size + 1} traité.")
+            print(f"🟢 Chunk {i // chunk_size + 1} / {total_chunks} traité.")
  
         print("🏁 Analyse massive terminée.")
     except Exception as e:
