@@ -1,10 +1,11 @@
 # ============================================================
-# scheduler.py — Orchestration APScheduler v3.2
+# scheduler.py — Orchestration APScheduler v3.3
 # Trading Brain | VT-Source
 # ============================================================
 # Jobs planifiés (automatiques) :
 #   06h00 lun-ven — Analyse incrémentale AT + ML
 #                   (charge 220j de contexte, sauvegarde 5j)
+#   06h15 lun-ven — Sync ETF sectoriels + Force Relative (30j)
 #   06h30 lun-ven — Sync metadata Yahoo Finance
 #   Dimanche 02h00 — Réentraînement ML hebdomadaire
 #
@@ -13,6 +14,10 @@
 #       - Après un changement de logique AT
 #       - Après l'ajout d'un nouvel indicateur
 #       - Pour initialiser un nouveau ticker
+#
+# ⚠️  /sync-etf-sectoriels?full=true N'EST PAS planifié ici.
+#     À appeler manuellement une seule fois après déploiement
+#     pour initialiser 5 ans d'historique ETF.
 # ============================================================
 
 import logging
@@ -31,11 +36,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 try:
-    from main import run_analysis_logic, sync_metadata_logic
+    from main import run_analysis_logic, sync_metadata_logic, sync_secteurs_etf_logic
 except ImportError as e:
     log.error(f"❌ Impossible d'importer main.py : {e}")
-    run_analysis_logic  = lambda **kw: log.error("run_analysis_logic non disponible")
-    sync_metadata_logic = lambda: log.error("sync_metadata_logic non disponible")
+    run_analysis_logic      = lambda **kw: log.error("run_analysis_logic non disponible")
+    sync_metadata_logic     = lambda: log.error("sync_metadata_logic non disponible")
+    sync_secteurs_etf_logic = lambda **kw: log.error("sync_secteurs_etf_logic non disponible")
 
 try:
     from train_model import train_brain
@@ -60,6 +66,20 @@ def job_analyse():
         log.info("✅ Job analyse terminé.")
     except Exception as e:
         log.error(f"❌ Erreur job analyse : {e}")
+
+
+def job_sync_etf():
+    """
+    Sync quotidienne des ETF sectoriels (mode incrémental — 30 derniers jours).
+    Lance à 06h15, après l'analyse (06h00) et avant la sync metadata (06h30).
+    NE PAS appeler avec full=True ici — utiliser /sync-etf-sectoriels?full=true manuellement.
+    """
+    log.info("📊 Job : Sync ETF sectoriels + Force Relative (incrémental 30j)")
+    try:
+        sync_secteurs_etf_logic(full=False)
+        log.info("✅ Job sync ETF sectoriels terminé.")
+    except Exception as e:
+        log.error(f"❌ Erreur job sync ETF : {e}")
 
 
 def job_sync_metadata():
@@ -97,7 +117,17 @@ def main():
         misfire_grace_time=600
     )
 
-    # Job 2 : Sync metadata — lun-ven à 06h30
+    # Job 2 : Sync ETF sectoriels — lun-ven à 06h15
+    scheduler.add_job(
+        job_sync_etf,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=6, minute=15),
+        id="sync_etf_sectoriels",
+        name="Sync ETF sectoriels + Force Relative",
+        replace_existing=True,
+        misfire_grace_time=600
+    )
+
+    # Job 3 : Sync metadata — lun-ven à 06h30
     scheduler.add_job(
         job_sync_metadata,
         trigger=CronTrigger(day_of_week="mon-fri", hour=6, minute=30),
@@ -107,7 +137,7 @@ def main():
         misfire_grace_time=600
     )
 
-    # Job 3 : Réentraînement ML — dimanche à 02h00
+    # Job 4 : Réentraînement ML — dimanche à 02h00
     scheduler.add_job(
         job_train_model,
         trigger=CronTrigger(day_of_week="sun", hour=2, minute=0),
@@ -119,10 +149,12 @@ def main():
 
     log.info("⏰ Scheduler démarré — Jobs planifiés :")
     log.info("   06h00 (lun-ven) → Analyse incrémentale AT + ML")
+    log.info("   06h15 (lun-ven) → Sync ETF sectoriels + Force Relative")
     log.info("   06h30 (lun-ven) → Sync metadata Yahoo Finance")
     log.info("   02h00 (dimanche) → Réentraînement ML")
     log.info("")
-    log.info("   ⚠️  Recalcul complet : appel MANUEL via /run-analysis-full uniquement")
+    log.info("   ⚠️  Initialisation ETF (5 ans) : GET /sync-etf-sectoriels?full=true  (MANUEL)")
+    log.info("   ⚠️  Recalcul complet AT        : GET /run-analysis-full              (MANUEL)")
     log.info("   Timezone : Europe/Brussels")
 
     try:
