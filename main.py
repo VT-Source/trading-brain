@@ -16,6 +16,12 @@ except ImportError:
     def train_brain():
         print("⚠️ Fonction train_brain non trouvée dans train_model.py")
 
+try:
+    from backtest import run_backtest_logic
+except ImportError:
+    def run_backtest_logic(**kwargs):
+        return {"erreur": "backtest.py non trouvé"}
+
 load_dotenv()
 
 app = FastAPI()
@@ -48,7 +54,7 @@ INCREMENTAL_SAVE_DAYS     = 5
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "5.6.0",
+        "version"         : "5.7.0",
         "engine_connected": engine is not None
     }
 
@@ -137,6 +143,24 @@ async def trigger_full_analysis(background_tasks: BackgroundTasks):
     return {
         "status" : "processing",
         "message": "⚠️ Recalcul COMPLET lancé sur tout l'historique (action manuelle)."
+    }
+
+
+# --- Endpoint backtest (action manuelle uniquement) ---
+# Tickers par défaut : NVDA, AAPL, MSFT, AMZN, ASML
+# Paramètres optionnels : tickers=NVDA,AAPL&horizon=30
+@app.get("/run-backtest")
+async def trigger_backtest(
+    background_tasks: BackgroundTasks,
+    tickers: str = "NVDA,AAPL,MSFT,AMZN,ASML",
+    horizon: int = 30
+):
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    background_tasks.add_task(run_backtest_logic, tickers=ticker_list, horizon=horizon)
+    return {
+        "status" : "processing",
+        "message": f"Backtest v3.5 lancé en arrière-plan — {len(ticker_list)} tickers, horizon={horizon}j.",
+        "tickers": ticker_list
     }
 
 
