@@ -54,7 +54,7 @@ INCREMENTAL_SAVE_DAYS     = 5
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "5.7.0",
+        "version"         : "5.8.0",
         "engine_connected": engine is not None
     }
 
@@ -144,6 +144,104 @@ async def trigger_full_analysis(background_tasks: BackgroundTasks):
         "status" : "processing",
         "message": "⚠️ Recalcul COMPLET lancé sur tout l'historique (action manuelle)."
     }
+
+
+# --- Endpoint diagnostic trades (analyse d'un ticker spécifique) ---
+@app.get("/backtest-detail")
+async def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 30):
+    """
+    Retourne le détail de chaque trade pour un ticker donné.
+    Synchrone (pas de background task) — résultat immédiat dans le navigateur.
+    """
+    from backtest import (load_ticker_data, load_secteur_force,
+                          compute_signals_v35, build_exit_signals)
+    try:
+        df         = load_ticker_data(ticker)
+        df_secteur = load_secteur_force(ticker)
+        df_signals = compute_signals_v35(df, df_secteur)
+
+        price   = df_signals["prix_ajuste"]
+        entries = df_signals["signal_achat"]
+        atr     = df_signals["atr_14"]
+        exits   = build_exit_signals(entries, price, atr, k)
+
+        # Reconstruire les trades
+        trades      = []
+        in_trade    = False
+        entry_date  = None
+        entry_price = None
+
+        for i in range(len(price)):
+            if not in_trade and entries.iloc[i]:
+                in_trade    = True
+                entry_date  = price.index[i]
+                entry_price = float(price.iloc[i])
+            elif in_trade and exits.iloc[i]:
+                exit_date  = price.index[i]
+                exit_price = float(price.iloc[i])
+                ret_pct    = round((exit_price - entry_price) / entry_price * 100, 2)
+
+                # Prix à J+horizon depuis l'entrée
+                loc = price.index.get_loc(entry_date)
+                prix_jh = float(price.iloc[loc + horizon]) if loc + horizon < len(price) else None
+
+                # Conditions actives au moment du signal
+                row = df_signals.loc[entry_date]
+                trades.append({
+                    "entry_date"      : str(entry_date.date()),
+                    "exit_date"       : str(exit_date.date()),
+                    "duree_jours"     : (exit_date - entry_date).days,
+                    "prix_entree"     : entry_price,
+                    "prix_sortie"     : exit_price,
+                    "rendement_pct"   : ret_pct,
+                    "resultat"        : "✅ WIN" if ret_pct > 0 else "❌ LOSS",
+                    f"prix_j{horizon}": round(prix_jh, 2) if prix_jh else None,
+                    "contexte_signal" : {
+                        "tendance_ok"     : bool(row["tendance_ok"]),
+                        "force_rel"       : bool(row["force_rel"]),
+                        "mom_r2"          : round(float(row["mom_r2"]), 4),
+                        "breakout_20j"    : bool(row["breakout_20j"]),
+                        "rvol"            : round(float(row["rvol"]), 2),
+                        "obv_accumulation": bool(row["obv_accumulation"]),
+                        "atr_14"          : round(float(row["atr_14"]), 3),
+                        "sma_200"         : round(float(row["sma_200"]), 2),
+                    }
+                })
+                in_trade = False
+
+        # Signaux sans sortie (position encore ouverte)
+        for i in range(len(price)):
+            if entries.iloc[i]:
+                date_signal = price.index[i]
+                if not any(t["entry_date"] == str(date_signal.date()) for t in trades):
+                    row = df_signals.loc[date_signal]
+                    trades.append({
+                        "entry_date"   : str(date_signal.date()),
+                        "exit_date"    : "OUVERT",
+                        "prix_entree"  : float(price.iloc[i]),
+                        "rendement_pct": round((float(price.iloc[-1]) - float(price.iloc[i])) / float(price.iloc[i]) * 100, 2),
+                        "resultat"     : "🔄 OUVERT",
+                        "contexte_signal": {
+                            "tendance_ok"     : bool(row["tendance_ok"]),
+                            "force_rel"       : bool(row["force_rel"]),
+                            "mom_r2"          : round(float(row["mom_r2"]), 4),
+                            "breakout_20j"    : bool(row["breakout_20j"]),
+                            "rvol"            : round(float(row["rvol"]), 2),
+                            "obv_accumulation": bool(row["obv_accumulation"]),
+                        }
+                    })
+
+        return {
+            "ticker"      : ticker,
+            "k"           : k,
+            "nb_signaux"  : int(entries.sum()),
+            "nb_trades"   : len(trades),
+            "win_rate"    : round(sum(1 for t in trades if "WIN" in t.get("resultat","")) / len(trades) * 100, 1) if trades else 0,
+            "trades"      : sorted(trades, key=lambda t: t["entry_date"])
+        }
+
+    except Exception as e:
+        return {"erreur": str(e)}
 
 
 # --- Endpoint backtest (action manuelle uniquement) ---
