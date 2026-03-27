@@ -39,6 +39,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
 #   RSI_14   → 14 jours
 #   BB_lower → 20 jours
 #   vol_avg  → 20 jours
+#   ATR_14   → 14 jours (réel si prix_haut/prix_bas disponibles)
 # On charge 220 jours pour avoir la SMA_200 correcte + marge.
 # On ne sauvegarde que les 5 derniers jours (nouveaux / modifiés).
 # ============================================================
@@ -54,7 +55,7 @@ INCREMENTAL_SAVE_DAYS     = 5
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "5.8.0",
+        "version"         : "5.9.0",
         "engine_connected": engine is not None
     }
 
@@ -95,7 +96,6 @@ async def trigger_sync(background_tasks: BackgroundTasks):
     background_tasks.add_task(sync_metadata_logic)
     return {"status": "processing", "message": "Synchronisation Yahoo lancée."}
 
-# --- Endpoint ETF sectoriels ---
 @app.get("/sync-etf-sectoriels")
 async def trigger_sync_etf(background_tasks: BackgroundTasks, full: bool = False):
     """
@@ -123,8 +123,20 @@ def get_secteurs_actifs_endpoint():
         "secteurs"          : secteurs
     }
 
-# --- Endpoint quotidien (scheduler 06h00) ---
-# Charge 220 jours de contexte, ne sauvegarde que les 5 derniers jours.
+@app.get("/fill-high-low")
+async def trigger_fill_high_low(background_tasks: BackgroundTasks):
+    """
+    Remplit prix_haut et prix_bas pour tout l'historique depuis yfinance.
+    À appeler UNE SEULE FOIS après déploiement de cette version.
+    Durée estimée : 20-40 minutes selon le nombre de tickers.
+    ⚠️ Action manuelle uniquement — NE PAS planifier dans le scheduler.
+    """
+    background_tasks.add_task(fill_high_low_logic)
+    return {
+        "status" : "processing",
+        "message": "⚠️ Remplissage prix_haut/prix_bas lancé sur tout l'historique (action manuelle unique)."
+    }
+
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_analysis_logic, full=False)
@@ -133,10 +145,6 @@ async def trigger_analysis(background_tasks: BackgroundTasks):
         "message": f"Analyse incrémentale lancée (contexte {INCREMENTAL_LOOKBACK_DAYS}j, sauvegarde {INCREMENTAL_SAVE_DAYS}j)."
     }
 
-# --- Endpoint recalcul complet (action manuelle uniquement) ---
-# À appeler après un changement de logique AT, ajout d'indicateur,
-# ou pour initialiser un nouveau ticker.
-# NE PAS planifier dans le scheduler.
 @app.get("/run-analysis-full")
 async def trigger_full_analysis(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_analysis_logic, full=True)
@@ -145,13 +153,11 @@ async def trigger_full_analysis(background_tasks: BackgroundTasks):
         "message": "⚠️ Recalcul COMPLET lancé sur tout l'historique (action manuelle)."
     }
 
-
-# --- Endpoint diagnostic trades (analyse d'un ticker spécifique) ---
 @app.get("/backtest-detail")
-async def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 30):
+def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 30):
     """
     Retourne le détail de chaque trade pour un ticker donné.
-    Synchrone (pas de background task) — résultat immédiat dans le navigateur.
+    Synchrone — résultat immédiat dans le navigateur.
     """
     from backtest import (load_ticker_data, load_secteur_force,
                           compute_signals_v35, build_exit_signals)
@@ -160,12 +166,12 @@ async def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 3
         df_secteur = load_secteur_force(ticker)
         df_signals = compute_signals_v35(df, df_secteur)
 
-        price   = df_signals["prix_ajuste"]
-        entries = df_signals["signal_achat"]
-        atr     = df_signals["atr_14"]
-        exits   = build_exit_signals(entries, price, atr, k)
+        price      = df_signals["prix_ajuste"]
+        entries    = df_signals["signal_achat"]
+        atr        = df_signals["atr_14"]
+        exits      = build_exit_signals(entries, price, atr, k)
+        atr_type   = "réel (H-L)" if df["prix_haut"].notna().any() else "approché (C-C)"
 
-        # Reconstruire les trades
         trades      = []
         in_trade    = False
         entry_date  = None
@@ -180,23 +186,19 @@ async def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 3
                 exit_date  = price.index[i]
                 exit_price = float(price.iloc[i])
                 ret_pct    = round((exit_price - entry_price) / entry_price * 100, 2)
-
-                # Prix à J+horizon depuis l'entrée
-                loc = price.index.get_loc(entry_date)
-                prix_jh = float(price.iloc[loc + horizon]) if loc + horizon < len(price) else None
-
-                # Conditions actives au moment du signal
-                row = df_signals.loc[entry_date]
+                loc        = price.index.get_loc(entry_date)
+                prix_jh    = float(price.iloc[loc + horizon]) if loc + horizon < len(price) else None
+                row        = df_signals.loc[entry_date]
                 trades.append({
-                    "entry_date"      : str(entry_date.date()),
-                    "exit_date"       : str(exit_date.date()),
-                    "duree_jours"     : (exit_date - entry_date).days,
-                    "prix_entree"     : entry_price,
-                    "prix_sortie"     : exit_price,
-                    "rendement_pct"   : ret_pct,
-                    "resultat"        : "✅ WIN" if ret_pct > 0 else "❌ LOSS",
-                    f"prix_j{horizon}": round(prix_jh, 2) if prix_jh else None,
-                    "contexte_signal" : {
+                    "entry_date"       : str(entry_date.date()),
+                    "exit_date"        : str(exit_date.date()),
+                    "duree_jours"      : (exit_date - entry_date).days,
+                    "prix_entree"      : entry_price,
+                    "prix_sortie"      : exit_price,
+                    "rendement_pct"    : ret_pct,
+                    "resultat"         : "✅ WIN" if ret_pct > 0 else "❌ LOSS",
+                    f"prix_j{horizon}" : round(prix_jh, 2) if prix_jh else None,
+                    "contexte_signal"  : {
                         "tendance_ok"     : bool(row["tendance_ok"]),
                         "force_rel"       : bool(row["force_rel"]),
                         "mom_r2"          : round(float(row["mom_r2"]), 4),
@@ -204,6 +206,7 @@ async def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 3
                         "rvol"            : round(float(row["rvol"]), 2),
                         "obv_accumulation": bool(row["obv_accumulation"]),
                         "atr_14"          : round(float(row["atr_14"]), 3),
+                        "atr_type"        : atr_type,
                         "sma_200"         : round(float(row["sma_200"]), 2),
                     }
                 })
@@ -232,21 +235,18 @@ async def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 3
                     })
 
         return {
-            "ticker"      : ticker,
-            "k"           : k,
-            "nb_signaux"  : int(entries.sum()),
-            "nb_trades"   : len(trades),
-            "win_rate"    : round(sum(1 for t in trades if "WIN" in t.get("resultat","")) / len(trades) * 100, 1) if trades else 0,
-            "trades"      : sorted(trades, key=lambda t: t["entry_date"])
+            "ticker"    : ticker,
+            "k"         : k,
+            "atr_type"  : atr_type,
+            "nb_signaux": int(entries.sum()),
+            "nb_trades" : len(trades),
+            "win_rate"  : round(sum(1 for t in trades if "WIN" in t.get("resultat", "")) / len(trades) * 100, 1) if trades else 0,
+            "trades"    : sorted(trades, key=lambda t: t["entry_date"])
         }
 
     except Exception as e:
         return {"erreur": str(e)}
 
-
-# --- Endpoint backtest (action manuelle uniquement) ---
-# Tickers par défaut : NVDA, AAPL, MSFT, AMZN, ASML
-# Paramètres optionnels : tickers=NVDA,AAPL&horizon=30
 @app.get("/run-backtest")
 async def trigger_backtest(
     background_tasks: BackgroundTasks,
@@ -344,6 +344,103 @@ def sync_metadata_logic():
 
 
 # ============================================================
+# LOGIQUE FILL HIGH/LOW — ACTION MANUELLE UNIQUE
+# ============================================================
+
+def fill_high_low_logic():
+    """
+    Remplit prix_haut, prix_bas et prix_ouverture pour tout l'historique depuis yfinance.
+    Traite les tickers un par un avec pause 0.5s pour éviter les bans Yahoo.
+    À appeler UNE SEULE FOIS via /fill-high-low après déploiement v5.9.0.
+    Les runs suivants de run_analysis_logic maintiennent high/low automatiquement.
+    """
+    if engine is None:
+        print("❌ fill_high_low_logic : engine non connecté.")
+        return
+
+    print("📥 Remplissage prix_haut / prix_bas / prix_ouverture — historique complet...")
+
+    try:
+        with engine.connect() as conn:
+            result      = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique ORDER BY ticker"))
+            all_tickers = [row[0] for row in result]
+
+        print(f"   {len(all_tickers)} tickers à traiter.")
+
+        chunk_size    = 20
+        total_chunks  = (len(all_tickers) - 1) // chunk_size + 1
+        total_updated = 0
+
+        for i in range(0, len(all_tickers), chunk_size):
+            chunk         = all_tickers[i:i + chunk_size]
+            chunk_updated = 0
+
+            for ticker_symbol in chunk:
+                try:
+                    df_yf = yf.download(
+                        ticker_symbol,
+                        period="5y",
+                        interval="1d",
+                        auto_adjust=True,
+                        progress=False
+                    )
+
+                    if df_yf.empty:
+                        print(f"   ⚠️ {ticker_symbol} — aucune donnée Yahoo.")
+                        continue
+
+                    df_yf = df_yf.reset_index()
+                    df_yf.columns = [c[0] if isinstance(c, tuple) else c for c in df_yf.columns]
+                    df_yf = df_yf.rename(columns={
+                        "Date"  : "date",
+                        "High"  : "prix_haut",
+                        "Low"   : "prix_bas",
+                        "Open"  : "prix_ouverture",
+                    })
+
+                    df_yf["date"]   = pd.to_datetime(df_yf["date"]).dt.date
+                    df_yf["ticker"] = ticker_symbol
+
+                    cols_needed = ["ticker", "date", "prix_haut", "prix_bas", "prix_ouverture"]
+                    records     = df_yf[[c for c in cols_needed if c in df_yf.columns]].dropna(
+                        subset=["prix_haut", "prix_bas"]
+                    ).to_dict("records")
+
+                    if not records:
+                        continue
+
+                    tmp = f"_tmp_hl_{ticker_symbol.replace('.', '_').replace('-', '_').replace('^', '')}"
+                    pd.DataFrame(records).to_sql(tmp, engine, if_exists="replace", index=False)
+
+                    with engine.begin() as conn:
+                        conn.execute(text(f"""
+                            UPDATE actions_prix_historique a SET
+                                prix_haut      = t.prix_haut,
+                                prix_bas       = t.prix_bas,
+                                prix_ouverture = t.prix_ouverture
+                            FROM {tmp} t
+                            WHERE a.ticker = t.ticker
+                              AND a.date   = t.date::date
+                        """))
+                        conn.execute(text(f"DROP TABLE IF EXISTS {tmp}"))
+
+                    chunk_updated += len(records)
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    print(f"   ❌ {ticker_symbol} : {e}")
+                    continue
+
+            total_updated += chunk_updated
+            print(f"   🟢 Chunk {i // chunk_size + 1}/{total_chunks} — {chunk_updated} lignes mises à jour.")
+
+        print(f"🏁 Fill high/low terminé — {total_updated} lignes mises à jour au total.")
+
+    except Exception as e:
+        print(f"❌ Erreur fill_high_low_logic : {e}")
+
+
+# ============================================================
 # LOGIQUE SYNC ETF SECTORIELS
 # ============================================================
 
@@ -367,7 +464,6 @@ def sync_secteurs_etf_logic(full: bool = False):
     print(f"🔄 Sync ETF sectoriels — mode {mode}...")
 
     try:
-        # 1. Récupérer tous les ETF actifs + leurs indices de référence
         with engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT ticker_etf, indice_reference
@@ -385,18 +481,12 @@ def sync_secteurs_etf_logic(full: bool = False):
 
         print(f"   {len(etf_list)} ETF sectoriels + {len(indices)} indices à synchroniser.")
 
-        # --------------------------------------------------------
-        # 2. Télécharger les indices de référence
-        # --------------------------------------------------------
         print("   📥 Téléchargement indices de référence...")
         for idx_ticker in indices:
             try:
                 df_idx = yf.download(
-                    idx_ticker,
-                    period=period,
-                    interval="1d",
-                    auto_adjust=True,
-                    progress=False
+                    idx_ticker, period=period, interval="1d",
+                    auto_adjust=True, progress=False
                 )
                 if df_idx.empty:
                     print(f"   ⚠️ Aucune donnée pour l'indice {idx_ticker}")
@@ -405,13 +495,10 @@ def sync_secteurs_etf_logic(full: bool = False):
                 df_idx = df_idx.reset_index()
                 df_idx.columns = [c[0] if isinstance(c, tuple) else c for c in df_idx.columns]
                 df_idx = df_idx.rename(columns={"Date": "date", "Close": "prix_cloture", "Adj Close": "prix_ajuste"})
-
                 if "prix_ajuste" not in df_idx.columns:
                     df_idx["prix_ajuste"] = df_idx["prix_cloture"]
-
                 df_idx["date"]          = pd.to_datetime(df_idx["date"]).dt.date
                 df_idx["ticker_indice"] = idx_ticker
-
                 records = df_idx[["ticker_indice", "date", "prix_cloture", "prix_ajuste"]].to_dict("records")
 
                 with engine.begin() as conn:
@@ -430,18 +517,12 @@ def sync_secteurs_etf_logic(full: bool = False):
                 print(f"   ❌ Erreur indice {idx_ticker} : {e}")
                 continue
 
-        # --------------------------------------------------------
-        # 3. Télécharger et traiter les ETF sectoriels
-        # --------------------------------------------------------
         print("   📥 Téléchargement ETF sectoriels...")
         for etf_ticker in etf_list:
             try:
                 df_etf = yf.download(
-                    etf_ticker,
-                    period=period,
-                    interval="1d",
-                    auto_adjust=True,
-                    progress=False
+                    etf_ticker, period=period, interval="1d",
+                    auto_adjust=True, progress=False
                 )
                 if df_etf.empty:
                     print(f"   ⚠️ Aucune donnée pour {etf_ticker}")
@@ -450,31 +531,21 @@ def sync_secteurs_etf_logic(full: bool = False):
                 df_etf = df_etf.reset_index()
                 df_etf.columns = [c[0] if isinstance(c, tuple) else c for c in df_etf.columns]
                 df_etf = df_etf.rename(columns={
-                    "Date"      : "date",
-                    "Close"     : "prix_cloture",
-                    "Adj Close" : "prix_ajuste",
-                    "Volume"    : "volume"
+                    "Date": "date", "Close": "prix_cloture",
+                    "Adj Close": "prix_ajuste", "Volume": "volume"
                 })
-
                 if "prix_ajuste" not in df_etf.columns:
                     df_etf["prix_ajuste"] = df_etf["prix_cloture"]
                 if "volume" not in df_etf.columns:
                     df_etf["volume"] = 0
-
                 df_etf["date"]       = pd.to_datetime(df_etf["date"]).dt.date
                 df_etf["ticker_etf"] = etf_ticker
 
-                # ------------------------------------------------
-                # 4. Récupérer le prix de l'indice de référence
-                # ------------------------------------------------
                 idx_ticker = etf_to_idx[etf_ticker]
-
                 with engine.connect() as conn:
                     df_indice = pd.read_sql(text("""
                         SELECT date, prix_ajuste AS prix_indice
-                        FROM indices_prix
-                        WHERE ticker_indice = :idx
-                        ORDER BY date ASC
+                        FROM indices_prix WHERE ticker_indice = :idx ORDER BY date ASC
                     """), conn, params={"idx": idx_ticker})
 
                 if df_indice.empty:
@@ -482,36 +553,22 @@ def sync_secteurs_etf_logic(full: bool = False):
                     continue
 
                 df_indice["date"] = pd.to_datetime(df_indice["date"]).dt.date
+                df_merged         = df_etf.merge(df_indice, on="date", how="inner")
 
-                # ------------------------------------------------
-                # 5. Calcul ratio de force relative
-                # ------------------------------------------------
-                df_merged = df_etf.merge(df_indice, on="date", how="inner")
-
-                # Normalisation à la première date disponible
-                first_etf_price = df_merged["prix_ajuste"].iloc[0]
-                first_idx_price = df_merged["prix_indice"].iloc[0]
-
+                first_etf = df_merged["prix_ajuste"].iloc[0]
+                first_idx = df_merged["prix_indice"].iloc[0]
                 df_merged["ratio_force_relative"] = (
-                    (df_merged["prix_ajuste"] / first_etf_price) /
-                    (df_merged["prix_indice"] / first_idx_price)
+                    (df_merged["prix_ajuste"] / first_etf) /
+                    (df_merged["prix_indice"] / first_idx)
                 )
+                df_merged["mm50_ratio"]        = df_merged["ratio_force_relative"].rolling(50, min_periods=1).mean()
+                df_merged["ratio_vs_mm50"]     = df_merged["ratio_force_relative"] / df_merged["mm50_ratio"]
+                df_merged["en_force_relative"] = df_merged["ratio_vs_mm50"] > 1.0
 
-                # MM50 du ratio (décision 2026-03-17 — plus réactif aux rotations sectorielles)
-                # min_periods=1 : évite les NaN en mode incrémental (< 50 jours chargés)
-                df_merged["mm50_ratio"]         = df_merged["ratio_force_relative"].rolling(50, min_periods=1).mean()
-                df_merged["ratio_vs_mm50"]      = df_merged["ratio_force_relative"] / df_merged["mm50_ratio"]
-                df_merged["en_force_relative"]  = df_merged["ratio_vs_mm50"] > 1.0
-
-                # ------------------------------------------------
-                # 6. Upsert dans secteurs_etf_prix
-                # ------------------------------------------------
-                cols_to_save = [
-                    "ticker_etf", "date", "prix_cloture", "prix_ajuste",
-                    "volume", "prix_indice", "ratio_force_relative",
-                    "ratio_vs_mm50", "en_force_relative"
-                ]
-                records = df_merged[cols_to_save].to_dict("records")
+                records = df_merged[[
+                    "ticker_etf", "date", "prix_cloture", "prix_ajuste", "volume",
+                    "prix_indice", "ratio_force_relative", "ratio_vs_mm50", "en_force_relative"
+                ]].to_dict("records")
 
                 for r in records:
                     r["en_force_relative"] = bool(r["en_force_relative"])
@@ -553,17 +610,12 @@ def sync_secteurs_etf_logic(full: bool = False):
 
 # ============================================================
 # HELPER : Secteurs en force relative
-# Utilisée par run_analysis_logic (Phase 1 Étape 3) et /secteurs-actifs
 # ============================================================
 
 def get_secteurs_en_force() -> list[dict]:
     """
     Retourne la liste des secteurs Yahoo actuellement en force relative.
     Interroge la vue v_secteurs_en_force (dernière date disponible).
-
-    Retourne une liste de dicts :
-      [{"secteur_yahoo": "Technology", "zone": "US", "ticker_etf": "XLK", ...}, ...]
-
     Si la table est vide ou absente → retourne [] sans planter run_analysis_logic.
     """
     if engine is None:
@@ -602,7 +654,7 @@ def run_analysis_logic(full: bool = False):
     if engine is None: return
 
     mode = "COMPLET" if full else "INCRÉMENTAL"
-    print(f"🚀 Démarrage Analyse v5.6.0 — mode {mode}...")
+    print(f"🚀 Démarrage Analyse v5.9.0 — mode {mode}...")
 
     try:
         # 1. Liste des tickers
@@ -633,8 +685,11 @@ def run_analysis_logic(full: bool = False):
         for i in range(0, len(all_tickers), chunk_size):
             tickers_chunk = all_tickers[i:i + chunk_size]
 
+            # prix_haut et prix_bas inclus pour ATR réel (remplis par /fill-high-low)
             query = text(f"""
-                SELECT a.id, a.ticker, a.date, a.prix_cloture, a.prix_ajuste, a.volume,
+                SELECT a.id, a.ticker, a.date,
+                       a.prix_cloture, a.prix_ajuste, a.volume,
+                       a.prix_haut, a.prix_bas,
                        t.secteur, t.market_cap, t.pe_ratio
                 FROM actions_prix_historique a
                 LEFT JOIN tickers_info t ON a.ticker = t.ticker
@@ -666,11 +721,11 @@ def run_analysis_logic(full: bool = False):
                 group['sma_50']  = price.rolling(50,  min_periods=1).mean()
 
                 # Bandes de Bollinger
-                sma_20            = price.rolling(20).mean()
-                std_20            = price.rolling(20).std()
-                bb_upper          = sma_20 + (std_20 * 2)
-                group['bb_lower'] = sma_20 - (std_20 * 2)
-                bb_range          = (bb_upper - group['bb_lower']).replace(0, np.nan)
+                sma_20               = price.rolling(20).mean()
+                std_20               = price.rolling(20).std()
+                bb_upper             = sma_20 + (std_20 * 2)
+                group['bb_lower']    = sma_20 - (std_20 * 2)
+                bb_range             = (bb_upper - group['bb_lower']).replace(0, np.nan)
                 group['bb_position'] = (price - group['bb_lower']) / bb_range
 
                 # Volume moyen 20j
@@ -680,6 +735,25 @@ def run_analysis_logic(full: bool = False):
                 group['rsi_slope']   = group['rsi_14'].diff(3)
                 group['vol_ratio']   = vol / (group['vol_avg_20'] + 1e-9)
                 group['dist_sma200'] = (price - group['sma_200']) / (group['sma_200'] + 1e-9)
+
+                # ATR 14 — réel (H-L) si disponible, approché (C-C) sinon
+                has_hl = (
+                    'prix_haut' in group.columns and
+                    'prix_bas'  in group.columns and
+                    group['prix_haut'].notna().any() and
+                    group['prix_bas'].notna().any()
+                )
+                if has_hl:
+                    prev_close = price.shift(1)
+                    tr = pd.concat([
+                        group['prix_haut'] - group['prix_bas'],
+                        (group['prix_haut'] - prev_close).abs(),
+                        (group['prix_bas']  - prev_close).abs()
+                    ], axis=1).max(axis=1)
+                else:
+                    tr = price.diff().abs()
+
+                group['atr_14'] = tr.rolling(14, min_periods=1).mean()
 
                 # Régime de marché
                 group['regime_marche'] = np.where(
@@ -707,7 +781,7 @@ def run_analysis_logic(full: bool = False):
                 for col in model_cols:
                     if col not in feat_df.columns:
                         feat_df[col] = 0
-                X_input          = feat_df[model_cols].fillna(0).replace([np.inf, -np.inf], 0)
+                X_input            = feat_df[model_cols].fillna(0).replace([np.inf, -np.inf], 0)
                 df['confiance_ml'] = model.predict_proba(X_input)[:, 1]
             else:
                 df['confiance_ml'] = 0.0
@@ -727,7 +801,7 @@ def run_analysis_logic(full: bool = False):
             cols_to_save = [
                 'id', 'rsi_14', 'sma_200', 'bb_lower', 'bb_position',
                 'vol_avg_20', 'regime_marche', 'signal_achat', 'confiance_ml',
-                'rsi_slope', 'vol_ratio', 'dist_sma200'
+                'rsi_slope', 'vol_ratio', 'dist_sma200', 'atr_14'
             ]
             df_update = df_to_save[[c for c in cols_to_save if c in df_to_save.columns]].copy()
             df_update.to_sql(tmp_table, engine, if_exists='replace', index=False)
@@ -745,7 +819,8 @@ def run_analysis_logic(full: bool = False):
                         score_ia      = t.confiance_ml,
                         rsi_slope     = t.rsi_slope,
                         vol_ratio     = t.vol_ratio,
-                        dist_sma200   = t.dist_sma200
+                        dist_sma200   = t.dist_sma200,
+                        atr_14        = t.atr_14
                     FROM {tmp_table} t
                     WHERE a.id = t.id
                 """))

@@ -58,6 +58,7 @@ def load_ticker_data(ticker: str) -> pd.DataFrame:
 
     query = text("""
         SELECT date, prix_cloture, prix_ajuste, volume,
+               prix_haut, prix_bas,
                sma_200, vol_avg_20, rsi_14
         FROM actions_prix_historique
         WHERE ticker = :ticker
@@ -148,13 +149,32 @@ def momentum_r2_score(prices: pd.Series, window: int = MOMENTUM_WINDOW) -> pd.Se
 
 def compute_atr(df: pd.DataFrame, window: int = ATR_WINDOW) -> pd.Series:
     """
-    ATR (Average True Range) calculé depuis prix_ajuste en mode close-to-close.
-    Note : sans high/low en base, on approxime TR = |close - prev_close|.
-    Acceptable pour le backtest — à affiner si high/low ajoutés en Phase 2.
+    ATR (Average True Range) sur 14 jours.
+    - Mode réel    : utilise prix_haut et prix_bas (True Range complet)
+                     activé automatiquement après /fill-high-low
+    - Mode approché : close-to-close si high/low absents (null en base)
     """
-    close     = df["prix_ajuste"]
-    prev_close = close.shift(1)
-    tr         = (close - prev_close).abs()
+    close = df["prix_ajuste"]
+
+    has_hl = (
+        "prix_haut" in df.columns and
+        "prix_bas"  in df.columns and
+        df["prix_haut"].notna().any() and
+        df["prix_bas"].notna().any()
+    )
+
+    if has_hl:
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            df["prix_haut"] - df["prix_bas"],
+            (df["prix_haut"] - prev_close).abs(),
+            (df["prix_bas"]  - prev_close).abs()
+        ], axis=1).max(axis=1)
+        print(f"      ATR mode : réel (High-Low) ✅")
+    else:
+        tr = close.diff().abs()
+        print(f"      ATR mode : approché (Close-Close) ⚠️ — lancer /fill-high-low")
+
     return tr.rolling(window, min_periods=1).mean()
 
 
