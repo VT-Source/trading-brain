@@ -350,9 +350,7 @@ def sync_metadata_logic():
 def fill_high_low_logic():
     """
     Remplit prix_haut, prix_bas et prix_ouverture pour tout l'historique depuis yfinance.
-    Traite les tickers un par un avec pause 0.5s pour éviter les bans Yahoo.
-    À appeler UNE SEULE FOIS via /fill-high-low après déploiement v5.9.0.
-    Les runs suivants de run_analysis_logic maintiennent high/low automatiquement.
+    Correction : Utilise la même transaction (conn) pour to_sql et l'UPDATE.
     """
     if engine is None:
         print("❌ fill_high_low_logic : engine non connecté.")
@@ -362,17 +360,17 @@ def fill_high_low_logic():
 
     try:
         with engine.connect() as conn:
-            result      = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique ORDER BY ticker"))
+            result = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique ORDER BY ticker"))
             all_tickers = [row[0] for row in result]
 
         print(f"   {len(all_tickers)} tickers à traiter.")
 
-        chunk_size    = 20
-        total_chunks  = (len(all_tickers) - 1) // chunk_size + 1
+        chunk_size = 20
+        total_chunks = (len(all_tickers) - 1) // chunk_size + 1
         total_updated = 0
 
         for i in range(0, len(all_tickers), chunk_size):
-            chunk         = all_tickers[i:i + chunk_size]
+            chunk = all_tickers[i:i + chunk_size]
             chunk_updated = 0
 
             for ticker_symbol in chunk:
@@ -386,45 +384,50 @@ def fill_high_low_logic():
                     )
 
                     if df_yf.empty:
-                        print(f"   ⚠️ {ticker_symbol} — aucune donnée Yahoo.")
                         continue
 
                     df_yf = df_yf.reset_index()
                     df_yf.columns = [c[0] if isinstance(c, tuple) else c for c in df_yf.columns]
                     df_yf = df_yf.rename(columns={
-                        "Date"  : "date",
-                        "High"  : "prix_haut",
-                        "Low"   : "prix_bas",
-                        "Open"  : "prix_ouverture",
+                        "Date": "date",
+                        "High": "prix_haut",
+                        "Low": "prix_bas",
+                        "Open": "prix_ouverture",
                     })
 
-                    df_yf["date"]   = pd.to_datetime(df_yf["date"]).dt.date
+                    df_yf["date"] = pd.to_datetime(df_yf["date"]).dt.date
                     df_yf["ticker"] = ticker_symbol
 
                     cols_needed = ["ticker", "date", "prix_haut", "prix_bas", "prix_ouverture"]
-                    records     = df_yf[[c for c in cols_needed if c in df_yf.columns]].dropna(
-                        subset=["prix_haut", "prix_bas"]
-                    ).to_dict("records")
+                    df_to_save = df_yf[[c for c in cols_needed if c in df_yf.columns]].dropna(subset=["prix_haut", "prix_bas"])
 
-                    if not records:
+                    if df_to_save.empty:
                         continue
 
-                    tmp = f"_tmp_hl_{ticker_symbol.replace('.', '_').replace('-', '_').replace('^', '')}"
-                    pd.DataFrame(records).to_sql(tmp, engine, if_exists="replace", index=False)
+                    # On nettoie le nom de la table (minuscules et sans caractères spéciaux)
+                    clean_ticker = ticker_symbol.lower().replace('.', '_').replace('-', '_').replace('^', '')
+                    tmp_table_name = f"_tmp_hl_{clean_ticker}"
 
+                    # --- CORE FIX: TOUTE L'OPÉRATION DANS LA MÊME TRANSACTION ---
                     with engine.begin() as conn:
+                        # 1. On écrit les données dans la table temporaire en utilisant la connexion active
+                        df_to_save.to_sql(tmp_table_name, conn, if_exists="replace", index=False)
+
+                        # 2. On fait l'UPDATE
                         conn.execute(text(f"""
                             UPDATE actions_prix_historique a SET
                                 prix_haut      = t.prix_haut,
                                 prix_bas       = t.prix_bas,
                                 prix_ouverture = t.prix_ouverture
-                            FROM {tmp} t
+                            FROM {tmp_table_name} t
                             WHERE a.ticker = t.ticker
                               AND a.date   = t.date::date
                         """))
-                        conn.execute(text(f"DROP TABLE IF EXISTS {tmp}"))
+                        
+                        # 3. On supprime la table
+                        conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table_name}"))
 
-                    chunk_updated += len(records)
+                    chunk_updated += len(df_to_save)
                     time.sleep(0.5)
 
                 except Exception as e:
@@ -432,9 +435,9 @@ def fill_high_low_logic():
                     continue
 
             total_updated += chunk_updated
-            print(f"   🟢 Chunk {i // chunk_size + 1}/{total_chunks} — {chunk_updated} lignes mises à jour.")
+            print(f"   🟢 Chunk {i // chunk_size + 1}/{total_chunks} terminé.")
 
-        print(f"🏁 Fill high/low terminé — {total_updated} lignes mises à jour au total.")
+        print(f"🏁 Fill high/low terminé — {total_updated} lignes mises à jour.")
 
     except Exception as e:
         print(f"❌ Erreur fill_high_low_logic : {e}")
