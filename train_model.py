@@ -142,18 +142,18 @@ def train_brain():
         with engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO models_store
-                    (model_name, model_data, cols_data, precision)
+                    (model_name, model_data, columns_data, accuracy)
                 VALUES
-                    ('trading_forest', :model_data, :cols_data, :precision)
+                    ('trading_forest', :model_data, :columns_data, :accuracy)
                 ON CONFLICT (model_name) DO UPDATE SET
-                    model_data = EXCLUDED.model_data,
-                    cols_data  = EXCLUDED.cols_data,
-                    precision  = EXCLUDED.precision,
-                    created_at = CURRENT_TIMESTAMP
+                    model_data   = EXCLUDED.model_data,
+                    columns_data = EXCLUDED.columns_data,
+                    accuracy     = EXCLUDED.accuracy,
+                    updated_at   = CURRENT_TIMESTAMP
             """), {
-                "model_data": buf_model.getvalue(),
-                "cols_data" : buf_cols.getvalue(),
-                "precision" : round(float(mean_prec), 4)
+                "model_data"   : buf_model.getvalue(),
+                "columns_data" : buf_cols.getvalue(),
+                "accuracy"     : round(float(mean_prec), 4)
             })
 
         print(f"✅ Modèle sauvegardé en base PostgreSQL (models_store)")
