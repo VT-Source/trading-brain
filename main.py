@@ -67,9 +67,9 @@ def check_model():
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT model_name, precision, created_at,
-                       LENGTH(model_data) AS model_size_bytes,
-                       LENGTH(cols_data)  AS cols_size_bytes
+                SELECT model_name, accuracy, updated_at,
+                       LENGTH(model_data)   AS model_size_bytes,
+                       LENGTH(columns_data) AS cols_size_bytes
                 FROM models_store
                 WHERE model_name = 'trading_forest'
             """)).fetchone()
@@ -77,8 +77,8 @@ def check_model():
             return {
                 "model_found"      : True,
                 "model_name"       : row[0],
-                "precision"        : f"{round(row[1] * 100, 2)}%",
-                "trained_at"       : str(row[2]),
+                "accuracy"         : f"{round(row[1] * 100, 2)}%",
+                "updated_at"       : str(row[2]),
                 "model_size_bytes" : row[3],
                 "cols_size_bytes"  : row[4]
             }
