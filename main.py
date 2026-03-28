@@ -247,6 +247,84 @@ def backtest_detail(ticker: str = "MSFT", k: float = 2.0, horizon: int = 30):
     except Exception as e:
         return {"erreur": str(e)}
 
+@app.get("/schema-diagnostic")
+def schema_diagnostic():
+    """
+    Retourne le schéma de chaque table + pourcentage de valeurs NULL par colonne.
+    À partager dans le projet Claude pour contextualiser le modèle de données.
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    tables = [
+        "actions_prix_historique",
+        "tickers_info",
+        "positions",
+        "signaux_log",
+        "models_store",
+        "secteurs_etf",
+        "secteurs_etf_prix",
+        "indices_prix"
+    ]
+
+    result = {}
+
+    with engine.connect() as conn:
+        for table in tables:
+            # 1. Schéma
+            schema_rows = conn.execute(text("""
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_name = :table
+                ORDER BY ordinal_position
+            """), {"table": table}).fetchall()
+
+            if not schema_rows:
+                result[table] = {"erreur": "table absente"}
+                continue
+
+            columns = [r[0] for r in schema_rows]
+            schema  = [
+                {
+                    "colonne" : r[0],
+                    "type"    : r[1],
+                    "nullable": r[2],
+                    "defaut"  : r[3]
+                }
+                for r in schema_rows
+            ]
+
+            # 2. Nombre total de lignes
+            try:
+                total = conn.execute(text(
+                    f"SELECT COUNT(*) FROM {table}"
+                )).scalar()
+            except Exception:
+                total = None
+
+            # 3. Pourcentage NULL par colonne
+            null_stats = {}
+            if total and total > 0:
+                for col in columns:
+                    try:
+                        null_count = conn.execute(text(
+                            f"SELECT COUNT(*) FROM {table} WHERE {col} IS NULL"
+                        )).scalar()
+                        null_stats[col] = {
+                            "null_count": null_count,
+                            "null_pct"  : round(100.0 * null_count / total, 1)
+                        }
+                    except Exception:
+                        null_stats[col] = {"erreur": "calcul impossible"}
+
+            result[table] = {
+                "nb_lignes" : total,
+                "schema"    : schema,
+                "null_stats": null_stats
+            }
+
+    return result
+
 @app.get("/run-backtest")
 async def trigger_backtest(
     background_tasks: BackgroundTasks,
