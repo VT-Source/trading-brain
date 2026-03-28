@@ -354,8 +354,8 @@ def load_model_from_db():
         return None, None
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT model_data, cols_data, precision, created_at
+                        row = conn.execute(text("""
+                SELECT model_data, columns_data, accuracy, updated_at
                 FROM models_store
                 WHERE model_name = 'trading_forest'
             """)).fetchone()
