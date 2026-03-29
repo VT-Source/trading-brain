@@ -128,7 +128,7 @@ def load_index_data(ticker: str) -> pd.DataFrame:
     try:
         # 1. Déduire l'indice de référence depuis le secteur du ticker
         query_indice = text("""
-            SELECT DISTINCT se.indice_reference
+            SELECT se.indice_reference
             FROM secteurs_etf se
             JOIN tickers_info ti ON ti.secteur = se.secteur_yahoo
             WHERE ti.ticker = :ticker
