@@ -8,9 +8,10 @@
 #   1. Signal v3.5 (momentum R² + breakout 20j + RVOL>2 + OBV)
 #   2. Sortie : Trailing Stop ATR (Chandelier Exit) — k = 2.0/2.5/3.0/3.5
 #   3. Comparaison : signaux en secteur fort vs hors secteur fort
-#   4. Critère de validation : Sharpe Ratio > 1.0 sur 3+ tickers
+#   4. Filtre macro : indice de référence > SMA200
+#   5. Critère de validation : Sharpe Ratio > 1.0 sur 3+ tickers
 #
-# Données : PostgreSQL (actions_prix_historique + secteurs_etf_prix)
+# Données : PostgreSQL (actions_prix_historique + secteurs_etf_prix + indices_prix)
 # ============================================================
 
 import os
@@ -33,15 +34,15 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
 # PARAMÈTRES
 # ============================================================
 TICKERS_DEFAULT    = ["NVDA", "AAPL", "MSFT", "AMZN", "ASML"]
-K_VALUES           = [2.0, 2.5, 3.0, 3.5]   # multiplicateurs ATR à tester
-MOMENTUM_WINDOW    = 252                      # 12 mois de trading
-ROC_WINDOW         = 252                      # rendement annuel
-BREAKOUT_WINDOW    = 20                       # plus haut 20j
-RVOL_THRESHOLD     = 2.0                      # conviction institutionnelle
-VOL_AVG_WINDOW     = 20                       # base RVOL
-OBV_SLOPE_WINDOW   = 10                       # pente OBV
-ATR_WINDOW         = 14                       # ATR standard
-CAPITAL_INITIAL    = 10_000                   # € par ticker pour le backtest
+K_VALUES           = [2.0, 2.5, 3.0, 3.5]
+MOMENTUM_WINDOW    = 252
+ROC_WINDOW         = 252
+BREAKOUT_WINDOW    = 20
+RVOL_THRESHOLD     = 2.0
+VOL_AVG_WINDOW     = 20
+OBV_SLOPE_WINDOW   = 10
+ATR_WINDOW         = 14
+CAPITAL_INITIAL    = 10_000
 
 
 # ============================================================
@@ -114,6 +115,66 @@ def load_secteur_force(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_index_data(ticker: str) -> pd.DataFrame:
+    """
+    Charge l'indice de référence approprié pour ce ticker.
+    Déduit l'indice via tickers_info.secteur → secteurs_etf.indice_reference.
+    Priorité : US → EU → BE (comme load_secteur_force).
+    Si aucun indice trouvé → retourne DataFrame vide (filtre désactivé).
+    """
+    if engine is None:
+        return pd.DataFrame()
+
+    try:
+        # 1. Déduire l'indice de référence depuis le secteur du ticker
+        query_indice = text("""
+            SELECT DISTINCT se.indice_reference
+            FROM secteurs_etf se
+            JOIN tickers_info ti ON ti.secteur = se.secteur_yahoo
+            WHERE ti.ticker = :ticker
+              AND se.actif = TRUE
+            ORDER BY
+                CASE se.zone WHEN 'US' THEN 1 WHEN 'EU' THEN 2 ELSE 3 END
+            LIMIT 1
+        """)
+
+        with engine.connect() as conn:
+            row = conn.execute(query_indice, {"ticker": ticker}).fetchone()
+
+        if not row:
+            print(f"      Filtre macro : indice introuvable pour {ticker} — désactivé")
+            return pd.DataFrame()
+
+        indice = row[0]
+        print(f"      Indice de référence pour {ticker} : {indice}")
+
+        # 2. Charger l'historique de cet indice
+        query_prix = text("""
+            SELECT date, prix_ajuste
+            FROM indices_prix
+            WHERE ticker_indice = :indice
+              AND prix_ajuste IS NOT NULL
+            ORDER BY date ASC
+        """)
+
+        with engine.connect() as conn:
+            df = pd.read_sql(query_prix, conn, params={"indice": indice})
+
+        if df.empty:
+            print(f"      Filtre macro : pas de données pour {indice} — désactivé")
+            return pd.DataFrame()
+
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df["sma_200"]          = df["prix_ajuste"].rolling(200, min_periods=1).mean()
+        df["marche_favorable"] = df["prix_ajuste"] > df["sma_200"]
+        return df
+
+    except Exception as e:
+        print(f"      Filtre macro erreur : {e}")
+        return pd.DataFrame()
+
+
 # ============================================================
 # CALCUL DES INDICATEURS v3.5
 # ============================================================
@@ -122,7 +183,6 @@ def momentum_r2_score(prices: pd.Series, window: int = MOMENTUM_WINDOW) -> pd.Se
     """
     Momentum ajusté R² = ROC_12m × R² de la régression log-linéaire.
     Pénalise les tendances erratiques, favorise les tendances propres.
-    Décision 2026-03-17 : remplace le ROC brut de v3.3.
     """
     scores = pd.Series(index=prices.index, dtype=float)
 
@@ -131,10 +191,8 @@ def momentum_r2_score(prices: pd.Series, window: int = MOMENTUM_WINDOW) -> pd.Se
         if slice_prices.isnull().any() or (slice_prices <= 0).any():
             continue
 
-        # ROC 12 mois
         roc = (slice_prices.iloc[-1] - slice_prices.iloc[0]) / slice_prices.iloc[0]
 
-        # R² de la tendance log-linéaire
         x = np.arange(window).reshape(-1, 1)
         y = np.log(slice_prices.values)
         try:
@@ -149,10 +207,8 @@ def momentum_r2_score(prices: pd.Series, window: int = MOMENTUM_WINDOW) -> pd.Se
 
 def compute_atr(df: pd.DataFrame, window: int = ATR_WINDOW) -> pd.Series:
     """
-    ATR (Average True Range) sur 14 jours.
-    - Mode réel    : utilise prix_haut et prix_bas (True Range complet)
-                     activé automatiquement après /fill-high-low
-    - Mode approché : close-to-close si high/low absents (null en base)
+    ATR sur 14 jours.
+    Mode réel (High-Low) si prix_haut/prix_bas disponibles, sinon close-to-close.
     """
     close = df["prix_ajuste"]
 
@@ -173,16 +229,18 @@ def compute_atr(df: pd.DataFrame, window: int = ATR_WINDOW) -> pd.Series:
         print(f"      ATR mode : réel (High-Low) ✅")
     else:
         tr = close.diff().abs()
-        print(f"      ATR mode : approché (Close-Close) ⚠️ — lancer /fill-high-low")
+        print(f"      ATR mode : approché (Close-Close) ⚠️")
 
     return tr.rolling(window, min_periods=1).mean()
 
 
-def compute_signals_v35(df: pd.DataFrame, df_secteur: pd.DataFrame) -> pd.DataFrame:
+def compute_signals_v35(df: pd.DataFrame, df_secteur: pd.DataFrame,
+                         df_index: pd.DataFrame = None) -> pd.DataFrame:
     """
     Calcule tous les indicateurs v3.5 et le signal d'achat composite.
 
     Niveaux implémentés :
+        Niveau 0 : indice de référence > SMA_200 (filtre macro)
         Niveau 1 : prix > SMA_200
         Niveau 2 : secteur en force relative (si données dispo)
         Niveau 3 : momentum_r2 > 0 + breakout_20j + RVOL > 2.0 + OBV accumulation
@@ -190,63 +248,69 @@ def compute_signals_v35(df: pd.DataFrame, df_secteur: pd.DataFrame) -> pd.DataFr
     price = df["prix_ajuste"]
     vol   = df["volume"].fillna(0)
 
+    # --- Niveau 0 : Filtre macro (indice de référence > SMA200) ---
+    if df_index is not None and not df_index.empty:
+        marche_favorable = df_index["marche_favorable"].reindex(
+            df.index, method="ffill"
+        ).fillna(False)
+        jours_favorables = int(marche_favorable.sum())
+        print(f"      Filtre macro actif — marché favorable : {jours_favorables}/{len(marche_favorable)} jours")
+    else:
+        marche_favorable = pd.Series(True, index=df.index)
+        print(f"      Filtre macro : désactivé (pas de données indice)")
+
     # --- Niveau 1 : Filtre tendance ---
-    sma_200    = price.rolling(200, min_periods=1).mean()
+    sma_200     = price.rolling(200, min_periods=1).mean()
     tendance_ok = price > sma_200
 
     # --- Niveau 2 : Force relative sectorielle ---
     if not df_secteur.empty:
-        # Aligner sur l'index du ticker (forward fill pour les jours sans ETF)
         force_rel = df_secteur["en_force_relative"].reindex(
             df.index, method="ffill"
         ).fillna(False)
     else:
-        # Pas de données secteur → on laisse passer (pas de filtre dur)
         force_rel = pd.Series(True, index=df.index)
 
     # --- Niveau 3 : Stock picking ---
 
-    # Momentum ajusté R²
-    mom_r2    = momentum_r2_score(price, MOMENTUM_WINDOW)
-    mom_ok    = mom_r2 > 0
+    mom_r2   = momentum_r2_score(price, MOMENTUM_WINDOW)
+    mom_ok   = mom_r2 > 0
 
-    # Breakout plus haut 20j
     breakout_20j = price >= price.rolling(BREAKOUT_WINDOW, min_periods=1).max()
 
-    # RVOL > 2.0
     vol_avg_20 = vol.rolling(VOL_AVG_WINDOW, min_periods=1).mean()
     rvol       = vol / (vol_avg_20 + 1e-9)
     rvol_fort  = rvol > RVOL_THRESHOLD
 
-    # OBV accumulation
-    obv            = (np.sign(price.diff()) * vol).fillna(0).cumsum()
-    obv_slope      = obv.diff(OBV_SLOPE_WINDOW)
+    obv              = (np.sign(price.diff()) * vol).fillna(0).cumsum()
+    obv_slope        = obv.diff(OBV_SLOPE_WINDOW)
     obv_accumulation = obv_slope > 0
 
     # --- Signal final v3.5 ---
     signal_achat = (
-        tendance_ok &
-        force_rel &
-        mom_ok &
+        marche_favorable &        # Niveau 0
+        tendance_ok &             # Niveau 1
+        force_rel &               # Niveau 2
+        mom_ok &                  # Niveau 3
         breakout_20j &
         rvol_fort &
         obv_accumulation
     )
 
-    # --- ATR pour le trailing stop ---
     atr_14 = compute_atr(df, ATR_WINDOW)
 
     result = df[["prix_ajuste", "volume"]].copy()
-    result["sma_200"]         = sma_200
-    result["tendance_ok"]     = tendance_ok
-    result["force_rel"]       = force_rel
-    result["mom_r2"]          = mom_r2
-    result["breakout_20j"]    = breakout_20j
-    result["rvol"]            = rvol
-    result["rvol_fort"]       = rvol_fort
-    result["obv_accumulation"]= obv_accumulation
-    result["signal_achat"]    = signal_achat
-    result["atr_14"]          = atr_14
+    result["sma_200"]          = sma_200
+    result["marche_favorable"] = marche_favorable
+    result["tendance_ok"]      = tendance_ok
+    result["force_rel"]        = force_rel
+    result["mom_r2"]           = mom_r2
+    result["breakout_20j"]     = breakout_20j
+    result["rvol"]             = rvol
+    result["rvol_fort"]        = rvol_fort
+    result["obv_accumulation"] = obv_accumulation
+    result["signal_achat"]     = signal_achat
+    result["atr_14"]           = atr_14
 
     return result
 
@@ -259,13 +323,7 @@ def build_exit_signals(entries: pd.Series, price: pd.Series,
                         atr: pd.Series, k: float) -> pd.Series:
     """
     Construit les signaux de sortie via Chandelier Exit.
-
-    Logique :
-        - À l'entrée : stop_initial = prix_entree - k × ATR_entree
-        - En cours : stop = max_depuis_entree - k × ATR (ne peut que monter)
-        - Sortie si prix <= stop
-
-    Retourne une Series booléenne (True = sortie ce jour).
+    Stop = max_depuis_entree - k × ATR (ne peut que monter).
     """
     exits      = pd.Series(False, index=price.index)
     in_trade   = False
@@ -279,15 +337,12 @@ def build_exit_signals(entries: pd.Series, price: pd.Series,
                 max_price = price.iloc[i]
                 stop      = price.iloc[i] - k * atr.iloc[i]
         else:
-            # Mise à jour du plus haut
             if price.iloc[i] > max_price:
                 max_price = price.iloc[i]
 
-            # Stop ne peut que monter
             new_stop = max_price - k * atr.iloc[i]
             stop     = max(stop, new_stop)
 
-            # Condition de sortie
             if price.iloc[i] <= stop:
                 exits.iloc[i] = True
                 in_trade      = False
@@ -311,27 +366,27 @@ def run_backtest_ticker(ticker: str) -> dict:
     try:
         df         = load_ticker_data(ticker)
         df_secteur = load_secteur_force(ticker)
+        df_index   = load_index_data(ticker)          # ← NOUVEAU
     except Exception as e:
         return {"ticker": ticker, "erreur": str(e)}
 
     if len(df) < MOMENTUM_WINDOW + 50:
         return {"ticker": ticker, "erreur": f"Historique insuffisant ({len(df)} jours)"}
 
-    # Calcul des indicateurs v3.5
-    df_signals = compute_signals_v35(df, df_secteur)
+    df_signals = compute_signals_v35(df, df_secteur, df_index)   # ← MODIFIÉ
 
-    price   = df_signals["prix_ajuste"]
-    entries = df_signals["signal_achat"]
-    atr     = df_signals["atr_14"]
-
+    price      = df_signals["prix_ajuste"]
+    entries    = df_signals["signal_achat"]
+    atr        = df_signals["atr_14"]
     nb_signaux = entries.sum()
+
     print(f"      Signaux générés : {nb_signaux}")
 
     if nb_signaux == 0:
         return {
-            "ticker"    : ticker,
-            "nb_signaux": 0,
-            "message"   : "Aucun signal v3.5 sur la période — conditions trop strictes ou données insuffisantes.",
+            "ticker"     : ticker,
+            "nb_signaux" : 0,
+            "message"    : "Aucun signal v3.5 sur la période.",
             "resultats_k": {}
         }
 
@@ -341,25 +396,23 @@ def run_backtest_ticker(ticker: str) -> dict:
         try:
             exits = build_exit_signals(entries, price, atr, k)
 
-            # VectorBT portfolio
             portfolio = vbt.Portfolio.from_signals(
-                close      = price,
-                entries    = entries,
-                exits      = exits,
-                init_cash  = CAPITAL_INITIAL,
-                freq       = "D",
-                upon_opposite_entry="ignore"  # ignorer signal si déjà en position
+                close     = price,
+                entries   = entries,
+                exits     = exits,
+                init_cash = CAPITAL_INITIAL,
+                freq      = "D",
+                upon_opposite_entry="ignore"
             )
 
             stats = portfolio.stats()
 
-            # Métriques clés
-            sharpe      = round(float(stats.get("Sharpe Ratio", 0) or 0), 3)
-            total_ret   = round(float(stats.get("Total Return [%]", 0) or 0), 2)
-            max_dd      = round(float(stats.get("Max Drawdown [%]", 0) or 0), 2)
-            nb_trades   = int(stats.get("Total Trades", 0) or 0)
-            win_rate    = round(float(stats.get("Win Rate [%]", 0) or 0), 2)
-            avg_trade   = round(float(stats.get("Avg Winning Trade [%]", 0) or 0), 2)
+            sharpe    = round(float(stats.get("Sharpe Ratio",         0) or 0), 3)
+            total_ret = round(float(stats.get("Total Return [%]",     0) or 0), 2)
+            max_dd    = round(float(stats.get("Max Drawdown [%]",     0) or 0), 2)
+            nb_trades = int(stats.get("Total Trades",                 0) or 0)
+            win_rate  = round(float(stats.get("Win Rate [%]",         0) or 0), 2)
+            avg_trade = round(float(stats.get("Avg Winning Trade [%]",0) or 0), 2)
 
             resultats_k[str(k)] = {
                 "sharpe"       : sharpe,
@@ -376,7 +429,6 @@ def run_backtest_ticker(ticker: str) -> dict:
         except Exception as e:
             resultats_k[str(k)] = {"erreur": str(e)}
 
-    # Meilleur k (Sharpe le plus élevé)
     valid_k = {k: v for k, v in resultats_k.items() if "sharpe" in v}
     best_k  = max(valid_k, key=lambda k: valid_k[k]["sharpe"]) if valid_k else None
 
@@ -398,23 +450,21 @@ def analyse_secteur_a_posteriori(ticker: str, df_signals: pd.DataFrame,
                                    horizon: int = 30) -> dict:
     """
     Compare les performances des signaux en secteur fort vs hors secteur fort.
-    Mesure le rendement moyen à J+horizon pour chaque groupe.
     """
-    price    = df_signals["prix_ajuste"]
-    signaux  = df_signals[df_signals["signal_achat"]].copy()
+    price   = df_signals["prix_ajuste"]
+    signaux = df_signals[df_signals["signal_achat"]].copy()
 
     if signaux.empty:
         return {}
 
-    # Rendement à J+horizon
     future_returns = []
     for date_signal in signaux.index:
         loc = price.index.get_loc(date_signal)
         if loc + horizon < len(price):
             ret = (price.iloc[loc + horizon] - price.iloc[loc]) / price.iloc[loc] * 100
             future_returns.append({
-                "date"        : date_signal,
-                "force_rel"   : bool(df_signals.loc[date_signal, "force_rel"]),
+                "date"         : date_signal,
+                "force_rel"    : bool(df_signals.loc[date_signal, "force_rel"]),
                 "rendement_pct": round(float(ret), 2)
             })
 
@@ -426,14 +476,14 @@ def analyse_secteur_a_posteriori(ticker: str, df_signals: pd.DataFrame,
     hors_force = df_ret[df_ret["force_rel"] == False]["rendement_pct"]
 
     return {
-        "horizon_jours"          : horizon,
-        "en_force_relative"      : {
-            "nb_signaux"    : len(en_force),
+        "horizon_jours"      : horizon,
+        "en_force_relative"  : {
+            "nb_signaux"     : len(en_force),
             "rendement_moyen": round(float(en_force.mean()), 2) if len(en_force) > 0 else None,
             "taux_succes_pct": round(float((en_force > 0).mean() * 100), 1) if len(en_force) > 0 else None
         },
-        "hors_force_relative"    : {
-            "nb_signaux"    : len(hors_force),
+        "hors_force_relative": {
+            "nb_signaux"     : len(hors_force),
             "rendement_moyen": round(float(hors_force.mean()), 2) if len(hors_force) > 0 else None,
             "taux_succes_pct": round(float((hors_force > 0).mean() * 100), 1) if len(hors_force) > 0 else None
         }
@@ -446,17 +496,14 @@ def analyse_secteur_a_posteriori(ticker: str, df_signals: pd.DataFrame,
 
 def synthesize_results(all_results: list) -> dict:
     """
-    Agrège les résultats de tous les tickers pour identifier :
-    - Le k optimal global (Sharpe moyen le plus élevé)
-    - Le nombre de tickers validant Sharpe > 1.0
-    - La recommandation finale
+    Agrège les résultats de tous les tickers.
+    Critère de validation : Sharpe > 1.0 sur 3+ tickers.
     """
     valid_results = [r for r in all_results if "resultats_k" in r and r["resultats_k"]]
 
     if not valid_results:
         return {"message": "Aucun résultat valide — vérifier les données en base."}
 
-    # Sharpe moyen par valeur de k
     sharpe_par_k = {}
     for k in K_VALUES:
         k_str   = str(k)
@@ -467,27 +514,25 @@ def synthesize_results(all_results: list) -> dict:
         ]
         if sharpes:
             sharpe_par_k[k_str] = {
-                "sharpe_moyen"   : round(np.mean(sharpes), 3),
-                "nb_tickers_ok"  : sum(1 for s in sharpes if s >= 1.0),
+                "sharpe_moyen"    : round(np.mean(sharpes), 3),
+                "nb_tickers_ok"   : sum(1 for s in sharpes if s >= 1.0),
                 "nb_tickers_total": len(sharpes)
             }
 
-    # Meilleur k global
     best_k_global = max(
         sharpe_par_k,
         key=lambda k: sharpe_par_k[k]["sharpe_moyen"]
     ) if sharpe_par_k else None
 
-    # Critère de validation : Sharpe > 1.0 sur 3+ tickers
-    nb_valides = sharpe_par_k.get(best_k_global, {}).get("nb_tickers_ok", 0) if best_k_global else 0
+    nb_valides    = sharpe_par_k.get(best_k_global, {}).get("nb_tickers_ok", 0) if best_k_global else 0
     signal_valide = nb_valides >= 3
 
     return {
-        "sharpe_par_k"   : sharpe_par_k,
-        "best_k_global"  : best_k_global,
+        "sharpe_par_k"      : sharpe_par_k,
+        "best_k_global"     : best_k_global,
         "nb_tickers_valides": nb_valides,
         "signal_v35_valide" : signal_valide,
-        "recommandation" : (
+        "recommandation"    : (
             f"✅ Signal v3.5 VALIDÉ — k={best_k_global} recommandé ({nb_valides} tickers Sharpe>1.0)"
             if signal_valide else
             f"⚠️ Signal v3.5 NON VALIDÉ — seulement {nb_valides}/3 tickers Sharpe>1.0 avec k={best_k_global}"
@@ -503,13 +548,6 @@ def run_backtest_logic(tickers: list[str] = None, horizon: int = 30) -> dict:
     """
     Point d'entrée principal du backtest.
     Appelée en arrière-plan par l'endpoint /run-backtest.
-
-    Paramètres
-    ----------
-    tickers : list[str]
-        Liste des tickers à tester. Défaut : NVDA, AAPL, MSFT, AMZN, ASML.
-    horizon : int
-        Horizon en jours pour l'analyse sectorielle a posteriori (défaut : 30).
     """
     if tickers is None:
         tickers = TICKERS_DEFAULT
@@ -518,19 +556,19 @@ def run_backtest_logic(tickers: list[str] = None, horizon: int = 30) -> dict:
     print(f"   Tickers : {', '.join(tickers)}")
     print(f"   K ATR testés : {K_VALUES}")
 
-    all_results      = []
-    analyse_secteur  = {}
+    all_results     = []
+    analyse_secteur = {}
 
     for ticker in tickers:
         result = run_backtest_ticker(ticker)
         all_results.append(result)
 
-        # Analyse sectorielle a posteriori si des signaux existent
         if result.get("nb_signaux", 0) > 0:
             try:
                 df         = load_ticker_data(ticker)
                 df_secteur = load_secteur_force(ticker)
-                df_signals = compute_signals_v35(df, df_secteur)
+                df_index   = load_index_data(ticker)          # ← NOUVEAU
+                df_signals = compute_signals_v35(df, df_secteur, df_index)   # ← MODIFIÉ
                 analyse_secteur[ticker] = analyse_secteur_a_posteriori(
                     ticker, df_signals, horizon
                 )
@@ -548,7 +586,7 @@ def run_backtest_logic(tickers: list[str] = None, horizon: int = 30) -> dict:
             print(f"   k={k} → Sharpe moyen={stats['sharpe_moyen']} | Tickers OK={stats['nb_tickers_ok']}/{stats['nb_tickers_total']}")
 
     return {
-        "parametres": {
+        "parametres"          : {
             "tickers" : tickers,
             "k_values": K_VALUES,
             "horizon" : horizon,
