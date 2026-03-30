@@ -118,35 +118,41 @@ def load_secteur_force(ticker: str) -> pd.DataFrame:
 def load_index_data(ticker: str) -> pd.DataFrame:
     """
     Charge l'indice de référence approprié pour ce ticker.
-    Déduit l'indice via tickers_info.secteur → secteurs_etf.indice_reference.
-    Priorité : US → EU → BE (comme load_secteur_force).
-    Si aucun indice trouvé → retourne DataFrame vide (filtre désactivé).
+    Déduit l'indice depuis le pays du ticker dans tickers_info :
+        - Belgique (BE) → ^BFX
+        - Europe (hors BE) → ^STOXX  
+        - Reste (US + autres) → ^GSPC
     """
     if engine is None:
         return pd.DataFrame()
 
     try:
-        # 1. Déduire l'indice de référence depuis le secteur du ticker
-        query_indice = text("""
-            SELECT se.indice_reference
-            FROM secteurs_etf se
-            JOIN tickers_info ti ON ti.secteur = se.secteur_yahoo
-            WHERE ti.ticker = :ticker
-              AND se.actif = TRUE
-            ORDER BY
-                CASE se.zone WHEN 'US' THEN 1 WHEN 'EU' THEN 2 ELSE 3 END
+        # 1. Récupérer le pays du ticker
+        query_pays = text("""
+            SELECT pays
+            FROM tickers_info
+            WHERE ticker = :ticker
             LIMIT 1
         """)
 
         with engine.connect() as conn:
-            row = conn.execute(query_indice, {"ticker": ticker}).fetchone()
+            row = conn.execute(query_pays, {"ticker": ticker}).fetchone()
 
-        if not row:
-            print(f"      Filtre macro : indice introuvable pour {ticker} — désactivé")
-            return pd.DataFrame()
+        if not row or not row[0]:
+            print(f"      Filtre macro : pays introuvable pour {ticker} — ^GSPC par défaut")
+            indice = "^GSPC"
+        else:
+            pays = row[0].strip()
+            if pays == "Belgium":
+                indice = "^BFX"
+            elif pays in ("France", "Germany", "Netherlands", "Spain", "Italy",
+                          "Sweden", "Switzerland", "Denmark", "Norway", "Finland",
+                          "Austria", "Portugal", "Ireland", "Luxembourg"):
+                indice = "^STOXX"
+            else:
+                indice = "^GSPC"
 
-        indice = row[0]
-        print(f"      Indice de référence pour {ticker} : {indice}")
+        print(f"      Indice de référence pour {ticker} ({pays if row and row[0] else '?'}) : {indice}")
 
         # 2. Charger l'historique de cet indice
         query_prix = text("""
@@ -164,10 +170,14 @@ def load_index_data(ticker: str) -> pd.DataFrame:
             print(f"      Filtre macro : pas de données pour {indice} — désactivé")
             return pd.DataFrame()
 
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date").sort_index()
+        df["date"]             = pd.to_datetime(df["date"])
+        df                     = df.set_index("date").sort_index()
         df["sma_200"]          = df["prix_ajuste"].rolling(200, min_periods=1).mean()
         df["marche_favorable"] = df["prix_ajuste"] > df["sma_200"]
+
+        jours_ok = int(df["marche_favorable"].sum())
+        print(f"      Filtre macro actif — marché favorable : {jours_ok}/{len(df)} jours")
+
         return df
 
     except Exception as e:
