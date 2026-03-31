@@ -345,11 +345,11 @@ async def trigger_backtest(
     }
 
 @app.get("/run-backtest-ranking")
-    async def trigger_backtest_ranking(
+async def trigger_backtest_ranking(
         background_tasks: BackgroundTasks,
         top_n: int = 5,
         k: float = None
-    ):
+):
         """
         Backtest momentum ranking — top N positions, réévaluation hebdo.
         - top_n : nombre de positions simultanées (défaut 5)
@@ -361,7 +361,7 @@ async def trigger_backtest(
         return {
             "status" : "processing",
             "message": f"Backtest ranking v4.0 lancé — top {top_n}, {mode}.",
-        }
+    }
         
 # ============================================================
 # CHARGEMENT DU MODÈLE DEPUIS POSTGRESQL
