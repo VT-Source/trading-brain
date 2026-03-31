@@ -346,21 +346,21 @@ async def trigger_backtest(
 
 @app.get("/run-backtest-ranking")
 async def trigger_backtest_ranking(
-        background_tasks: BackgroundTasks,
-        top_n: int = 5,
-        k: float = None
+    background_tasks: BackgroundTasks,
+    top_n: int = 5,
+    k: float = None
 ):
-        """
-        Backtest momentum ranking — top N positions, réévaluation hebdo.
-        - top_n : nombre de positions simultanées (défaut 5)
-        - k     : multiplicateur ATR trailing stop (défaut: teste 2.5/3.0/3.5)
-        Appel : GET /run-backtest-ranking?top_n=5&k=3.0
-        """
-        background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, k=k)
-        mode = f"k={k}" if k else f"multi-k ({', '.join(str(v) for v in [2.5, 3.0, 3.5])})"
-        return {
-            "status" : "processing",
-            "message": f"Backtest ranking v4.0 lancé — top {top_n}, {mode}.",
+    """
+    Backtest momentum ranking — top N positions, réévaluation hebdo.
+    - top_n : nombre de positions simultanées (défaut 5)
+    - k     : multiplicateur ATR trailing stop (défaut: teste 2.5/3.0/3.5)
+    Appel : GET /run-backtest-ranking?top_n=5&k=3.0
+    """
+    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, k=k)
+    mode = f"k={k}" if k else f"multi-k ({', '.join(str(v) for v in [2.5, 3.0, 3.5])})"
+    return {
+        "status" : "processing",
+        "message": f"Backtest ranking v4.0 lancé — top {top_n}, {mode}.",
     }
         
 # ============================================================
