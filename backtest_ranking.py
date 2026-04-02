@@ -38,7 +38,10 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
 # PARAMÈTRES
 # ============================================================
 TOP_N              = 5            # positions simultanées max
-K_VALUES           = [2.5, 3.0, 3.5]   # trailing stop ATR
+K_VALUES           = [2.5, 3.0, 3.5]   # trailing stop ATR (fixes)
+K_MIN              = 2.0          # k adaptatif — plancher
+K_MAX              = 4.0          # k adaptatif — plafond
+K_ADAPTIVE_COEFF   = 0.5          # k = K_MIN + atr_pct × coeff, clampé [K_MIN, K_MAX]
 MOMENTUM_WINDOW    = 252          # 12 mois
 VOL_AVG_WINDOW     = 20           # base RVOL
 OBV_SLOPE_WINDOW   = 10           # pente OBV
@@ -354,12 +357,35 @@ def compute_composite_score(
 
 
 # ============================================================
+# K ADAPTATIF — ATR% based
+# ============================================================
+
+def compute_adaptive_k(atr_14: float, prix: float) -> float:
+    """
+    Calcule le k du trailing stop adapté à la volatilité du ticker.
+
+    Formule : k = K_MIN + (atr_pct × K_ADAPTIVE_COEFF), clampé entre K_MIN et K_MAX.
+
+    Exemples :
+        AAPL  : ATR=4$, prix=250$ → atr_pct=1.6% → k = 2.0 + 1.6×0.5 = 2.8
+        NVDA  : ATR=8$, prix=130$ → atr_pct=6.2% → k = 2.0 + 6.2×0.5 = 5.1 → clamp → 4.0
+        PG    : ATR=2$, prix=170$ → atr_pct=1.2% → k = 2.0 + 1.2×0.5 = 2.6
+        ASML  : ATR=25€, prix=900€ → atr_pct=2.8% → k = 2.0 + 2.8×0.5 = 3.4
+    """
+    if prix <= 0:
+        return 3.0  # fallback
+    atr_pct = (atr_14 / prix) * 100
+    k = K_MIN + atr_pct * K_ADAPTIVE_COEFF
+    return max(K_MIN, min(K_MAX, round(k, 2)))
+
+
+# ============================================================
 # SIMULATION PORTFOLIO
 # ============================================================
 
 def run_ranking_backtest(
     top_n: int = TOP_N,
-    k: float = 3.0,
+    k = 3.0,
     start_date: str = None,
     end_date: str = None,
 ) -> dict:
@@ -373,10 +399,18 @@ def run_ranking_backtest(
     En continu :
         4. Trailing stop ATR sur chaque position
 
+    Paramètre k :
+        float (ex. 3.0)    → k fixe pour toutes les positions
+        "adaptive"         → k calculé par ticker via ATR% à l'entrée
+
     Retourne les métriques détaillées du portefeuille.
     """
-    print(f"🚀 Backtest Ranking v4.0 — top {top_n}, k={k}")
+    adaptive_mode = (k == "adaptive")
+    k_label = "adaptive (ATR%)" if adaptive_mode else str(k)
+    print(f"🚀 Backtest Ranking v4.0 — top {top_n}, k={k_label}")
     print(f"   Pondérations : Mom R² {W_MOM_R2:.0%} | RVOL {W_RVOL:.0%} | OBV {W_OBV:.0%}")
+    if adaptive_mode:
+        print(f"   K adaptatif : k = {K_MIN} + atr_pct × {K_ADAPTIVE_COEFF}, clampé [{K_MIN}, {K_MAX}]")
 
     # 1. Charger tout
     print("   📥 Chargement des tickers...")
@@ -454,7 +488,8 @@ def run_ranking_backtest(
                         pos["max_price"] = current_price
 
                     # Nouveau stop (ne peut que monter)
-                    new_stop = pos["max_price"] - k * current_atr
+                    pos_k = pos["k"]
+                    new_stop = pos["max_price"] - pos_k * current_atr
                     pos["stop"] = max(pos["stop"], new_stop)
 
                     # Vérification sortie
@@ -472,6 +507,7 @@ def run_ranking_backtest(
                             "pnl_eur"     : round(pos["shares"] * (current_price - pos["entry_price"]), 2),
                             "return_pct"  : round(ret_pct, 2),
                             "duration_days": (day - pos["entry_date"]).days,
+                            "k_used"      : pos["k"],
                         })
                         tickers_to_close.append(ticker)
 
@@ -523,6 +559,7 @@ def run_ranking_backtest(
                 "pnl_eur"     : round(pos["shares"] * (exit_price - pos["entry_price"]), 2),
                 "return_pct"  : round(ret_pct, 2),
                 "duration_days": (monday - pos["entry_date"]).days,
+                "k_used"      : pos["k"],
             })
             del positions[ticker]
 
@@ -540,6 +577,12 @@ def run_ranking_backtest(
             entry_price = float(df_t.loc[monday, "prix_ajuste"])
             atr_val     = float(df_t.loc[monday, "atr_14"]) if not pd.isna(df_t.loc[monday, "atr_14"]) else entry_price * 0.02
 
+            # K adaptatif ou fixe selon le mode
+            if adaptive_mode:
+                pos_k = compute_adaptive_k(atr_val, entry_price)
+            else:
+                pos_k = k
+
             # Investir une fraction du capital
             invest = min(position_size, cash)
             if invest < 100:  # minimum pour ouvrir
@@ -553,8 +596,9 @@ def run_ranking_backtest(
                 "entry_date"  : monday,
                 "shares"      : shares,
                 "max_price"   : entry_price,
-                "stop"        : entry_price - k * atr_val,
+                "stop"        : entry_price - pos_k * atr_val,
                 "atr_entry"   : atr_val,
+                "k"           : pos_k,
             }
 
         # --- E. Valeur du portefeuille ---
@@ -601,6 +645,7 @@ def run_ranking_backtest(
             "pnl_eur"     : round(pos["shares"] * (exit_price - pos["entry_price"]), 2),
             "return_pct"  : round(ret_pct, 2),
             "duration_days": (last_date - pos["entry_date"]).days,
+            "k_used"      : pos["k"],
         })
 
     # --- G. Métriques globales ---
@@ -663,7 +708,9 @@ def run_ranking_backtest(
         "version"    : "v4.0-ranking",
         "parametres" : {
             "top_n"          : top_n,
-            "k_atr"          : k,
+            "k_atr"          : k_label,
+            "k_adaptive"     : adaptive_mode,
+            "k_range"        : f"[{K_MIN}, {K_MAX}]" if adaptive_mode else None,
             "capital_initial" : CAPITAL_INITIAL,
             "weights"        : {"mom_r2": W_MOM_R2, "rvol": W_RVOL, "obv": W_OBV},
             "period"         : f"{mondays[0].date()} → {mondays[-1].date()}",
@@ -706,15 +753,23 @@ def run_ranking_backtest(
 
 def run_ranking_multi_k(top_n: int = TOP_N) -> dict:
     """
-    Teste le backtest ranking avec plusieurs valeurs de k.
+    Teste le backtest ranking avec plusieurs valeurs de k fixes + le mode adaptatif.
     Retourne les métriques comparées.
     """
     results = {}
-    for k in K_VALUES:
+
+    # Tests k fixes
+    for k_val in K_VALUES:
         print(f"\n{'='*60}")
-        print(f"🔄 Test k={k}")
+        print(f"🔄 Test k={k_val}")
         print(f"{'='*60}")
-        results[str(k)] = run_ranking_backtest(top_n=top_n, k=k)
+        results[str(k_val)] = run_ranking_backtest(top_n=top_n, k=k_val)
+
+    # Test k adaptatif
+    print(f"\n{'='*60}")
+    print(f"🔄 Test k=adaptive (ATR%)")
+    print(f"{'='*60}")
+    results["adaptive"] = run_ranking_backtest(top_n=top_n, k="adaptive")
 
     # Résumé comparatif
     summary = {}
@@ -749,12 +804,16 @@ def run_ranking_multi_k(top_n: int = TOP_N) -> dict:
 # POINT D'ENTRÉE — appelé par l'endpoint FastAPI
 # ============================================================
 
-def run_backtest_ranking_logic(top_n: int = TOP_N, k: float = None) -> dict:
+def run_backtest_ranking_logic(top_n: int = TOP_N, k = None) -> dict:
     """
-    Point d'entrée pour le endpoint /run-backtest?mode=ranking.
-    Si k est spécifié, teste une seule valeur. Sinon, teste toutes les valeurs de K_VALUES.
+    Point d'entrée pour le endpoint /run-backtest-ranking.
+    - k=None         → teste k fixes (2.5, 3.0, 3.5) + adaptatif
+    - k=3.0          → teste uniquement k=3.0
+    - k="adaptive"   → teste uniquement le mode adaptatif ATR%
     """
     if k is not None:
-        return run_ranking_backtest(top_n=top_n, k=k)
+        if k == "adaptive":
+            return run_ranking_backtest(top_n=top_n, k="adaptive")
+        return run_ranking_backtest(top_n=top_n, k=float(k))
     else:
         return run_ranking_multi_k(top_n=top_n)
