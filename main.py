@@ -348,28 +348,34 @@ async def trigger_backtest(
 async def trigger_backtest_ranking(
     background_tasks: BackgroundTasks,
     top_n: int = 5,
-    k: str = None
+    k: str = None,
+    macro: str = "off"
 ):
     """
     Backtest momentum ranking — top N positions, réévaluation hebdo.
     - top_n : nombre de positions simultanées (défaut 5)
     - k     : "adaptive" pour ATR%, ou un float (ex. 3.0), ou rien pour multi-k
+    - macro : "off" (défaut), "cut" (exclure zones bearish), "reduce" (réduire top N)
     Appels :
-      GET /run-backtest-ranking                    → multi-k (2.5, 3.0, 3.5) + adaptive
-      GET /run-backtest-ranking?k=3.0              → k fixe 3.0 uniquement
-      GET /run-backtest-ranking?k=adaptive          → k adaptatif uniquement
+      GET /run-backtest-ranking                              → multi-k + adaptive, sans macro
+      GET /run-backtest-ranking?k=adaptive&macro=cut         → k adaptatif + filtre macro hard
+      GET /run-backtest-ranking?k=3.0&macro=cut              → k=3.0 + filtre macro hard
+      GET /run-backtest-ranking?k=adaptive&macro=reduce      → k adaptatif + macro soft
     """
     if k is not None and k != "adaptive":
         try:
             k = float(k)
         except ValueError:
             return {"error": f"k doit être un nombre ou 'adaptive', reçu: {k}"}
-    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, k=k)
+    if macro not in ("off", "cut", "reduce"):
+        return {"error": f"macro doit être 'off', 'cut' ou 'reduce', reçu: {macro}"}
+    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, k=k, macro=macro)
     k_label = "adaptive (ATR%)" if k == "adaptive" else f"k={k}" if k else "multi-k + adaptive"
     return {
         "status" : "processing",
-        "message": f"Backtest ranking v4.0 lancé — top {top_n}, {k_label}.",
+        "message": f"Backtest ranking v4.0 lancé — top {top_n}, {k_label}, macro={macro}.",
     }
+ 
         
 # ============================================================
 # CHARGEMENT DU MODÈLE DEPUIS POSTGRESQL
