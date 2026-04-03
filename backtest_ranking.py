@@ -164,6 +164,66 @@ def load_all_secteur_force() -> dict[str, pd.DataFrame]:
     return result
 
 
+def load_macro_data() -> dict[str, pd.DataFrame]:
+    """
+    Charge les prix des indices de référence macro et calcule la SMA 200.
+    Retourne {zone: DataFrame indexé par date avec prix_ajuste et sma_200_idx}.
+
+    Mapping zone → indice :
+        US → ^GSPC (S&P 500)
+        EU → ^STOXX (STOXX Europe 600)
+    """
+    ZONE_INDEX = {"US": "^GSPC", "EU": "^STOXX"}
+
+    result = {}
+    for zone, idx_ticker in ZONE_INDEX.items():
+        with engine.connect() as conn:
+            df = pd.read_sql(text("""
+                SELECT date, prix_ajuste
+                FROM indices_prix
+                WHERE ticker_indice = :ticker
+                ORDER BY date ASC
+            """), conn, params={"ticker": idx_ticker})
+
+        if df.empty:
+            continue
+
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df["sma_200_idx"] = df["prix_ajuste"].rolling(200, min_periods=200).mean()
+        df["macro_bull"] = df["prix_ajuste"] > df["sma_200_idx"]
+        result[zone] = df
+
+    return result
+
+
+def get_macro_regime(
+    macro_data: dict[str, pd.DataFrame],
+    as_of: pd.Timestamp
+) -> dict[str, bool]:
+    """
+    Retourne l'état macro par zone à la date donnée.
+    {"US": True/False, "EU": True/False}
+    True = bullish (indice > SMA200), False = bearish.
+    """
+    regime = {}
+    for zone, df in macro_data.items():
+        valid = df[df.index <= as_of]
+        if not valid.empty:
+            regime[zone] = bool(valid["macro_bull"].iloc[-1])
+        else:
+            regime[zone] = True  # pas de données → on laisse passer
+    return regime
+
+
+def get_ticker_zone(ticker: str, secteur_mapping: dict) -> str:
+    """Retourne la zone principale d'un ticker (US ou EU)."""
+    info = secteur_mapping.get(ticker)
+    if not info:
+        return "US"
+    return info["zone_priority"][0]
+
+
 def get_secteur_force_for_ticker(
     ticker: str,
     secteur_mapping: dict,
@@ -386,6 +446,7 @@ def compute_adaptive_k(atr_14: float, prix: float) -> float:
 def run_ranking_backtest(
     top_n: int = TOP_N,
     k = 3.0,
+    macro_mode: str = "off",
     start_date: str = None,
     end_date: str = None,
 ) -> dict:
@@ -403,11 +464,16 @@ def run_ranking_backtest(
         float (ex. 3.0)    → k fixe pour toutes les positions
         "adaptive"         → k calculé par ticker via ATR% à l'entrée
 
+    Paramètre macro_mode :
+        "off"    → pas de filtre macro (comportement actuel)
+        "cut"    → 0 position si la zone du ticker est bearish
+        "reduce" → max 2 positions par zone bearish (au lieu de 5)
+
     Retourne les métriques détaillées du portefeuille.
     """
     adaptive_mode = (k == "adaptive")
     k_label = "adaptive (ATR%)" if adaptive_mode else str(k)
-    print(f"🚀 Backtest Ranking v4.0 — top {top_n}, k={k_label}")
+    print(f"🚀 Backtest Ranking v4.0 — top {top_n}, k={k_label}, macro={macro_mode}")
     print(f"   Pondérations : Mom R² {W_MOM_R2:.0%} | RVOL {W_RVOL:.0%} | OBV {W_OBV:.0%}")
     if adaptive_mode:
         print(f"   K adaptatif : k = {K_MIN} + atr_pct × {K_ADAPTIVE_COEFF}, clampé [{K_MIN}, {K_MAX}]")
@@ -425,6 +491,13 @@ def run_ranking_backtest(
     secteur_mapping = load_secteur_mapping()
     force_data      = load_all_secteur_force()
     print(f"   {len(secteur_mapping)} tickers mappés, {len(force_data)} secteurs-zones chargés.")
+
+    # Chargement macro (indices + SMA 200)
+    macro_data = {}
+    if macro_mode != "off":
+        print("   📥 Chargement données macro (indices SMA200)...")
+        macro_data = load_macro_data()
+        print(f"   {len(macro_data)} zones macro chargées : {list(macro_data.keys())}")
 
     # 2. Calculer les indicateurs pour chaque ticker
     print("   📊 Calcul des indicateurs...")
@@ -517,25 +590,49 @@ def run_ranking_backtest(
         # --- B. Ranking hebdomadaire ---
         ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data)
 
+        # --- B2. Filtre macro — exclure ou réduire les zones bearish ---
+        macro_regime = get_macro_regime(macro_data, monday) if macro_mode != "off" else {}
+
+        if ranking and macro_mode == "cut":
+            # Exclure les tickers dont la zone est bearish
+            ranking = [r for r in ranking if macro_regime.get(get_ticker_zone(r["ticker"], secteur_mapping), True)]
+
         if ranking:
-            top_tickers = [r["ticker"] for r in ranking[:top_n]]
+            effective_top_n = top_n
+            if macro_mode == "reduce":
+                # Compter combien de zones sont bearish
+                nb_bearish_zones = sum(1 for z, bull in macro_regime.items() if not bull)
+                if nb_bearish_zones > 0:
+                    effective_top_n = max(2, top_n - nb_bearish_zones)  # réduire de 1 par zone bearish, min 2
+
+            top_tickers = [r["ticker"] for r in ranking[:effective_top_n]]
             weekly_rankings.append({
                 "date"          : str(monday.date()),
                 "nb_eligible"   : len(ranking),
+                "macro_regime"  : macro_regime if macro_mode != "off" else None,
+                "effective_top_n": effective_top_n if macro_mode == "reduce" else top_n,
                 "top"           : [{"ticker": r["ticker"], "score": round(r["score"], 4),
                                     "mom_r2": round(r["mom_r2"], 4), "rvol": round(r["rvol"], 2),
-                                    "rank": r["rank"]} for r in ranking[:top_n]],
+                                    "rank": r["rank"]} for r in ranking[:effective_top_n]],
             })
         else:
             top_tickers = []
             weekly_rankings.append({
                 "date"        : str(monday.date()),
                 "nb_eligible" : 0,
+                "macro_regime": macro_regime if macro_mode != "off" else None,
                 "top"         : [],
             })
 
         # --- C. Vendre les positions qui ne sont plus dans le top N ---
         tickers_to_sell = [t for t in positions if t not in top_tickers]
+
+        # En mode "cut", vendre aussi les positions dans les zones bearish
+        if macro_mode == "cut":
+            for t in list(positions.keys()):
+                zone = get_ticker_zone(t, secteur_mapping)
+                if not macro_regime.get(zone, True) and t not in tickers_to_sell:
+                    tickers_to_sell.append(t)
         for ticker in tickers_to_sell:
             pos = positions[ticker]
             df_t = ticker_data.get(ticker)
@@ -548,11 +645,18 @@ def run_ranking_backtest(
 
             ret_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
             cash += pos["shares"] * exit_price
+            # Déterminer la raison de sortie
+            ticker_zone = get_ticker_zone(ticker, secteur_mapping)
+            if macro_mode == "cut" and not macro_regime.get(ticker_zone, True):
+                exit_reason = "MACRO_BEARISH"
+            else:
+                exit_reason = "RANKING_OUT"
+
             all_trades.append({
                 "ticker"      : ticker,
                 "entry_date"  : str(pos["entry_date"].date()),
                 "exit_date"   : str(monday.date()),
-                "exit_reason" : "RANKING_OUT",
+                "exit_reason" : exit_reason,
                 "entry_price" : round(pos["entry_price"], 2),
                 "exit_price"  : round(exit_price, 2),
                 "shares"      : round(pos["shares"], 4),
@@ -804,16 +908,19 @@ def run_ranking_multi_k(top_n: int = TOP_N) -> dict:
 # POINT D'ENTRÉE — appelé par l'endpoint FastAPI
 # ============================================================
 
-def run_backtest_ranking_logic(top_n: int = TOP_N, k = None) -> dict:
+def run_backtest_ranking_logic(top_n: int = TOP_N, k = None, macro: str = "off") -> dict:
     """
     Point d'entrée pour le endpoint /run-backtest-ranking.
     - k=None         → teste k fixes (2.5, 3.0, 3.5) + adaptatif
     - k=3.0          → teste uniquement k=3.0
     - k="adaptive"   → teste uniquement le mode adaptatif ATR%
+    - macro="off"    → pas de filtre macro
+    - macro="cut"    → exclure les zones bearish du ranking
+    - macro="reduce" → réduire le top N pour les zones bearish
     """
     if k is not None:
         if k == "adaptive":
-            return run_ranking_backtest(top_n=top_n, k="adaptive")
-        return run_ranking_backtest(top_n=top_n, k=float(k))
+            return run_ranking_backtest(top_n=top_n, k="adaptive", macro_mode=macro)
+        return run_ranking_backtest(top_n=top_n, k=float(k), macro_mode=macro)
     else:
         return run_ranking_multi_k(top_n=top_n)
