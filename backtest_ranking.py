@@ -440,43 +440,110 @@ def compute_adaptive_k(atr_14: float, prix: float) -> float:
 
 
 # ============================================================
-# SIMULATION PORTFOLIO
+# SIMULATION PORTFOLIO — v4.1 HYBRID
+# ============================================================
+# Logique fondamentalement différente de v4.0 :
+#   ENTRÉE : ranking (relatif) — on achète le meilleur candidat quand un slot est libre
+#   SORTIE : critères absolus — on vend quand LA POSITION se dégrade, pas quand un autre ticker est meilleur
+#
+# Conditions de sortie (n'importe laquelle suffit) :
+#   1. Trailing stop ATR touché (prix < stop)
+#   2. Prix < SMA 200 (tendance cassée)
+#   3. Momentum R² < 0 (qualité de tendance perdue)
+#   4. Secteur hors force relative
+#   5. Macro bearish (indice zone < SMA 200)
 # ============================================================
 
-def run_ranking_backtest(
-    top_n: int = TOP_N,
-    k = 3.0,
-    macro_mode: str = "off",
+MAX_POSITIONS      = 10           # positions simultanées max
+CAPITAL_INITIAL    = 50_000       # capital total
+
+
+def check_absolute_exit(
+    ticker: str,
+    pos: dict,
+    df_t: pd.DataFrame,
+    day: pd.Timestamp,
+    secteur_mapping: dict,
+    force_data: dict,
+    macro_data: dict,
+) -> str | None:
+    """
+    Vérifie les 5 conditions de sortie absolue pour une position.
+    Retourne la raison de sortie ou None si la position est saine.
+    
+    Ordre de vérification :
+        1. Trailing stop ATR (priorité — protection capital)
+        2. Prix < SMA 200 (tendance cassée)
+        3. Momentum R² < 0 (qualité perdue)
+        4. Secteur hors force relative
+        5. Macro bearish (indice < SMA 200)
+    """
+    if day not in df_t.index:
+        return None  # pas de données ce jour → on garde
+
+    current_price = float(df_t.loc[day, "prix_ajuste"])
+    current_atr   = float(df_t.loc[day, "atr_14"]) if not pd.isna(df_t.loc[day, "atr_14"]) else pos["atr_entry"]
+
+    # --- 1. Trailing stop ATR ---
+    if current_price > pos["max_price"]:
+        pos["max_price"] = current_price
+
+    new_stop = pos["max_price"] - pos["k"] * current_atr
+    pos["stop"] = max(pos["stop"], new_stop)
+
+    if current_price <= pos["stop"]:
+        return "TRAILING_STOP"
+
+    # --- 2. Prix < SMA 200 ---
+    sma_200 = df_t.loc[day, "sma_200"] if "sma_200" in df_t.columns and not pd.isna(df_t.loc[day, "sma_200"]) else None
+    if sma_200 is not None and current_price < sma_200:
+        return "TREND_BROKEN"
+
+    # --- 3. Momentum R² < 0 ---
+    mom_r2 = df_t.loc[day, "mom_r2"] if "mom_r2" in df_t.columns else None
+    if mom_r2 is not None and not pd.isna(mom_r2) and mom_r2 < 0:
+        return "MOMENTUM_LOST"
+
+    # --- 4. Secteur hors force relative ---
+    if not get_secteur_force_for_ticker(ticker, secteur_mapping, force_data, day):
+        return "SECTOR_WEAK"
+
+    # --- 5. Macro bearish ---
+    if macro_data:
+        zone = get_ticker_zone(ticker, secteur_mapping)
+        macro_regime = get_macro_regime(macro_data, day)
+        if not macro_regime.get(zone, True):
+            return "MACRO_BEARISH"
+
+    return None  # position saine
+
+
+def run_hybrid_backtest(
+    max_positions: int = MAX_POSITIONS,
     start_date: str = None,
     end_date: str = None,
 ) -> dict:
     """
-    Backtest principal avec ranking hebdomadaire.
+    Backtest hybride v4.1.
 
-    Chaque lundi :
-        1. Score et classe tous les tickers éligibles
-        2. Vend les positions qui ont quitté le top N
-        3. Achète les nouveaux entrants du top N
-    En continu :
-        4. Trailing stop ATR sur chaque position
+    ENTRÉE (hebdomadaire, chaque lundi) :
+        - S'il y a des slots libres, prendre le(s) meilleur(s) du ranking
+        - Ne pas acheter un ticker déjà en portefeuille
+        - Filtre macro à l'entrée : n'acheter que dans les zones bullish
+    
+    SORTIE (quotidienne, critères absolus) :
+        - Trailing stop ATR adaptatif
+        - Prix < SMA 200
+        - Momentum R² < 0
+        - Secteur hors force relative
+        - Macro bearish
 
-    Paramètre k :
-        float (ex. 3.0)    → k fixe pour toutes les positions
-        "adaptive"         → k calculé par ticker via ATR% à l'entrée
-
-    Paramètre macro_mode :
-        "off"    → pas de filtre macro (comportement actuel)
-        "cut"    → 0 position si la zone du ticker est bearish
-        "reduce" → max 2 positions par zone bearish (au lieu de 5)
-
-    Retourne les métriques détaillées du portefeuille.
+    Retourne les métriques détaillées.
     """
-    adaptive_mode = (k == "adaptive")
-    k_label = "adaptive (ATR%)" if adaptive_mode else str(k)
-    print(f"🚀 Backtest Ranking v4.0 — top {top_n}, k={k_label}, macro={macro_mode}")
-    print(f"   Pondérations : Mom R² {W_MOM_R2:.0%} | RVOL {W_RVOL:.0%} | OBV {W_OBV:.0%}")
-    if adaptive_mode:
-        print(f"   K adaptatif : k = {K_MIN} + atr_pct × {K_ADAPTIVE_COEFF}, clampé [{K_MIN}, {K_MAX}]")
+    print(f"🚀 Backtest Hybrid v4.1 — max {max_positions} positions, k=adaptive, exit=absolute")
+    print(f"   Pondérations scoring : Mom R² {W_MOM_R2:.0%} | RVOL {W_RVOL:.0%} | OBV {W_OBV:.0%}")
+    print(f"   K adaptatif : k = {K_MIN} + atr_pct × {K_ADAPTIVE_COEFF}, clampé [{K_MIN}, {K_MAX}]")
+    print(f"   Sorties absolues : trailing stop | prix<SMA200 | momR2<0 | secteur faible | macro bear")
 
     # 1. Charger tout
     print("   📥 Chargement des tickers...")
@@ -492,20 +559,17 @@ def run_ranking_backtest(
     force_data      = load_all_secteur_force()
     print(f"   {len(secteur_mapping)} tickers mappés, {len(force_data)} secteurs-zones chargés.")
 
-    # Chargement macro (indices + SMA 200)
-    macro_data = {}
-    if macro_mode != "off":
-        print("   📥 Chargement données macro (indices SMA200)...")
-        macro_data = load_macro_data()
-        print(f"   {len(macro_data)} zones macro chargées : {list(macro_data.keys())}")
+    print("   📥 Chargement données macro...")
+    macro_data = load_macro_data()
+    print(f"   {len(macro_data)} zones macro chargées : {list(macro_data.keys())}")
 
-    # 2. Calculer les indicateurs pour chaque ticker
+    # 2. Calculer les indicateurs
     print("   📊 Calcul des indicateurs...")
     for ticker in ticker_data:
         ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
     print("   Indicateurs calculés.")
 
-    # 3. Construire la timeline des lundis
+    # 3. Timeline
     all_dates = set()
     for df in ticker_data.values():
         all_dates.update(df.index)
@@ -516,30 +580,26 @@ def run_ranking_backtest(
     if end_date:
         all_dates = [d for d in all_dates if d <= pd.Timestamp(end_date)]
 
-    # On commence après MOMENTUM_WINDOW jours pour avoir les indicateurs
     if len(all_dates) > MOMENTUM_WINDOW + 50:
         all_dates = all_dates[MOMENTUM_WINDOW + 50:]
 
     mondays = [d for d in all_dates if d.weekday() == 0]
-
     if not mondays:
-        return {"erreur": "Pas assez de données pour le backtest."}
+        return {"erreur": "Pas assez de données."}
 
     print(f"   📅 {len(mondays)} lundis de {mondays[0].date()} à {mondays[-1].date()}")
 
     # 4. Simulation
-    capital        = CAPITAL_INITIAL
-    cash           = CAPITAL_INITIAL
-    positions      = {}   # {ticker: {entry_price, entry_date, shares, max_price, stop, atr_entry}}
-    all_trades     = []
+    cash              = float(CAPITAL_INITIAL)
+    positions         = {}  # {ticker: {entry_price, entry_date, shares, max_price, stop, atr_entry, k}}
+    all_trades        = []
     portfolio_history = []
     weekly_rankings   = []
-
-    position_size = CAPITAL_INITIAL / top_n  # taille par position
+    position_size     = CAPITAL_INITIAL / max_positions
 
     for i, monday in enumerate(mondays):
-        # --- A. Vérifier les trailing stops sur toutes les positions ---
-        # On vérifie chaque jour de la semaine précédente
+
+        # --- A. Vérifier les sorties absolues sur TOUS les jours de la semaine ---
         if i > 0:
             prev_monday = mondays[i - 1]
             week_days = [d for d in all_dates if prev_monday < d <= monday]
@@ -547,165 +607,100 @@ def run_ranking_backtest(
             for day in week_days:
                 tickers_to_close = []
                 for ticker, pos in positions.items():
-                    if ticker not in ticker_data:
-                        continue
-                    df_t = ticker_data[ticker]
-                    if day not in df_t.index:
+                    df_t = ticker_data.get(ticker)
+                    if df_t is None:
                         continue
 
-                    current_price = float(df_t.loc[day, "prix_ajuste"])
-                    current_atr   = float(df_t.loc[day, "atr_14"]) if not pd.isna(df_t.loc[day, "atr_14"]) else pos["atr_entry"]
+                    exit_reason = check_absolute_exit(
+                        ticker, pos, df_t, day,
+                        secteur_mapping, force_data, macro_data
+                    )
 
-                    # Mise à jour du plus haut
-                    if current_price > pos["max_price"]:
-                        pos["max_price"] = current_price
-
-                    # Nouveau stop (ne peut que monter)
-                    pos_k = pos["k"]
-                    new_stop = pos["max_price"] - pos_k * current_atr
-                    pos["stop"] = max(pos["stop"], new_stop)
-
-                    # Vérification sortie
-                    if current_price <= pos["stop"]:
+                    if exit_reason:
+                        current_price = float(df_t.loc[day, "prix_ajuste"]) if day in df_t.index else pos["entry_price"]
                         ret_pct = (current_price - pos["entry_price"]) / pos["entry_price"] * 100
                         cash += pos["shares"] * current_price
                         all_trades.append({
-                            "ticker"      : ticker,
-                            "entry_date"  : str(pos["entry_date"].date()),
-                            "exit_date"   : str(day.date()),
-                            "exit_reason" : "TRAILING_STOP",
-                            "entry_price" : round(pos["entry_price"], 2),
-                            "exit_price"  : round(current_price, 2),
-                            "shares"      : round(pos["shares"], 4),
-                            "pnl_eur"     : round(pos["shares"] * (current_price - pos["entry_price"]), 2),
-                            "return_pct"  : round(ret_pct, 2),
+                            "ticker"       : ticker,
+                            "entry_date"   : str(pos["entry_date"].date()),
+                            "exit_date"    : str(day.date()),
+                            "exit_reason"  : exit_reason,
+                            "entry_price"  : round(pos["entry_price"], 2),
+                            "exit_price"   : round(current_price, 2),
+                            "shares"       : round(pos["shares"], 4),
+                            "pnl_eur"      : round(pos["shares"] * (current_price - pos["entry_price"]), 2),
+                            "return_pct"   : round(ret_pct, 2),
                             "duration_days": (day - pos["entry_date"]).days,
-                            "k_used"      : pos["k"],
+                            "k_used"       : pos["k"],
                         })
                         tickers_to_close.append(ticker)
 
                 for t in tickers_to_close:
                     del positions[t]
 
-        # --- B. Ranking hebdomadaire ---
-        ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data)
+        # --- B. Ranking hebdomadaire (pour les entrées uniquement) ---
+        nb_slots_free = max_positions - len(positions)
 
-        # --- B2. Filtre macro — exclure ou réduire les zones bearish ---
-        macro_regime = get_macro_regime(macro_data, monday) if macro_mode != "off" else {}
+        if nb_slots_free > 0:
+            ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data)
 
-        if ranking and macro_mode == "cut":
-            # Exclure les tickers dont la zone est bearish
-            ranking = [r for r in ranking if macro_regime.get(get_ticker_zone(r["ticker"], secteur_mapping), True)]
+            # Filtrer les tickers déjà en portefeuille
+            ranking = [r for r in ranking if r["ticker"] not in positions]
 
-        if ranking:
-            effective_top_n = top_n
-            if macro_mode == "reduce":
-                # Compter combien de zones sont bearish
-                nb_bearish_zones = sum(1 for z, bull in macro_regime.items() if not bull)
-                if nb_bearish_zones > 0:
-                    effective_top_n = max(2, top_n - nb_bearish_zones)  # réduire de 1 par zone bearish, min 2
+            # Filtrer par macro (n'acheter que dans les zones bullish)
+            macro_regime = get_macro_regime(macro_data, monday)
+            ranking = [r for r in ranking
+                       if macro_regime.get(get_ticker_zone(r["ticker"], secteur_mapping), True)]
 
-            top_tickers = [r["ticker"] for r in ranking[:effective_top_n]]
+            # Prendre les meilleurs pour remplir les slots
+            to_buy = ranking[:nb_slots_free]
+
+            weekly_rankings.append({
+                "date"           : str(monday.date()),
+                "nb_eligible"    : len(ranking),
+                "nb_slots_free"  : nb_slots_free,
+                "nb_bought"      : len(to_buy),
+                "macro_regime"   : macro_regime,
+                "top"            : [{"ticker": r["ticker"], "score": round(r["score"], 4),
+                                     "mom_r2": round(r["mom_r2"], 4)} for r in to_buy],
+            })
+
+            for r in to_buy:
+                ticker = r["ticker"]
+                df_t = ticker_data.get(ticker)
+                if df_t is None or monday not in df_t.index:
+                    continue
+
+                entry_price = float(df_t.loc[monday, "prix_ajuste"])
+                atr_val     = float(df_t.loc[monday, "atr_14"]) if not pd.isna(df_t.loc[monday, "atr_14"]) else entry_price * 0.02
+                pos_k       = compute_adaptive_k(atr_val, entry_price)
+
+                invest = min(position_size, cash)
+                if invest < 100:
+                    continue
+
+                shares = invest / entry_price
+                cash  -= invest
+
+                positions[ticker] = {
+                    "entry_price" : entry_price,
+                    "entry_date"  : monday,
+                    "shares"      : shares,
+                    "max_price"   : entry_price,
+                    "stop"        : entry_price - pos_k * atr_val,
+                    "atr_entry"   : atr_val,
+                    "k"           : pos_k,
+                }
+        else:
             weekly_rankings.append({
                 "date"          : str(monday.date()),
-                "nb_eligible"   : len(ranking),
-                "macro_regime"  : macro_regime if macro_mode != "off" else None,
-                "effective_top_n": effective_top_n if macro_mode == "reduce" else top_n,
-                "top"           : [{"ticker": r["ticker"], "score": round(r["score"], 4),
-                                    "mom_r2": round(r["mom_r2"], 4), "rvol": round(r["rvol"], 2),
-                                    "rank": r["rank"]} for r in ranking[:effective_top_n]],
-            })
-        else:
-            top_tickers = []
-            weekly_rankings.append({
-                "date"        : str(monday.date()),
-                "nb_eligible" : 0,
-                "macro_regime": macro_regime if macro_mode != "off" else None,
-                "top"         : [],
+                "nb_eligible"   : 0,
+                "nb_slots_free" : 0,
+                "nb_bought"     : 0,
+                "top"           : [],
             })
 
-        # --- C. Vendre les positions qui ne sont plus dans le top N ---
-        tickers_to_sell = [t for t in positions if t not in top_tickers]
-
-        # En mode "cut", vendre aussi les positions dans les zones bearish
-        if macro_mode == "cut":
-            for t in list(positions.keys()):
-                zone = get_ticker_zone(t, secteur_mapping)
-                if not macro_regime.get(zone, True) and t not in tickers_to_sell:
-                    tickers_to_sell.append(t)
-        for ticker in tickers_to_sell:
-            pos = positions[ticker]
-            df_t = ticker_data.get(ticker)
-            if df_t is not None and monday in df_t.index:
-                exit_price = float(df_t.loc[monday, "prix_ajuste"])
-            else:
-                # Prendre le dernier prix connu
-                valid = df_t[df_t.index <= monday] if df_t is not None else pd.DataFrame()
-                exit_price = float(valid["prix_ajuste"].iloc[-1]) if not valid.empty else pos["entry_price"]
-
-            ret_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
-            cash += pos["shares"] * exit_price
-            # Déterminer la raison de sortie
-            ticker_zone = get_ticker_zone(ticker, secteur_mapping)
-            if macro_mode == "cut" and not macro_regime.get(ticker_zone, True):
-                exit_reason = "MACRO_BEARISH"
-            else:
-                exit_reason = "RANKING_OUT"
-
-            all_trades.append({
-                "ticker"      : ticker,
-                "entry_date"  : str(pos["entry_date"].date()),
-                "exit_date"   : str(monday.date()),
-                "exit_reason" : exit_reason,
-                "entry_price" : round(pos["entry_price"], 2),
-                "exit_price"  : round(exit_price, 2),
-                "shares"      : round(pos["shares"], 4),
-                "pnl_eur"     : round(pos["shares"] * (exit_price - pos["entry_price"]), 2),
-                "return_pct"  : round(ret_pct, 2),
-                "duration_days": (monday - pos["entry_date"]).days,
-                "k_used"      : pos["k"],
-            })
-            del positions[ticker]
-
-        # --- D. Acheter les nouveaux entrants du top N ---
-        for ticker in top_tickers:
-            if ticker in positions:
-                continue  # déjà en portefeuille
-            if len(positions) >= top_n:
-                break  # portefeuille plein
-
-            df_t = ticker_data.get(ticker)
-            if df_t is None or monday not in df_t.index:
-                continue
-
-            entry_price = float(df_t.loc[monday, "prix_ajuste"])
-            atr_val     = float(df_t.loc[monday, "atr_14"]) if not pd.isna(df_t.loc[monday, "atr_14"]) else entry_price * 0.02
-
-            # K adaptatif ou fixe selon le mode
-            if adaptive_mode:
-                pos_k = compute_adaptive_k(atr_val, entry_price)
-            else:
-                pos_k = k
-
-            # Investir une fraction du capital
-            invest = min(position_size, cash)
-            if invest < 100:  # minimum pour ouvrir
-                continue
-
-            shares = invest / entry_price
-            cash  -= invest
-
-            positions[ticker] = {
-                "entry_price" : entry_price,
-                "entry_date"  : monday,
-                "shares"      : shares,
-                "max_price"   : entry_price,
-                "stop"        : entry_price - pos_k * atr_val,
-                "atr_entry"   : atr_val,
-                "k"           : pos_k,
-            }
-
-        # --- E. Valeur du portefeuille ---
+        # --- C. Valeur du portefeuille ---
         portfolio_value = cash
         for ticker, pos in positions.items():
             df_t = ticker_data.get(ticker)
@@ -715,19 +710,22 @@ def run_ranking_backtest(
                     portfolio_value += pos["shares"] * float(valid["prix_ajuste"].iloc[-1])
 
         portfolio_history.append({
-            "date"          : str(monday.date()),
-            "portfolio_value": round(portfolio_value, 2),
-            "cash"          : round(cash, 2),
-            "nb_positions"  : len(positions),
-            "positions"     : list(positions.keys()),
+            "date"            : str(monday.date()),
+            "portfolio_value" : round(portfolio_value, 2),
+            "cash"            : round(cash, 2),
+            "nb_positions"    : len(positions),
+            "positions"       : list(positions.keys()),
         })
 
         # Log mensuel
         if i % 4 == 0:
             pct = round((portfolio_value / CAPITAL_INITIAL - 1) * 100, 1)
-            print(f"   📅 {monday.date()} | Portefeuille: {portfolio_value:,.0f}€ ({pct:+.1f}%) | Positions: {len(positions)} | Cash: {cash:,.0f}€")
+            pos_list = ", ".join(list(positions.keys())[:5])
+            if len(positions) > 5:
+                pos_list += f"... (+{len(positions)-5})"
+            print(f"   📅 {monday.date()} | {portfolio_value:,.0f}€ ({pct:+.1f}%) | {len(positions)} pos | Cash: {cash:,.0f}€ | {pos_list}")
 
-    # --- F. Fermer les positions restantes ---
+    # --- D. Fermer les positions restantes ---
     last_date = all_dates[-1] if all_dates else mondays[-1]
     for ticker, pos in list(positions.items()):
         df_t = ticker_data.get(ticker)
@@ -739,26 +737,26 @@ def run_ranking_backtest(
 
         ret_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
         all_trades.append({
-            "ticker"      : ticker,
-            "entry_date"  : str(pos["entry_date"].date()),
-            "exit_date"   : str(last_date.date()) + " (FINAL)",
-            "exit_reason" : "END_OF_BACKTEST",
-            "entry_price" : round(pos["entry_price"], 2),
-            "exit_price"  : round(exit_price, 2),
-            "shares"      : round(pos["shares"], 4),
-            "pnl_eur"     : round(pos["shares"] * (exit_price - pos["entry_price"]), 2),
-            "return_pct"  : round(ret_pct, 2),
+            "ticker"       : ticker,
+            "entry_date"   : str(pos["entry_date"].date()),
+            "exit_date"    : str(last_date.date()) + " (FINAL)",
+            "exit_reason"  : "END_OF_BACKTEST",
+            "entry_price"  : round(pos["entry_price"], 2),
+            "exit_price"   : round(exit_price, 2),
+            "shares"       : round(pos["shares"], 4),
+            "pnl_eur"      : round(pos["shares"] * (exit_price - pos["entry_price"]), 2),
+            "return_pct"   : round(ret_pct, 2),
             "duration_days": (last_date - pos["entry_date"]).days,
-            "k_used"      : pos["k"],
+            "k_used"       : pos["k"],
         })
 
-    # --- G. Métriques globales ---
-    final_value   = portfolio_history[-1]["portfolio_value"] if portfolio_history else CAPITAL_INITIAL
-    total_return  = round((final_value / CAPITAL_INITIAL - 1) * 100, 2)
-    nb_trades     = len(all_trades)
+    # --- E. Métriques globales ---
+    final_value  = portfolio_history[-1]["portfolio_value"] if portfolio_history else CAPITAL_INITIAL
+    total_return = round((final_value / CAPITAL_INITIAL - 1) * 100, 2)
+    nb_trades    = len(all_trades)
 
-    wins    = [t for t in all_trades if t["return_pct"] > 0]
-    losses  = [t for t in all_trades if t["return_pct"] <= 0]
+    wins     = [t for t in all_trades if t["return_pct"] > 0]
+    losses   = [t for t in all_trades if t["return_pct"] <= 0]
     win_rate = round(len(wins) / nb_trades * 100, 1) if nb_trades > 0 else 0
 
     avg_win  = round(np.mean([t["return_pct"] for t in wins]), 2) if wins else 0
@@ -766,8 +764,8 @@ def run_ranking_backtest(
 
     # Drawdown
     values = [h["portfolio_value"] for h in portfolio_history]
-    peak       = values[0]
-    max_dd     = 0
+    peak   = values[0]
+    max_dd = 0
     for v in values:
         if v > peak:
             peak = v
@@ -776,12 +774,12 @@ def run_ranking_backtest(
             max_dd = dd
     max_dd = round(max_dd, 2)
 
-    # Sharpe (annualisé, sur rendements hebdomadaires)
+    # Sharpe annualisé
     if len(values) > 2:
-        weekly_returns = [(values[i] - values[i-1]) / values[i-1] for i in range(1, len(values))]
+        weekly_returns = [(values[j] - values[j-1]) / values[j-1] for j in range(1, len(values))]
         mean_r = np.mean(weekly_returns)
         std_r  = np.std(weekly_returns)
-        sharpe = round(mean_r / (std_r + 1e-9) * np.sqrt(52), 3)  # annualisé
+        sharpe = round(mean_r / (std_r + 1e-9) * np.sqrt(52), 3)
     else:
         sharpe = 0
 
@@ -790,137 +788,91 @@ def run_ranking_backtest(
     for t in all_trades:
         reason = t["exit_reason"]
         if reason not in exit_reasons:
-            exit_reasons[reason] = {"count": 0, "avg_return": []}
+            exit_reasons[reason] = {"count": 0, "returns": []}
         exit_reasons[reason]["count"] += 1
-        exit_reasons[reason]["avg_return"].append(t["return_pct"])
+        exit_reasons[reason]["returns"].append(t["return_pct"])
 
     for reason in exit_reasons:
-        rets = exit_reasons[reason]["avg_return"]
+        rets = exit_reasons[reason]["returns"]
         exit_reasons[reason]["avg_return"] = round(np.mean(rets), 2)
-        exit_reasons[reason]["win_rate"] = round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1)
+        exit_reasons[reason]["win_rate"]   = round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1)
+        del exit_reasons[reason]["returns"]
 
-    # Tickers les plus fréquents dans le top N
+    # Durée moyenne de détention
+    durations = [t["duration_days"] for t in all_trades if t["duration_days"] > 0]
+    avg_duration = round(np.mean(durations), 1) if durations else 0
+
+    # Positions moyennes détenues
+    avg_positions = round(np.mean([h["nb_positions"] for h in portfolio_history]), 1)
+
+    # Tickers les plus fréquents
     ticker_frequency = {}
-    for wr in weekly_rankings:
-        for entry in wr["top"]:
-            t = entry["ticker"]
+    for h in portfolio_history:
+        for t in h["positions"]:
             ticker_frequency[t] = ticker_frequency.get(t, 0) + 1
-
     top_tickers_freq = sorted(ticker_frequency.items(), key=lambda x: -x[1])[:20]
 
     result = {
-        "version"    : "v4.0-ranking",
+        "version"    : "v4.1-hybrid",
         "parametres" : {
-            "top_n"          : top_n,
-            "k_atr"          : k_label,
-            "k_adaptive"     : adaptive_mode,
-            "k_range"        : f"[{K_MIN}, {K_MAX}]" if adaptive_mode else None,
-            "capital_initial" : CAPITAL_INITIAL,
+            "max_positions"  : max_positions,
+            "k_mode"         : "adaptive (ATR%)",
+            "k_range"        : f"[{K_MIN}, {K_MAX}]",
+            "exit_mode"      : "absolute (5 conditions)",
+            "capital_initial": CAPITAL_INITIAL,
+            "position_size"  : position_size,
             "weights"        : {"mom_r2": W_MOM_R2, "rvol": W_RVOL, "obv": W_OBV},
             "period"         : f"{mondays[0].date()} → {mondays[-1].date()}",
             "nb_weeks"       : len(mondays),
         },
         "metriques"  : {
-            "total_return_pct"  : total_return,
-            "final_value"       : final_value,
-            "sharpe_ratio"      : sharpe,
-            "max_drawdown_pct"  : max_dd,
-            "nb_trades"         : nb_trades,
-            "win_rate_pct"      : win_rate,
-            "avg_win_pct"       : avg_win,
-            "avg_loss_pct"      : avg_loss,
-            "profit_factor"     : round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
+            "total_return_pct"   : total_return,
+            "final_value"        : final_value,
+            "sharpe_ratio"       : sharpe,
+            "max_drawdown_pct"   : max_dd,
+            "nb_trades"          : nb_trades,
+            "win_rate_pct"       : win_rate,
+            "avg_win_pct"        : avg_win,
+            "avg_loss_pct"       : avg_loss,
+            "profit_factor"      : round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
+            "avg_duration_days"  : avg_duration,
+            "avg_positions_held" : avg_positions,
         },
-        "exit_reasons"       : exit_reasons,
-        "top_tickers_freq"   : [{"ticker": t, "weeks_in_top": w} for t, w in top_tickers_freq],
-        "trades"             : sorted(all_trades, key=lambda t: t["entry_date"]),
-        "portfolio_history"  : portfolio_history,
-        "sample_rankings"    : weekly_rankings[:5] + weekly_rankings[-5:],  # premiers et derniers pour diagnostic
+        "exit_reasons"      : exit_reasons,
+        "top_tickers_freq"  : [{"ticker": t, "weeks_held": w} for t, w in top_tickers_freq],
+        "trades"            : sorted(all_trades, key=lambda t: t["entry_date"]),
+        "portfolio_history" : portfolio_history,
+        "sample_rankings"   : weekly_rankings[:5] + weekly_rankings[-5:],
     }
 
     print(f"\n{'='*60}")
-    print(f"📋 SYNTHÈSE BACKTEST RANKING v4.0")
+    print(f"📋 SYNTHÈSE BACKTEST HYBRID v4.1")
     print(f"{'='*60}")
-    print(f"   Total Return  : {total_return:+.1f}%")
-    print(f"   Sharpe Ratio  : {sharpe}")
-    print(f"   Max Drawdown  : {max_dd:.1f}%")
-    print(f"   Trades        : {nb_trades} (Win rate: {win_rate}%)")
-    print(f"   Avg Win/Loss  : {avg_win:+.1f}% / {avg_loss:.1f}%")
-    print(f"   Profit Factor : {result['metriques']['profit_factor']}")
+    print(f"   Total Return   : {total_return:+.1f}%")
+    print(f"   Sharpe Ratio   : {sharpe}")
+    print(f"   Max Drawdown   : {max_dd:.1f}%")
+    print(f"   Trades         : {nb_trades} (Win rate: {win_rate}%)")
+    print(f"   Avg Win/Loss   : {avg_win:+.1f}% / {avg_loss:.1f}%")
+    print(f"   Profit Factor  : {result['metriques']['profit_factor']}")
+    print(f"   Avg Duration   : {avg_duration:.0f} days")
+    print(f"   Avg Positions  : {avg_positions:.1f}")
+    print(f"   Exit Reasons   :")
+    for reason, stats in exit_reasons.items():
+        print(f"      {reason}: {stats['count']} trades, avg {stats['avg_return']:+.1f}%, WR {stats['win_rate']}%")
 
     return result
-
-
-# ============================================================
-# MULTI-K TEST
-# ============================================================
-
-def run_ranking_multi_k(top_n: int = TOP_N) -> dict:
-    """
-    Teste le backtest ranking avec plusieurs valeurs de k fixes + le mode adaptatif.
-    Retourne les métriques comparées.
-    """
-    results = {}
-
-    # Tests k fixes
-    for k_val in K_VALUES:
-        print(f"\n{'='*60}")
-        print(f"🔄 Test k={k_val}")
-        print(f"{'='*60}")
-        results[str(k_val)] = run_ranking_backtest(top_n=top_n, k=k_val)
-
-    # Test k adaptatif
-    print(f"\n{'='*60}")
-    print(f"🔄 Test k=adaptive (ATR%)")
-    print(f"{'='*60}")
-    results["adaptive"] = run_ranking_backtest(top_n=top_n, k="adaptive")
-
-    # Résumé comparatif
-    summary = {}
-    for k_str, res in results.items():
-        m = res["metriques"]
-        summary[k_str] = {
-            "sharpe"       : m["sharpe_ratio"],
-            "total_return" : m["total_return_pct"],
-            "max_drawdown" : m["max_drawdown_pct"],
-            "nb_trades"    : m["nb_trades"],
-            "win_rate"     : m["win_rate_pct"],
-            "profit_factor": m["profit_factor"],
-        }
-
-    best_k = max(summary, key=lambda k: summary[k]["sharpe"])
-
-    print(f"\n{'='*60}")
-    print(f"📋 COMPARATIF K VALUES")
-    print(f"{'='*60}")
-    for k_str, s in summary.items():
-        marker = " ← BEST" if k_str == best_k else ""
-        print(f"   k={k_str} → Sharpe={s['sharpe']} | Return={s['total_return']}% | MaxDD={s['max_drawdown']}% | Trades={s['nb_trades']}{marker}")
-
-    return {
-        "summary": summary,
-        "best_k" : best_k,
-        "details": results,
-    }
 
 
 # ============================================================
 # POINT D'ENTRÉE — appelé par l'endpoint FastAPI
 # ============================================================
 
-def run_backtest_ranking_logic(top_n: int = TOP_N, k = None, macro: str = "off") -> dict:
+def run_backtest_ranking_logic(top_n: int = 10, k = None, macro: str = "off") -> dict:
     """
     Point d'entrée pour le endpoint /run-backtest-ranking.
-    - k=None         → teste k fixes (2.5, 3.0, 3.5) + adaptatif
-    - k=3.0          → teste uniquement k=3.0
-    - k="adaptive"   → teste uniquement le mode adaptatif ATR%
-    - macro="off"    → pas de filtre macro
-    - macro="cut"    → exclure les zones bearish du ranking
-    - macro="reduce" → réduire le top N pour les zones bearish
+    
+    Mode par défaut (v4.1) : hybride avec sorties absolues.
+      GET /run-backtest-ranking                    → v4.1 hybrid, max 10 positions
+      GET /run-backtest-ranking?top_n=5            → v4.1 hybrid, max 5 positions
     """
-    if k is not None:
-        if k == "adaptive":
-            return run_ranking_backtest(top_n=top_n, k="adaptive", macro_mode=macro)
-        return run_ranking_backtest(top_n=top_n, k=float(k), macro_mode=macro)
-    else:
-        return run_ranking_multi_k(top_n=top_n)
+    return run_hybrid_backtest(max_positions=top_n)
