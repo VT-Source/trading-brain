@@ -263,8 +263,9 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     price = df["prix_ajuste"]
     vol   = df["volume"].fillna(0)
 
-    # SMA 200
+    # SMA 200 et SMA 150
     df["sma_200"] = price.rolling(200, min_periods=200).mean()
+    df["sma_150"] = price.rolling(150, min_periods=150).mean()
 
     # Momentum R² (vectorisé par fenêtre glissante)
     scores = pd.Series(index=df.index, dtype=float)
@@ -325,17 +326,19 @@ def compute_composite_score(
     ticker_data: dict[str, pd.DataFrame],
     date: pd.Timestamp,
     secteur_mapping: dict,
-    force_data: dict
+    force_data: dict,
+    sma_period: int = 200
 ) -> list[dict]:
     """
     Score tous les tickers éligibles à une date donnée.
     Retourne une liste triée par score décroissant.
 
     Éligibilité :
-        1. Prix > SMA 200 (tendance haussière)
+        1. Prix > SMA (sma_period) (tendance haussière)
         2. Secteur en force relative
         3. Mom R² > 0 (tendance positive)
     """
+    sma_col = f"sma_{sma_period}"
     candidates = []
 
     for ticker, df in ticker_data.items():
@@ -353,10 +356,10 @@ def compute_composite_score(
         else:
             row = df.loc[date]
 
-        # Filtre 1 : tendance haussière
-        sma_200 = row.get("sma_200")
+        # Filtre 1 : tendance haussière (SMA paramétrable)
+        sma_val = row.get(sma_col)
         prix = row.get("prix_ajuste")
-        if pd.isna(sma_200) or pd.isna(prix) or prix <= sma_200:
+        if pd.isna(sma_val) or pd.isna(prix) or prix <= sma_val:
             continue
 
         # Filtre 2 : secteur en force
@@ -466,6 +469,7 @@ def check_absolute_exit(
     secteur_mapping: dict,
     force_data: dict,
     macro_data: dict,
+    sma_period: int = 200,
 ) -> str | None:
     """
     Vérifie les 5 conditions de sortie absolue pour une position.
@@ -473,13 +477,14 @@ def check_absolute_exit(
     
     Ordre de vérification :
         1. Trailing stop ATR (priorité — protection capital)
-        2. Prix < SMA 200 (tendance cassée)
+        2. Prix < SMA (sma_period) (tendance cassée)
         3. Momentum R² < 0 (qualité perdue)
         4. Secteur hors force relative
         5. Macro bearish (indice < SMA 200)
     """
+    sma_col = f"sma_{sma_period}"
     if day not in df_t.index:
-        return None  # pas de données ce jour → on garde
+        return None
 
     current_price = float(df_t.loc[day, "prix_ajuste"])
     current_atr   = float(df_t.loc[day, "atr_14"]) if not pd.isna(df_t.loc[day, "atr_14"]) else pos["atr_entry"]
@@ -494,9 +499,9 @@ def check_absolute_exit(
     if current_price <= pos["stop"]:
         return "TRAILING_STOP"
 
-    # --- 2. Prix < SMA 200 ---
-    sma_200 = df_t.loc[day, "sma_200"] if "sma_200" in df_t.columns and not pd.isna(df_t.loc[day, "sma_200"]) else None
-    if sma_200 is not None and current_price < sma_200:
+    # --- 2. Prix < SMA (paramétrable) ---
+    sma_val = df_t.loc[day, sma_col] if sma_col in df_t.columns and not pd.isna(df_t.loc[day, sma_col]) else None
+    if sma_val is not None and current_price < sma_val:
         return "TREND_BROKEN"
 
     # --- 3. Momentum R² < 0 ---
@@ -520,6 +525,7 @@ def check_absolute_exit(
 
 def run_hybrid_backtest(
     max_positions: int = MAX_POSITIONS,
+    sma_period: int = 200,
     start_date: str = None,
     end_date: str = None,
 ) -> dict:
@@ -533,14 +539,14 @@ def run_hybrid_backtest(
     
     SORTIE (quotidienne, critères absolus) :
         - Trailing stop ATR adaptatif
-        - Prix < SMA 200
+        - Prix < SMA (sma_period)
         - Momentum R² < 0
         - Secteur hors force relative
         - Macro bearish
 
     Retourne les métriques détaillées.
     """
-    print(f"🚀 Backtest Hybrid v4.1 — max {max_positions} positions, k=adaptive, exit=absolute")
+    print(f"🚀 Backtest Hybrid v4.1 — max {max_positions} positions, k=adaptive, exit=absolute, SMA={sma_period}")
     print(f"   Pondérations scoring : Mom R² {W_MOM_R2:.0%} | RVOL {W_RVOL:.0%} | OBV {W_OBV:.0%}")
     print(f"   K adaptatif : k = {K_MIN} + atr_pct × {K_ADAPTIVE_COEFF}, clampé [{K_MIN}, {K_MAX}]")
     print(f"   Sorties absolues : trailing stop | prix<SMA200 | momR2<0 | secteur faible | macro bear")
@@ -613,7 +619,8 @@ def run_hybrid_backtest(
 
                     exit_reason = check_absolute_exit(
                         ticker, pos, df_t, day,
-                        secteur_mapping, force_data, macro_data
+                        secteur_mapping, force_data, macro_data,
+                        sma_period=sma_period
                     )
 
                     if exit_reason:
@@ -642,7 +649,7 @@ def run_hybrid_backtest(
         nb_slots_free = max_positions - len(positions)
 
         if nb_slots_free > 0:
-            ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data)
+            ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data, sma_period=sma_period)
 
             # Filtrer les tickers déjà en portefeuille
             ranking = [r for r in ranking if r["ticker"] not in positions]
@@ -819,6 +826,7 @@ def run_hybrid_backtest(
             "k_mode"         : "adaptive (ATR%)",
             "k_range"        : f"[{K_MIN}, {K_MAX}]",
             "exit_mode"      : "absolute (5 conditions)",
+            "sma_ticker"     : sma_period,
             "capital_initial": CAPITAL_INITIAL,
             "position_size"  : position_size,
             "weights"        : {"mom_r2": W_MOM_R2, "rvol": W_RVOL, "obv": W_OBV},
@@ -867,12 +875,49 @@ def run_hybrid_backtest(
 # POINT D'ENTRÉE — appelé par l'endpoint FastAPI
 # ============================================================
 
-def run_backtest_ranking_logic(top_n: int = 10, k = None, macro: str = "off") -> dict:
+def run_backtest_ranking_logic(top_n: int = 5, k = None, macro: str = "off", sma: int = None) -> dict:
     """
     Point d'entrée pour le endpoint /run-backtest-ranking.
     
     Mode par défaut (v4.1) : hybride avec sorties absolues.
-      GET /run-backtest-ranking                    → v4.1 hybrid, max 10 positions
-      GET /run-backtest-ranking?top_n=5            → v4.1 hybrid, max 5 positions
+      GET /run-backtest-ranking                    → v4.1 hybrid, SMA 200
+      GET /run-backtest-ranking?sma=150            → v4.1 hybrid, SMA 150
+      GET /run-backtest-ranking?sma=compare        → teste SMA 200 puis SMA 150, compare
     """
-    return run_hybrid_backtest(max_positions=top_n)
+    if sma is not None and sma != 0:
+        return run_hybrid_backtest(max_positions=top_n, sma_period=sma)
+
+    # Mode comparaison : tester SMA 200 et SMA 150
+    print(f"\n{'='*60}")
+    print(f"🔄 Test SMA 200 (baseline)")
+    print(f"{'='*60}")
+    result_200 = run_hybrid_backtest(max_positions=top_n, sma_period=200)
+
+    print(f"\n{'='*60}")
+    print(f"🔄 Test SMA 150")
+    print(f"{'='*60}")
+    result_150 = run_hybrid_backtest(max_positions=top_n, sma_period=150)
+
+    # Comparatif
+    m200 = result_200["metriques"]
+    m150 = result_150["metriques"]
+    print(f"\n{'='*60}")
+    print(f"📋 COMPARATIF SMA TICKER")
+    print(f"{'='*60}")
+    print(f"   SMA 200 → Sharpe={m200['sharpe_ratio']} | Return={m200['total_return_pct']}% | MaxDD={m200['max_drawdown_pct']}% | Trades={m200['nb_trades']} | PF={m200['profit_factor']} | AvgDur={m200['avg_duration_days']}j")
+    print(f"   SMA 150 → Sharpe={m150['sharpe_ratio']} | Return={m150['total_return_pct']}% | MaxDD={m150['max_drawdown_pct']}% | Trades={m150['nb_trades']} | PF={m150['profit_factor']} | AvgDur={m150['avg_duration_days']}j")
+
+    best = "SMA 200" if m200["sharpe_ratio"] >= m150["sharpe_ratio"] else "SMA 150"
+    print(f"   → {best} wins on Sharpe")
+
+    return {
+        "comparison": {
+            "sma_200": m200,
+            "sma_150": m150,
+            "best": best,
+        },
+        "details": {
+            "sma_200": result_200,
+            "sma_150": result_150,
+        }
+    }
