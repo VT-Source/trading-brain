@@ -349,31 +349,23 @@ async def trigger_backtest_ranking(
     background_tasks: BackgroundTasks,
     top_n: int = 5,
     k: str = None,
-    macro: str = "off"
+    macro: str = "off",
+    sma: int = None
 ):
     """
-    Backtest momentum ranking — top N positions, réévaluation hebdo.
-    - top_n : nombre de positions simultanées (défaut 5)
-    - k     : "adaptive" pour ATR%, ou un float (ex. 3.0), ou rien pour multi-k
-    - macro : "off" (défaut), "cut" (exclure zones bearish), "reduce" (réduire top N)
+    Backtest hybrid v4.1 — entrée ranking, sortie absolue.
+    - top_n : positions max (défaut 5)
+    - sma   : None = compare SMA200 vs SMA150, ou valeur spécifique (150, 200)
     Appels :
-      GET /run-backtest-ranking                              → multi-k + adaptive, sans macro
-      GET /run-backtest-ranking?k=adaptive&macro=cut         → k adaptatif + filtre macro hard
-      GET /run-backtest-ranking?k=3.0&macro=cut              → k=3.0 + filtre macro hard
-      GET /run-backtest-ranking?k=adaptive&macro=reduce      → k adaptatif + macro soft
+      GET /run-backtest-ranking              → compare SMA 200 vs SMA 150
+      GET /run-backtest-ranking?sma=150      → SMA 150 uniquement
+      GET /run-backtest-ranking?sma=200      → SMA 200 uniquement
     """
-    if k is not None and k != "adaptive":
-        try:
-            k = float(k)
-        except ValueError:
-            return {"error": f"k doit être un nombre ou 'adaptive', reçu: {k}"}
-    if macro not in ("off", "cut", "reduce"):
-        return {"error": f"macro doit être 'off', 'cut' ou 'reduce', reçu: {macro}"}
-    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, k=k, macro=macro)
-    k_label = "adaptive (ATR%)" if k == "adaptive" else f"k={k}" if k else "multi-k + adaptive"
+    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, sma=sma)
+    sma_label = f"SMA {sma}" if sma else "SMA 200 vs SMA 150 (compare)"
     return {
         "status" : "processing",
-        "message": f"Backtest ranking v4.0 lancé — top {top_n}, {k_label}, macro={macro}.",
+        "message": f"Backtest hybrid v4.1 lancé — top {top_n}, {sma_label}.",
     }
  
         
