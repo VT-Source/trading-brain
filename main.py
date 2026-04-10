@@ -22,10 +22,33 @@ except ImportError:
     def run_backtest_logic(**kwargs):
         return {"erreur": "backtest.py non trouvé"}
 try:
-    from backtest_ranking import run_backtest_ranking_logic
+    from backtest_ranking import (
+        run_backtest_ranking_logic,
+        load_all_tickers,
+        load_all_price_data,
+        compute_indicators,
+        compute_composite_score,
+        compute_adaptive_k,
+        load_secteur_mapping,
+        load_all_secteur_force,
+        load_macro_data,
+        get_macro_regime,
+        get_ticker_zone,
+    )
 except ImportError:
     def run_backtest_ranking_logic(**kwargs):
-         return {"erreur": "backtest_ranking.py non trouvé"}
+        return {"erreur": "backtest_ranking.py non trouvé"}
+    # Stubs pour les fonctions individuelles
+    load_all_tickers = None
+    load_all_price_data = None
+    compute_indicators = None
+    compute_composite_score = None
+    compute_adaptive_k = None
+    load_secteur_mapping = None
+    load_all_secteur_force = None
+    load_macro_data = None
+    get_macro_regime = None
+    get_ticker_zone = None
 
 load_dotenv()
 
@@ -127,6 +150,149 @@ def get_secteurs_actifs_endpoint():
         "nb_secteurs_actifs": len(secteurs),
         "secteurs"          : secteurs
     }
+
+@app.get("/ranking-live")
+def ranking_live(top_n: int = 20):
+    """
+    Calcule le ranking momentum live sur tous les tickers.
+    Retourne le top N candidats avec score, indicateurs et contexte.
+ 
+    Utilisé par le dashboard Streamlit (page Ranking Hebdo).
+    Synchrone — prend ~30-60s sur 400 tickers.
+    """
+    if compute_composite_score is None:
+        return {"error": "backtest_ranking.py non disponible"}
+    if engine is None:
+        return {"error": "engine non connecté"}
+ 
+    try:
+        import pandas as pd
+ 
+        # 1. Charger les tickers et données
+        all_tickers = load_all_tickers()
+        ticker_data = load_all_price_data(all_tickers)
+ 
+        # 2. Calculer les indicateurs pour chaque ticker
+        for ticker in list(ticker_data.keys()):
+            ticker_data[ticker] = compute_indicators(ticker_data[ticker])
+ 
+        # 3. Charger contexte sectoriel et macro
+        secteur_mapping = load_secteur_mapping()
+        force_data = load_all_secteur_force()
+        macro_data = load_macro_data()
+ 
+        # 4. Trouver le dernier jour de trading disponible
+        all_dates = set()
+        for df in ticker_data.values():
+            all_dates.update(df.index)
+        if not all_dates:
+            return {"error": "Aucune donnée disponible"}
+ 
+        latest_date = max(all_dates)
+ 
+        # 5. Calculer le ranking
+        ranking = compute_composite_score(
+            ticker_data, latest_date, secteur_mapping, force_data, sma_period=200
+        )
+ 
+        # 6. Enrichir avec k adaptatif, zone, secteur
+        macro_regime = get_macro_regime(macro_data, latest_date)
+        enriched = []
+        for r in ranking[:top_n]:
+            ticker = r["ticker"]
+            zone = get_ticker_zone(ticker, secteur_mapping)
+            secteur = secteur_mapping.get(ticker, {}).get("secteur", "—")
+            k = compute_adaptive_k(r["atr_14"], r["prix"]) if r["atr_14"] > 0 else 3.0
+ 
+            enriched.append({
+                "rank":      r.get("rank", 0),
+                "ticker":    ticker,
+                "score":     round(r["score"], 4),
+                "mom_r2":    round(r["mom_r2"], 4),
+                "rvol":      round(r["rvol"], 2),
+                "obv_slope": round(r["obv_slope"], 2),
+                "prix":      round(r["prix"], 2),
+                "sma_200":   round(r["sma_200"], 2),
+                "atr_14":    round(r["atr_14"], 2),
+                "k":         k,
+                "zone":      zone,
+                "secteur":   secteur,
+            })
+ 
+        return {
+            "ranking": enriched,
+            "macro_regime": macro_regime,
+            "meta": {
+                "data_date":        str(latest_date.date()),
+                "nb_total_tickers": len(ticker_data),
+                "nb_eligible":      len(ranking),
+                "top_n":            top_n,
+            },
+        }
+ 
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/macro-status")
+def macro_status():
+    """
+    Retourne l'état macro complet : régime par zone + détails indices.
+    Utilisé par le dashboard Streamlit (page Macro & Secteurs).
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+ 
+    try:
+        import pandas as pd
+ 
+        # Charger les données d'indices
+        with engine.connect() as conn:
+            df_indices = pd.read_sql(text("""
+                SELECT ticker_indice, date, prix_ajuste
+                FROM indices_prix
+                WHERE ticker_indice IN ('^GSPC', '^STOXX')
+                ORDER BY ticker_indice, date ASC
+            """), conn)
+ 
+        if df_indices.empty:
+            return {"error": "Aucune donnée d'indices en base"}
+ 
+        df_indices["date"] = pd.to_datetime(df_indices["date"])
+ 
+        zones = []
+        zone_map = {
+            "^GSPC":  {"zone": "US", "nom": "S&P 500"},
+            "^STOXX": {"zone": "EU", "nom": "STOXX Europe 600"},
+        }
+ 
+        for ticker_indice, info in zone_map.items():
+            df_z = df_indices[df_indices["ticker_indice"] == ticker_indice].set_index("date").sort_index()
+            if df_z.empty:
+                continue
+ 
+            prix = float(df_z["prix_ajuste"].iloc[-1])
+            sma_200 = float(df_z["prix_ajuste"].rolling(200, min_periods=200).mean().iloc[-1]) \
+                if len(df_z) >= 200 else None
+ 
+            is_bull = prix > sma_200 if sma_200 else None
+ 
+            zones.append({
+                "zone":         info["zone"],
+                "indice":       info["nom"],
+                "ticker":       ticker_indice,
+                "prix_indice":  round(prix, 2),
+                "sma_200":      round(sma_200, 2) if sma_200 else None,
+                "bullish":      is_bull,
+                "date":         str(df_z.index[-1].date()),
+            })
+ 
+        return {
+            "zones": zones,
+            "date":  str(date.today()),
+        }
+ 
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/fill-high-low")
 async def trigger_fill_high_low(background_tasks: BackgroundTasks):
