@@ -387,7 +387,7 @@ def compute_composite_score(
             "rvol"     : float(rvol),
             "obv_slope": float(obv_slope),
             "atr_14"   : float(atr_14) if not pd.isna(atr_14) else 0,
-            "sma_200"  : float(sma_200),
+            "sma_200"  : float(sma_val),
         })
 
     if not candidates:
