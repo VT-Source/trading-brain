@@ -53,6 +53,7 @@ MIN_HISTORY        = 260          # jours min pour calculer les indicateurs
 W_MOM_R2           = 0.50         # momentum ajusté R² (qualité de tendance)
 W_RVOL             = 0.25         # volume relatif (conviction)
 W_OBV              = 0.25         # accumulation OBV (smart money)
+MIN_MOM_R2_DEFAULT = 0.0
 
 # Pays européens pour le mapping zone ETF
 PAYS_EU = {
@@ -327,7 +328,8 @@ def compute_composite_score(
     date: pd.Timestamp,
     secteur_mapping: dict,
     force_data: dict,
-    sma_period: int = 200
+    sma_period: int = 200,
+    min_mom_r2: float = MIN_MOM_R2_DEFAULT
 ) -> list[dict]:
     """
     Score tous les tickers éligibles à une date donnée.
@@ -366,9 +368,9 @@ def compute_composite_score(
         if not get_secteur_force_for_ticker(ticker, secteur_mapping, force_data, date):
             continue
 
-        # Filtre 3 : momentum positif
+        # Filtre 3 : momentum positif (seuil paramétrable)
         mom_r2 = row.get("mom_r2")
-        if pd.isna(mom_r2) or mom_r2 <= 0:
+        if pd.isna(mom_r2) or mom_r2 <= min_mom_r2:
             continue
 
         rvol      = row.get("rvol", 0)
@@ -528,6 +530,7 @@ def run_hybrid_backtest(
     sma_period: int = 200,
     start_date: str = None,
     end_date: str = None,
+    min_mom_r2: float = MIN_MOM_R2_DEFAULT,
 ) -> dict:
     """
     Backtest hybride v4.1.
@@ -550,6 +553,7 @@ def run_hybrid_backtest(
     print(f"   Pondérations scoring : Mom R² {W_MOM_R2:.0%} | RVOL {W_RVOL:.0%} | OBV {W_OBV:.0%}")
     print(f"   K adaptatif : k = {K_MIN} + atr_pct × {K_ADAPTIVE_COEFF}, clampé [{K_MIN}, {K_MAX}]")
     print(f"   Sorties absolues : trailing stop | prix<SMA200 | momR2<0 | secteur faible | macro bear")
+    print(f"   Seuil min mom_r2 : {min_mom_r2}")
 
     # 1. Charger tout
     print("   📥 Chargement des tickers...")
@@ -649,7 +653,7 @@ def run_hybrid_backtest(
         nb_slots_free = max_positions - len(positions)
 
         if nb_slots_free > 0:
-            ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data, sma_period=sma_period)
+            ranking = compute_composite_score(ticker_data, monday, secteur_mapping, force_data, sma_period=sma_period, min_mom_r2=min_mom_r2)
 
             # Filtrer les tickers déjà en portefeuille
             ranking = [r for r in ranking if r["ticker"] not in positions]
@@ -875,7 +879,7 @@ def run_hybrid_backtest(
 # POINT D'ENTRÉE — appelé par l'endpoint FastAPI
 # ============================================================
 
-def run_backtest_ranking_logic(top_n: int = 5, k = None, macro: str = "off", sma: int = None) -> dict:
+def run_backtest_ranking_logic(top_n: int = 5, k = None, macro: str = "off", sma: int = None, min_mom_r2: float = None) -> dict:
     """
     Point d'entrée pour le endpoint /run-backtest-ranking.
     
@@ -884,8 +888,72 @@ def run_backtest_ranking_logic(top_n: int = 5, k = None, macro: str = "off", sma
       GET /run-backtest-ranking?sma=150            → v4.1 hybrid, SMA 150
       GET /run-backtest-ranking?sma=compare        → teste SMA 200 puis SMA 150, compare
     """
+# --- Mode comparaison seuil mom_r2 ---
+    if min_mom_r2 is not None and min_mom_r2 == -1:
+        thresholds = [0.0, 0.01, 0.05]
+        results = {}
+        for t in thresholds:
+            label = f"mom_r2>{t}"
+            print(f"\n{'='*60}")
+            print(f"🔄 Test seuil min_mom_r2 = {t}")
+            print(f"{'='*60}")
+            results[label] = run_hybrid_backtest(max_positions=top_n, sma_period=200, min_mom_r2=t)
+
+        print(f"\n{'='*60}")
+        print(f"📋 COMPARATIF SEUIL MOM_R2")
+        print(f"{'='*60}")
+        for label, res in results.items():
+            m = res["metriques"]
+            print(f"   {label} → Sharpe={m['sharpe_ratio']} | Return={m['total_return_pct']}% | MaxDD={m['max_drawdown_pct']}% | Trades={m['nb_trades']} | PF={m['profit_factor']} | AvgDur={m['avg_duration_days']}j | AvgPos={m['avg_positions_held']}")
+
+        best = max(results, key=lambda l: results[l]["metriques"]["sharpe_ratio"])
+        print(f"   → {best} wins on Sharpe")
+
+        return {
+            "comparison": {label: res["metriques"] for label, res in results.items()},
+            "best": best,
+            "details": results,
+        }
+
+    # --- Mode seuil spécifique ---
+    effective_mom_r2 = min_mom_r2 if min_mom_r2 is not None else MIN_MOM_R2_DEFAULT
+
     if sma is not None and sma != 0:
-        return run_hybrid_backtest(max_positions=top_n, sma_period=sma)
+        return run_hybrid_backtest(max_positions=top_n, sma_period=sma, min_mom_r2=effective_mom_r2)
+
+    # Mode comparaison SMA (comportement existant)
+    print(f"\n{'='*60}")
+    print(f"🔄 Test SMA 200 (baseline)")
+    print(f"{'='*60}")
+    result_200 = run_hybrid_backtest(max_positions=top_n, sma_period=200, min_mom_r2=effective_mom_r2)
+
+    print(f"\n{'='*60}")
+    print(f"🔄 Test SMA 150")
+    print(f"{'='*60}")
+    result_150 = run_hybrid_backtest(max_positions=top_n, sma_period=150, min_mom_r2=effective_mom_r2)
+
+    m200 = result_200["metriques"]
+    m150 = result_150["metriques"]
+    print(f"\n{'='*60}")
+    print(f"📋 COMPARATIF SMA TICKER")
+    print(f"{'='*60}")
+    print(f"   SMA 200 → Sharpe={m200['sharpe_ratio']} | Return={m200['total_return_pct']}% | MaxDD={m200['max_drawdown_pct']}% | Trades={m200['nb_trades']} | PF={m200['profit_factor']} | AvgDur={m200['avg_duration_days']}j")
+    print(f"   SMA 150 → Sharpe={m150['sharpe_ratio']} | Return={m150['total_return_pct']}% | MaxDD={m150['max_drawdown_pct']}% | Trades={m150['nb_trades']} | PF={m150['profit_factor']} | AvgDur={m150['avg_duration_days']}j")
+
+    best = "SMA 200" if m200["sharpe_ratio"] >= m150["sharpe_ratio"] else "SMA 150"
+    print(f"   → {best} wins on Sharpe")
+
+    return {
+        "comparison": {
+            "sma_200": m200,
+            "sma_150": m150,
+            "best": best,
+        },
+        "details": {
+            "sma_200": result_200,
+            "sma_150": result_150,
+        }
+    }
 
     # Mode comparaison : tester SMA 200 et SMA 150
     print(f"\n{'='*60}")
