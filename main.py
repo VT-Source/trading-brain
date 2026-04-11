@@ -41,7 +41,7 @@ except ImportError:
     # Stubs pour les fonctions individuelles
     load_all_tickers = None
     load_all_price_data = None
-    compute_indicators = None
+    compute_all_indicators = None
     compute_composite_score = None
     compute_adaptive_k = None
     load_secteur_mapping = None
@@ -174,7 +174,7 @@ def ranking_live(top_n: int = 20):
  
         # 2. Calculer les indicateurs pour chaque ticker
         for ticker in list(ticker_data.keys()):
-            ticker_data[ticker] = compute_indicators(ticker_data[ticker])
+            ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
  
         # 3. Charger contexte sectoriel et macro
         secteur_mapping = load_secteur_mapping()
@@ -981,7 +981,7 @@ def run_analysis_logic(full: bool = False):
             df['prix_ajuste'] = df['prix_ajuste'].fillna(df['prix_cloture'])
             df = df.dropna(subset=['prix_ajuste']).sort_values(['ticker', 'date'])
 
-            def compute_indicators(group):
+            def compute_all_indicators(group):
                 if len(group) < 50: return group
                 price = group['prix_ajuste']
                 vol   = group['volume']
@@ -1049,7 +1049,7 @@ def run_analysis_logic(full: bool = False):
                 )
                 return group
 
-            df = df.groupby('ticker', group_keys=False).apply(compute_indicators)
+            df = df.groupby('ticker', group_keys=False).apply(ccompute_all_indicators)
 
             # 5. Score ML
             if model is not None:
