@@ -196,7 +196,8 @@ def ranking_live(top_n: int = 20):
         if not rows:
             return {"error": "Ranking vide."}
  
-        macro_regime = json.loads(rows[0][12]) if rows[0][12] else {}
+        raw = rows[0][12]
+        macro_regime = raw if isinstance(raw, dict) else json.loads(raw) if raw else {}
  
         ranking = []
         for r in rows:
