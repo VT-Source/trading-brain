@@ -151,88 +151,85 @@ def get_secteurs_actifs_endpoint():
         "secteurs"          : secteurs
     }
 
+@app.get("/compute-ranking")
+async def trigger_compute_ranking(background_tasks: BackgroundTasks, top_n: int = 20):
+    """
+    Lance le calcul du ranking en arrière-plan.
+    Résultat stocké dans ranking_hebdo, lu par /ranking-live.
+    """
+    background_tasks.add_task(compute_and_store_ranking, top_n=top_n)
+    return {
+        "status": "processing",
+        "message": f"Calcul ranking lancé en arrière-plan (top {top_n})."
+    }
+
 @app.get("/ranking-live")
 def ranking_live(top_n: int = 20):
     """
-    Calcule le ranking momentum live sur tous les tickers.
-    Retourne le top N candidats avec score, indicateurs et contexte.
- 
-    Utilisé par le dashboard Streamlit (page Ranking Hebdo).
-    Synchrone — prend ~30-60s sur 400 tickers.
+    Retourne le dernier ranking pré-calculé depuis ranking_hebdo.
+    Instantané (~50ms).
     """
-    if compute_composite_score is None:
-        return {"error": "backtest_ranking.py non disponible"}
     if engine is None:
         return {"error": "engine non connecté"}
  
     try:
-        import pandas as pd
+        import json
  
-        # 1. Charger les tickers et données
-        all_tickers = load_all_tickers()
-        ticker_data = load_all_price_data(all_tickers)
+        with engine.connect() as conn:
+            last_date = conn.execute(text(
+                "SELECT MAX(date_calcul) FROM ranking_hebdo"
+            )).scalar()
  
-        # 2. Calculer les indicateurs pour chaque ticker
-        for ticker in list(ticker_data.keys()):
-            ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
+            if last_date is None:
+                return {"error": "Aucun ranking calculé. Appeler /compute-ranking d'abord."}
  
-        # 3. Charger contexte sectoriel et macro
-        secteur_mapping = load_secteur_mapping()
-        force_data = load_all_secteur_force()
-        macro_data = load_macro_data()
+            rows = conn.execute(text("""
+                SELECT rank, ticker, score, mom_r2, rvol, obv_slope,
+                       prix, sma_200, atr_14, k_adaptatif, zone, secteur,
+                       macro_regime, nb_eligible, nb_total, data_date
+                FROM ranking_hebdo
+                WHERE date_calcul = :d
+                ORDER BY rank ASC
+                LIMIT :n
+            """), {"d": last_date, "n": top_n}).fetchall()
  
-        # 4. Trouver le dernier jour de trading disponible
-        all_dates = set()
-        for df in ticker_data.values():
-            all_dates.update(df.index)
-        if not all_dates:
-            return {"error": "Aucune donnée disponible"}
+        if not rows:
+            return {"error": "Ranking vide."}
  
-        latest_date = max(all_dates)
+        macro_regime = json.loads(rows[0][12]) if rows[0][12] else {}
  
-        # 5. Calculer le ranking
-        ranking = compute_composite_score(
-            ticker_data, latest_date, secteur_mapping, force_data, sma_period=200
-        )
- 
-        # 6. Enrichir avec k adaptatif, zone, secteur
-        macro_regime = get_macro_regime(macro_data, latest_date)
-        enriched = []
-        for r in ranking[:top_n]:
-            ticker = r["ticker"]
-            zone = get_ticker_zone(ticker, secteur_mapping)
-            secteur = secteur_mapping.get(ticker, {}).get("secteur", "—")
-            k = compute_adaptive_k(r["atr_14"], r["prix"]) if r["atr_14"] > 0 else 3.0
- 
-            enriched.append({
-                "rank":      r.get("rank", 0),
-                "ticker":    ticker,
-                "score":     round(r["score"], 4),
-                "mom_r2":    round(r["mom_r2"], 4),
-                "rvol":      round(r["rvol"], 2),
-                "obv_slope": round(r["obv_slope"], 2),
-                "prix":      round(r["prix"], 2),
-                "sma_200":   round(r["sma_200"], 2),
-                "atr_14":    round(r["atr_14"], 2),
-                "k":         k,
-                "zone":      zone,
-                "secteur":   secteur,
+        ranking = []
+        for r in rows:
+            ranking.append({
+                "rank":      r[0],
+                "ticker":    r[1],
+                "score":     float(r[2]) if r[2] else 0,
+                "mom_r2":    float(r[3]) if r[3] else 0,
+                "rvol":      float(r[4]) if r[4] else 0,
+                "obv_slope": float(r[5]) if r[5] else 0,
+                "prix":      float(r[6]) if r[6] else 0,
+                "sma_200":   float(r[7]) if r[7] else 0,
+                "atr_14":    float(r[8]) if r[8] else 0,
+                "k":         float(r[9]) if r[9] else 3.0,
+                "zone":      r[10],
+                "secteur":   r[11],
             })
  
         return {
-            "ranking": enriched,
+            "ranking": ranking,
             "macro_regime": macro_regime,
             "meta": {
-                "data_date":        str(latest_date.date()),
-                "nb_total_tickers": len(ticker_data),
-                "nb_eligible":      len(ranking),
+                "data_date":        str(rows[0][15]),
+                "nb_total_tickers": int(rows[0][14]) if rows[0][14] else 0,
+                "nb_eligible":      int(rows[0][13]) if rows[0][13] else 0,
                 "top_n":            top_n,
+                "date_calcul":      str(last_date),
             },
         }
  
     except Exception as e:
         return {"error": str(e)}
-
+        
 @app.get("/macro-status")
 def macro_status():
     """
@@ -921,6 +918,104 @@ def get_secteurs_en_force() -> list[dict]:
         print(f"⚠️ get_secteurs_en_force : {e} — retour liste vide.")
         return []
 
+def compute_and_store_ranking(top_n: int = 20):
+    """
+    Calcule le ranking momentum sur tous les tickers et le persiste
+    dans ranking_hebdo. Appelé par le scheduler (lundi 06h45)
+    et par l'endpoint /compute-ranking.
+ 
+    Durée estimée : 3-4 min sur 400 tickers.
+    """
+    if compute_composite_score is None:
+        print("❌ compute_and_store_ranking : backtest_ranking.py non disponible")
+        return {"error": "backtest_ranking.py non disponible"}
+    if engine is None:
+        print("❌ compute_and_store_ranking : engine non connecté")
+        return {"error": "engine non connecté"}
+ 
+    try:
+        print("📊 Calcul ranking hebdo...")
+ 
+        # 1. Charger les tickers et données
+        all_tickers = load_all_tickers()
+        ticker_data = load_all_price_data(all_tickers)
+ 
+        # 2. Calculer les indicateurs pour chaque ticker
+        for ticker in list(ticker_data.keys()):
+            ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
+ 
+        # 3. Charger contexte sectoriel et macro
+        secteur_mapping = load_secteur_mapping()
+        force_data = load_all_secteur_force()
+        macro_data = load_macro_data()
+ 
+        # 4. Trouver le dernier jour de trading disponible
+        all_dates = set()
+        for df in ticker_data.values():
+            all_dates.update(df.index)
+        if not all_dates:
+            return {"error": "Aucune donnée disponible"}
+ 
+        latest_date = max(all_dates)
+ 
+        # 5. Calculer le ranking
+        ranking = compute_composite_score(
+            ticker_data, latest_date, secteur_mapping, force_data, sma_period=200
+        )
+ 
+        # 6. Enrichir et préparer les records
+        macro_regime = get_macro_regime(macro_data, latest_date)
+        import json
+        today = date.today()
+ 
+        records = []
+        for r in ranking[:top_n]:
+            ticker = r["ticker"]
+            zone = get_ticker_zone(ticker, secteur_mapping)
+            secteur = secteur_mapping.get(ticker, {}).get("secteur", "—")
+            k = compute_adaptive_k(r["atr_14"], r["prix"]) if r["atr_14"] > 0 else 3.0
+ 
+            records.append({
+                "date_calcul":  today,
+                "rank":         r.get("rank", 0),
+                "ticker":       ticker,
+                "score":        round(r["score"], 4),
+                "mom_r2":       round(r["mom_r2"], 4),
+                "rvol":         round(r["rvol"], 2),
+                "obv_slope":    round(r["obv_slope"], 2),
+                "prix":         round(r["prix"], 2),
+                "sma_200":      round(r["sma_200"], 2),
+                "atr_14":       round(r["atr_14"], 2),
+                "k_adaptatif":  k,
+                "zone":         zone,
+                "secteur":      secteur,
+                "macro_regime": json.dumps(macro_regime),
+                "nb_eligible":  len(ranking),
+                "nb_total":     len(ticker_data),
+                "data_date":    latest_date.date(),
+            })
+ 
+        # 7. Supprimer l'ancien ranking du jour et insérer
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM ranking_hebdo WHERE date_calcul = :d"), {"d": today})
+            for rec in records:
+                conn.execute(text("""
+                    INSERT INTO ranking_hebdo
+                        (date_calcul, rank, ticker, score, mom_r2, rvol, obv_slope,
+                         prix, sma_200, atr_14, k_adaptatif, zone, secteur,
+                         macro_regime, nb_eligible, nb_total, data_date)
+                    VALUES
+                        (:date_calcul, :rank, :ticker, :score, :mom_r2, :rvol, :obv_slope,
+                         :prix, :sma_200, :atr_14, :k_adaptatif, :zone, :secteur,
+                         :macro_regime::jsonb, :nb_eligible, :nb_total, :data_date)
+                """), rec)
+ 
+        print(f"✅ Ranking hebdo sauvegardé : {len(records)} tickers, date données {latest_date.date()}")
+        return {"status": "ok", "nb_ranked": len(records), "data_date": str(latest_date.date())}
+ 
+    except Exception as e:
+        print(f"❌ Erreur compute_and_store_ranking : {e}")
+        return {"error": str(e)}
 
 # ============================================================
 # LOGIQUE ANALYSE — INCRÉMENTALE ET COMPLÈTE
@@ -1049,7 +1144,7 @@ def run_analysis_logic(full: bool = False):
                 )
                 return group
 
-            df = df.groupby('ticker', group_keys=False).apply(ccompute_all_indicators)
+            df = df.groupby('ticker', group_keys=False).apply(compute_all_indicators)
 
             # 5. Score ML
             if model is not None:
