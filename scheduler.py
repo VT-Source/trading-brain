@@ -7,6 +7,7 @@
 #                   (charge 220j de contexte, sauvegarde 5j)
 #   06h15 lun-ven — Sync ETF sectoriels + Force Relative (30j)
 #   06h30 lun-ven — Sync metadata Yahoo Finance
+#   06h45 lund - Job Ranking Hebdo
 #   Dimanche 02h00 — Réentraînement ML hebdomadaire
 #
 # ⚠️  /run-analysis-full N'EST PAS planifié ici.
@@ -36,12 +37,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 try:
-    from main import run_analysis_logic, sync_metadata_logic, sync_secteurs_etf_logic
+    from main import run_analysis_logic, sync_metadata_logic, sync_secteurs_etf_logic, compute_and_store_ranking
 except ImportError as e:
     log.error(f"❌ Impossible d'importer main.py : {e}")
     run_analysis_logic      = lambda **kw: log.error("run_analysis_logic non disponible")
     sync_metadata_logic     = lambda: log.error("sync_metadata_logic non disponible")
     sync_secteurs_etf_logic = lambda **kw: log.error("sync_secteurs_etf_logic non disponible")
+    compute_and_store_ranking = lambda **kw: log.error("compute_and_store_ranking non disponible")
 
 try:
     from train_model import train_brain
@@ -90,6 +92,21 @@ def job_sync_metadata():
     except Exception as e:
         log.error(f"❌ Erreur job sync metadata : {e}")
 
+def job_compute_ranking():
+    """
+    Pré-calcul du ranking hebdomadaire.
+    Lancé le lundi à 06h45, après analyse (06h00), ETF (06h15), metadata (06h30).
+    Résultat stocké dans ranking_hebdo, lu instantanément par le dashboard.
+    """
+    log.info("📊 Job : Calcul ranking hebdomadaire")
+    try:
+        result = compute_and_store_ranking(top_n=20)
+        if "error" in result:
+            log.error(f"❌ Erreur ranking : {result['error']}")
+        else:
+            log.info(f"✅ Ranking calculé : {result.get('nb_ranked', 0)} tickers")
+    except Exception as e:
+        log.error(f"❌ Erreur job ranking : {e}")
 
 def job_train_model():
     log.info("🧠 Job : Réentraînement ML hebdomadaire")
@@ -147,10 +164,21 @@ def main():
         misfire_grace_time=3600
     )
 
+    #Job 5 : Calcul ranking hebdomadaire - Samedi 6h45
+        scheduler.add_job(
+        job_compute_ranking,
+        trigger=CronTrigger(day_of_week="mon", hour=6, minute=45),
+        id="compute_ranking",
+        name="Calcul ranking hebdomadaire",
+        replace_existing=True,
+        misfire_grace_time=600
+    )
+
     log.info("⏰ Scheduler démarré — Jobs planifiés :")
     log.info("   06h00 (lun-ven) → Analyse incrémentale AT + ML")
     log.info("   06h15 (lun-ven) → Sync ETF sectoriels + Force Relative")
     log.info("   06h30 (lun-ven) → Sync metadata Yahoo Finance")
+    log.info("   06h45 (lundi)   → Calcul ranking hebdomadaire")
     log.info("   02h00 (dimanche) → Réentraînement ML")
     log.info("")
     log.info("   ⚠️  Initialisation ETF (5 ans) : GET /sync-etf-sectoriels?full=true  (MANUEL)")
