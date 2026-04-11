@@ -527,7 +527,7 @@ async def trigger_backtest_ranking(
       GET /run-backtest-ranking?sma=200      → SMA 200 uniquement
     """
     background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, sma=sma, min_mom_r2=min_mom_r2)
-if min_mom_r2 == -1:
+    if min_mom_r2 == -1:
         label = "comparaison seuils mom_r2 (0 vs 0.01 vs 0.05)"
     elif min_mom_r2 is not None:
         label = f"min_mom_r2={min_mom_r2}"
