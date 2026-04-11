@@ -26,7 +26,7 @@ try:
         run_backtest_ranking_logic,
         load_all_tickers,
         load_all_price_data,
-        compute_indicators,
+        compute_all_indicators,
         compute_composite_score,
         compute_adaptive_k,
         load_secteur_mapping,
