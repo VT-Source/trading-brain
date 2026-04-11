@@ -1007,7 +1007,7 @@ def compute_and_store_ranking(top_n: int = 20):
                     VALUES
                         (:date_calcul, :rank, :ticker, :score, :mom_r2, :rvol, :obv_slope,
                          :prix, :sma_200, :atr_14, :k_adaptatif, :zone, :secteur,
-                         :macro_regime::jsonb, :nb_eligible, :nb_total, :data_date)
+                         CAST(:macro_regime AS jsonb), :nb_eligible, :nb_total, :data_date)
                 """), rec)
  
         print(f"✅ Ranking hebdo sauvegardé : {len(records)} tickers, date données {latest_date.date()}")
