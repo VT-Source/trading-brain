@@ -514,7 +514,8 @@ async def trigger_backtest_ranking(
     top_n: int = 5,
     k: str = None,
     macro: str = "off",
-    sma: int = None
+    sma: int = None,
+    min_mom_r2: float = None
 ):
     """
     Backtest hybrid v4.1 — entrée ranking, sortie absolue.
@@ -525,11 +526,18 @@ async def trigger_backtest_ranking(
       GET /run-backtest-ranking?sma=150      → SMA 150 uniquement
       GET /run-backtest-ranking?sma=200      → SMA 200 uniquement
     """
-    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, sma=sma)
-    sma_label = f"SMA {sma}" if sma else "SMA 200 vs SMA 150 (compare)"
+    background_tasks.add_task(run_backtest_ranking_logic, top_n=top_n, sma=sma, min_mom_r2=min_mom_r2)
+if min_mom_r2 == -1:
+        label = "comparaison seuils mom_r2 (0 vs 0.01 vs 0.05)"
+    elif min_mom_r2 is not None:
+        label = f"min_mom_r2={min_mom_r2}"
+    elif sma:
+        label = f"SMA {sma}"
+    else:
+        label = "SMA 200 vs SMA 150 (compare)"
     return {
         "status" : "processing",
-        "message": f"Backtest hybrid v4.1 lancé — top {top_n}, {sma_label}.",
+        "message": f"Backtest hybrid v4.1 lancé — top {top_n}, {label}.",
     }
  
         
