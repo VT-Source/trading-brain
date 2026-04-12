@@ -35,6 +35,36 @@ st.set_page_config(
 )
 
 # ============================================================
+# AUTH — Protection par mot de passe
+# ============================================================
+
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
+def check_password() -> bool:
+    """Gate d'authentification simple."""
+    if not DASHBOARD_PASSWORD:
+        # Pas de mot de passe configuré → accès libre (dev local)
+        return True
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown("# 🧠 Trading Brain")
+    st.markdown("### 🔒 Accès protégé")
+    password = st.text_input("Mot de passe", type="password", key="pw_input")
+
+    if st.button("Se connecter", use_container_width=True):
+        if password == DASHBOARD_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Mot de passe incorrect.")
+
+    st.stop()
+
+check_password()
+
+# ============================================================
 # STYLE
 # ============================================================
 
