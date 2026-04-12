@@ -119,6 +119,21 @@ async def trigger_training(background_tasks: BackgroundTasks):
     background_tasks.add_task(train_brain)
     return {"status": "processing", "message": "Entraînement lancé en arrière-plan."}
 
+# --- Endpoint sync prix quotidien (remplace n8n) ---
+@app.get("/sync-prix")
+async def trigger_sync_prix(background_tasks: BackgroundTasks, full: bool = False):
+    """
+    Synchronise les prix OHLCV depuis yfinance → actions_prix_historique.
+    - full=False (défaut) : 30 derniers jours — appel quotidien scheduler
+    - full=True           : 5 ans d'historique — rattrapage manuel
+    """
+    background_tasks.add_task(sync_prix_logic, full=full)
+    mode = "COMPLÈTE (5 ans)" if full else "incrémentale (30j)"
+    return {
+        "status" : "processing",
+        "message": f"Sync prix lancée en arrière-plan — mode {mode}."
+    }
+
 @app.get("/sync-metadata")
 async def trigger_sync(background_tasks: BackgroundTasks):
     background_tasks.add_task(sync_metadata_logic)
@@ -574,6 +589,128 @@ def load_model_from_db():
         print(f"❌ Erreur chargement modèle depuis DB : {e}")
         return None, None
 
+# ============================================================
+# LOGIQUE SYNC PRIX QUOTIDIEN (remplace n8n)
+# ============================================================
+
+def sync_prix_logic(full: bool = False):
+    """
+    Télécharge les prix OHLCV depuis yfinance et upsert dans actions_prix_historique.
+    Remplace le workflow n8n désactivé le 2026-04-11.
+
+    Paramètres
+    ----------
+    full : bool
+        False → 30 derniers jours (mode quotidien, scheduler)
+        True  → 5 ans d'historique (initialisation / rattrapage)
+    """
+    if engine is None:
+        print("❌ sync_prix_logic : engine non connecté.")
+        return
+
+    mode   = "COMPLET (5 ans)" if full else "INCRÉMENTAL (30j)"
+    period = "5y" if full else "1mo"
+    print(f"🔄 Sync prix quotidien — mode {mode}...")
+
+    try:
+        # 1. Liste des tickers depuis la base
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT DISTINCT ticker FROM actions_prix_historique ORDER BY ticker"
+            ))
+            all_tickers = [row[0] for row in result]
+
+        if not all_tickers:
+            print("⚠️ Aucun ticker en base.")
+            return
+
+        print(f"   {len(all_tickers)} tickers à synchroniser.")
+
+        chunk_size    = 20
+        total_chunks  = (len(all_tickers) - 1) // chunk_size + 1
+        total_upserted = 0
+        total_errors   = 0
+
+        for i in range(0, len(all_tickers), chunk_size):
+            chunk = all_tickers[i:i + chunk_size]
+            chunk_upserted = 0
+
+            for ticker_symbol in chunk:
+                try:
+                    df_yf = yf.download(
+                        ticker_symbol,
+                        period=period,
+                        interval="1d",
+                        auto_adjust=True,
+                        progress=False
+                    )
+
+                    if df_yf.empty:
+                        continue
+
+                    df_yf = df_yf.reset_index()
+                    # yfinance peut retourner des MultiIndex columns
+                    df_yf.columns = [c[0] if isinstance(c, tuple) else c for c in df_yf.columns]
+
+                    df_yf = df_yf.rename(columns={
+                        "Date" : "date",
+                        "Open" : "prix_ouverture",
+                        "High" : "prix_haut",
+                        "Low"  : "prix_bas",
+                        "Close": "prix_cloture",
+                        "Volume": "volume",
+                    })
+
+                    # auto_adjust=True → Close est déjà ajusté
+                    df_yf["prix_ajuste"] = df_yf["prix_cloture"]
+                    df_yf["date"]   = pd.to_datetime(df_yf["date"]).dt.date
+                    df_yf["ticker"] = ticker_symbol
+
+                    cols = ["ticker", "date", "prix_ouverture", "prix_haut",
+                            "prix_bas", "prix_cloture", "prix_ajuste", "volume"]
+                    df_clean = df_yf[[c for c in cols if c in df_yf.columns]].dropna(
+                        subset=["prix_cloture"]
+                    )
+
+                    if df_clean.empty:
+                        continue
+
+                    records = df_clean.to_dict("records")
+
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO actions_prix_historique
+                                (ticker, date, prix_ouverture, prix_haut,
+                                 prix_bas, prix_cloture, prix_ajuste, volume)
+                            VALUES
+                                (:ticker, :date, :prix_ouverture, :prix_haut,
+                                 :prix_bas, :prix_cloture, :prix_ajuste, :volume)
+                            ON CONFLICT (ticker, date) DO UPDATE SET
+                                prix_ouverture = EXCLUDED.prix_ouverture,
+                                prix_haut      = EXCLUDED.prix_haut,
+                                prix_bas       = EXCLUDED.prix_bas,
+                                prix_cloture   = EXCLUDED.prix_cloture,
+                                prix_ajuste    = EXCLUDED.prix_ajuste,
+                                volume         = EXCLUDED.volume
+                        """), records)
+
+                    chunk_upserted += len(records)
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    print(f"   ❌ {ticker_symbol} : {e}")
+                    total_errors += 1
+                    continue
+
+            total_upserted += chunk_upserted
+            print(f"   🟢 Chunk {i // chunk_size + 1}/{total_chunks} — "
+                  f"{chunk_upserted} lignes upsertées.")
+
+        print(f"🏁 Sync prix terminée — {total_upserted} lignes upsertées, "
+              f"{total_errors} erreurs.")
+
+    except Exception as e:
+        print(f"❌ Erreur sync_prix_logic : {e}")
 
 # ============================================================
 # LOGIQUE SYNC METADATA
