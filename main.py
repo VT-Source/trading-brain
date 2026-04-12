@@ -637,6 +637,7 @@ def sync_prix_logic(full: bool = False):
 
             for ticker_symbol in chunk:
                 try:
+                    print(f"   ⏳ {ticker_symbol}...")
                     df_yf = yf.download(
                         ticker_symbol,
                         period=period,
@@ -793,10 +794,11 @@ def fill_high_low_logic():
                 try:
                     df_yf = yf.download(
                         ticker_symbol,
-                        period="5y",
+                        period=period,
                         interval="1d",
                         auto_adjust=True,
-                        progress=False
+                        progress=False,
+                        timeout=30
                     )
 
                     if df_yf.empty:
