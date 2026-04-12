@@ -3,6 +3,7 @@
 # Trading Brain | VT-Source
 # ============================================================
 # Jobs planifiés (automatiques) :
+#   05h30 lun-ven — Sync prix quotidien yfinance (remplace n8n)
 #   06h00 lun-ven — Analyse incrémentale AT + ML
 #                   (charge 220j de contexte, sauvegarde 5j)
 #   06h15 lun-ven — Sync ETF sectoriels + Force Relative (30j)
@@ -37,13 +38,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 try:
-    from main import run_analysis_logic, sync_metadata_logic, sync_secteurs_etf_logic, compute_and_store_ranking
+    from main import run_analysis_logic, sync_metadata_logic, sync_secteurs_etf_logic, compute_and_store_ranking, sync_prix_logic
 except ImportError as e:
     log.error(f"❌ Impossible d'importer main.py : {e}")
     run_analysis_logic      = lambda **kw: log.error("run_analysis_logic non disponible")
     sync_metadata_logic     = lambda: log.error("sync_metadata_logic non disponible")
     sync_secteurs_etf_logic = lambda **kw: log.error("sync_secteurs_etf_logic non disponible")
     compute_and_store_ranking = lambda **kw: log.error("compute_and_store_ranking non disponible")
+    sync_prix_logic           = lambda **kw: log.error("sync_prix_logic non disponible")
 
 try:
     from train_model import train_brain
@@ -56,6 +58,19 @@ except ImportError as e:
 # WRAPPERS
 # ============================================================
 
+def job_sync_prix():
+    """
+    Sync quotidienne des prix OHLCV (remplace n8n).
+    Lance à 05h30, AVANT l'analyse (06h00) pour que les indicateurs soient calculés sur des données fraîches.
+    NE PAS appeler avec full=True ici — utiliser /sync-prix?full=true manuellement.
+    """
+    log.info("💰 Job : Sync prix quotidien yfinance (incrémental 30j)")
+    try:
+        sync_prix_logic(full=False)
+        log.info("✅ Job sync prix terminé.")
+    except Exception as e:
+        log.error(f"❌ Erreur job sync prix : {e}")
+        
 def job_analyse():
     """
     Analyse incrémentale quotidienne.
@@ -121,6 +136,16 @@ def job_train_model():
 # SCHEDULER
 # ============================================================
 
+    # Job 0 : Sync prix quotidien — lun-ven à 05h30
+    scheduler.add_job(
+        job_sync_prix,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=5, minute=30),
+        id="sync_prix",
+        name="Sync prix quotidien yfinance",
+        replace_existing=True,
+        misfire_grace_time=600
+    )
+
 def main():
     scheduler = BlockingScheduler(timezone="Europe/Brussels")
 
@@ -175,12 +200,14 @@ def main():
     )
 
     log.info("⏰ Scheduler démarré — Jobs planifiés :")
+    log.info("   05h30 (lun-ven) → Sync prix quotidien yfinance")
     log.info("   06h00 (lun-ven) → Analyse incrémentale AT + ML")
     log.info("   06h15 (lun-ven) → Sync ETF sectoriels + Force Relative")
     log.info("   06h30 (lun-ven) → Sync metadata Yahoo Finance")
     log.info("   06h45 (lundi)   → Calcul ranking hebdomadaire")
     log.info("   02h00 (dimanche) → Réentraînement ML")
     log.info("")
+    log.info("   ⚠️  Rattrapage prix (5 ans)    : GET /sync-prix?full=true             (MANUEL)")
     log.info("   ⚠️  Initialisation ETF (5 ans) : GET /sync-etf-sectoriels?full=true  (MANUEL)")
     log.info("   ⚠️  Recalcul complet AT        : GET /run-analysis-full              (MANUEL)")
     log.info("   Timezone : Europe/Brussels")
