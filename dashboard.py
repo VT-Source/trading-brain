@@ -544,19 +544,24 @@ elif page == "⚙️ Système":
     # --- Manual actions ---
     st.markdown("### 🔧 Actions manuelles")
 
-    col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
     with col1:
+        if st.button("💰 Sync Prix", use_container_width=True):
+            r = api_get("/sync-prix")
+            st.info(r.get("message", "Lancé") if r else "Erreur")
+
+    with col2:
         if st.button("🔄 Sync Metadata", use_container_width=True):
             r = api_get("/sync-metadata")
             st.info(r.get("message", "Lancé") if r else "Erreur")
 
-    with col2:
+    with col3:
         if st.button("📊 Sync ETF", use_container_width=True):
             r = api_get("/sync-etf-sectoriels")
             st.info(r.get("message", "Lancé") if r else "Erreur")
 
-    with col3:
+    with col4:
         if st.button("🧮 Analyse complète", use_container_width=True):
             r = api_get("/run-analysis-full")
             st.info(r.get("message", "Lancé") if r else "Erreur")
