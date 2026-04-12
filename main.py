@@ -121,14 +121,14 @@ async def trigger_training(background_tasks: BackgroundTasks):
 
 # --- Endpoint sync prix quotidien (remplace n8n) ---
 @app.get("/sync-prix")
-async def trigger_sync_prix(background_tasks: BackgroundTasks, full: bool = False):
+async def trigger_sync_prix(background_tasks: BackgroundTasks, full: bool = False, period: str = None):
     """
     Synchronise les prix OHLCV depuis yfinance → actions_prix_historique.
     - full=False (défaut) : 30 derniers jours — appel quotidien scheduler
     - full=True           : 5 ans d'historique — rattrapage manuel
     """
-    background_tasks.add_task(sync_prix_logic, full=full)
-    mode = "COMPLÈTE (5 ans)" if full else "incrémentale (30j)"
+    background_tasks.add_task(sync_prix_logic, full=full, period_override=period)
+    mode = f"custom ({period})" if period else ("COMPLÈTE (5 ans)" if full else "incrémentale (30j)")
     return {
         "status" : "processing",
         "message": f"Sync prix lancée en arrière-plan — mode {mode}."
@@ -147,7 +147,7 @@ async def trigger_sync_etf(background_tasks: BackgroundTasks, full: bool = False
     - full=True           : 5 ans d'historique — initialisation manuelle uniquement
     """
     background_tasks.add_task(sync_secteurs_etf_logic, full=full)
-    mode = "COMPLÈTE (5 ans)" if full else "incrémentale (30j)"
+    mode = f"custom ({period})" if period else ("COMPLÈTE (5 ans)" if full else "incrémentale (30j)")
     return {
         "status" : "processing",
         "message": f"Sync ETF sectoriels lancée en arrière-plan — mode {mode}."
@@ -593,7 +593,7 @@ def load_model_from_db():
 # LOGIQUE SYNC PRIX QUOTIDIEN (remplace n8n)
 # ============================================================
 
-def sync_prix_logic(full: bool = False):
+def sync_prix_logic(full: bool = False, period_override: str = None):
     """
     Télécharge les prix OHLCV depuis yfinance et upsert dans actions_prix_historique.
     Remplace le workflow n8n désactivé le 2026-04-11.
@@ -609,7 +609,7 @@ def sync_prix_logic(full: bool = False):
         return
 
     mode   = "COMPLET (5 ans)" if full else "INCRÉMENTAL (30j)"
-    period = "5y" if full else "1mo"
+    period = period_override or ("5y" if full else "1mo")
     print(f"🔄 Sync prix quotidien — mode {mode}...")
 
     try:
