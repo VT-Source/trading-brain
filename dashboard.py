@@ -156,9 +156,30 @@ st.markdown("""
     }
 
     /* --- Sidebar --- */
+/* --- Sidebar --- */
     section[data-testid="stSidebar"] {
         background: #0d1117;
         border-right: 1px solid #1a1a2e;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] .stRadio label {
+        color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] .stRadio label:hover {
+        color: #e94560 !important;
+    }
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] .stMarkdown {
+        color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] .stCaption,
+    section[data-testid="stSidebar"] small {
+        color: #8892b0 !important;
+    }
     }
 </style>
 """, unsafe_allow_html=True)
