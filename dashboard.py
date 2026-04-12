@@ -161,8 +161,13 @@ st.markdown("""
         background: #0d1117;
         border-right: 1px solid #1a1a2e;
     }
-    section[data-testid="stSidebar"] * {
+section[data-testid="stSidebar"] *:not(button *):not(button) {
         color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] button p,
+    section[data-testid="stSidebar"] button span,
+    section[data-testid="stSidebar"] button {
+        color: #0d1117 !important;
     }
     section[data-testid="stSidebar"] .stRadio label {
         color: #ffffff !important;
