@@ -147,7 +147,7 @@ async def trigger_sync_etf(background_tasks: BackgroundTasks, full: bool = False
     - full=True           : 5 ans d'historique — initialisation manuelle uniquement
     """
     background_tasks.add_task(sync_secteurs_etf_logic, full=full)
-    mode = f"custom ({period})" if period else ("COMPLÈTE (5 ans)" if full else "incrémentale (30j)")
+    mode = "COMPLÈTE (5 ans)" if full else "incrémentale (30j)"
     return {
         "status" : "processing",
         "message": f"Sync ETF sectoriels lancée en arrière-plan — mode {mode}."
