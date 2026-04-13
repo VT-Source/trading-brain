@@ -247,7 +247,7 @@ with st.sidebar:
 if page == "📊 Ranking Hebdo":
 
     st.markdown("# 📊 Ranking Hebdomadaire")
-    st.caption("Top candidats du momentum ranking v4.1 — calculé en temps réel sur ~400 tickers")
+    st.caption("Top candidats du momentum ranking v4.1 — calculé chaque lundi sur ~400 tickers")
 
     # --- Fetch ranking ---
     with st.spinner("Calcul du ranking en cours... (~30s sur 400 tickers)"):
