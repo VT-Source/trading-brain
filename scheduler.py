@@ -136,6 +136,9 @@ def job_train_model():
 # SCHEDULER
 # ============================================================
 
+def main():
+    scheduler = BlockingScheduler(timezone="Europe/Brussels")
+
     # Job 0 : Sync prix quotidien — lun-ven à 05h30
     scheduler.add_job(
         job_sync_prix,
@@ -145,9 +148,6 @@ def job_train_model():
         replace_existing=True,
         misfire_grace_time=600
     )
-
-def main():
-    scheduler = BlockingScheduler(timezone="Europe/Brussels")
 
     # Job 1 : Analyse incrémentale — lun-ven à 06h00
     scheduler.add_job(
@@ -189,8 +189,8 @@ def main():
         misfire_grace_time=3600
     )
 
-    #Job 5 : Calcul ranking hebdomadaire - Samedi 6h45
-        scheduler.add_job(
+    # Job 5 : Calcul ranking hebdomadaire — lundi à 06h45
+    scheduler.add_job(
         job_compute_ranking,
         trigger=CronTrigger(day_of_week="mon", hour=6, minute=45),
         id="compute_ranking",
