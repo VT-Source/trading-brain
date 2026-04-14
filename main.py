@@ -85,7 +85,7 @@ INCREMENTAL_SAVE_DAYS     = 5
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "5.9.0",
+        "version"         : "6.2.0",
         "engine_connected": engine is not None
     }
 
