@@ -7,6 +7,8 @@ import numpy as np
 import yfinance as yf
 from datetime import date, timedelta
 from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -304,6 +306,114 @@ def macro_status():
             "date":  str(date.today()),
         }
  
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============================================================
+# ENDPOINTS — DÉCISIONS HUMAINES (v2)
+# ============================================================
+
+class DecisionPayload(BaseModel):
+    semaine:     str            # format YYYY-MM-DD (lundi de la semaine)
+    ticker:      str
+    rang:        Optional[int]  = None
+    decision:    str            # 'suivi' | 'ignore' | 'modifie'
+    commentaire: Optional[str]  = None
+
+
+@app.post("/decisions")
+def upsert_decision(payload: DecisionPayload):
+    """
+    Crée ou met à jour la décision humaine pour un ticker/semaine.
+    UPSERT : si (semaine, ticker) existe déjà, on écrase.
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    decisions_valides = {"suivi", "ignore", "modifie"}
+    if payload.decision not in decisions_valides:
+        return {"error": f"Décision invalide. Valeurs acceptées : {decisions_valides}"}
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO decisions_humaines (semaine, ticker, rang, decision, commentaire, updated_at)
+                VALUES (:semaine, :ticker, :rang, :decision, :commentaire, NOW())
+                ON CONFLICT (semaine, ticker)
+                DO UPDATE SET
+                    decision    = EXCLUDED.decision,
+                    commentaire = EXCLUDED.commentaire,
+                    rang        = EXCLUDED.rang,
+                    updated_at  = NOW()
+            """), {
+                "semaine":     payload.semaine,
+                "ticker":      payload.ticker.upper(),
+                "rang":        payload.rang,
+                "decision":    payload.decision,
+                "commentaire": payload.commentaire,
+            })
+        return {
+            "status":  "ok",
+            "semaine": payload.semaine,
+            "ticker":  payload.ticker.upper(),
+            "decision": payload.decision,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/decisions")
+def get_decisions(semaine: Optional[str] = None):
+    """
+    Retourne les décisions humaines.
+    - ?semaine=YYYY-MM-DD  → décisions de cette semaine uniquement
+    - sans paramètre        → toutes les semaines disponibles + leurs décisions
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    try:
+        with engine.connect() as conn:
+            if semaine:
+                rows = conn.execute(text("""
+                    SELECT semaine, ticker, rang, decision, commentaire, updated_at
+                    FROM decisions_humaines
+                    WHERE semaine = :semaine
+                    ORDER BY rang ASC NULLS LAST, ticker ASC
+                """), {"semaine": semaine}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT semaine, ticker, rang, decision, commentaire, updated_at
+                    FROM decisions_humaines
+                    ORDER BY semaine DESC, rang ASC NULLS LAST
+                """)).fetchall()
+
+        decisions = [
+            {
+                "semaine":     str(r[0]),
+                "ticker":      r[1],
+                "rang":        r[2],
+                "decision":    r[3],
+                "commentaire": r[4],
+                "updated_at":  str(r[5]),
+            }
+            for r in rows
+        ]
+
+        # Statistiques rapides par semaine
+        semaines = {}
+        for d in decisions:
+            s = d["semaine"]
+            if s not in semaines:
+                semaines[s] = {"suivi": 0, "ignore": 0, "modifie": 0, "total": 0}
+            semaines[s][d["decision"]] += 1
+            semaines[s]["total"] += 1
+
+        return {
+            "nb_total":  len(decisions),
+            "semaines":  semaines,
+            "decisions": decisions,
+        }
     except Exception as e:
         return {"error": str(e)}
 
