@@ -223,7 +223,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "📈 Backtest", "⚙️ Système"],
+        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "📈 Backtest", "📋 Décisions", "⚙️ Système"],
         label_visibility="collapsed",
     )
 
@@ -329,16 +329,76 @@ if page == "📊 Ranking Hebdo":
         else:
             st.warning("Aucun ticker éligible au ranking — vérifier filtres macro/sectoriels.")
 
-        # --- v2 placeholder: Human decisions ---
+# --- v2: Human decisions inline ---
         st.divider()
         st.markdown("### 🧑‍💼 Décisions humaines")
-        st.markdown("""
-        <div class="placeholder-box">
-            <strong>v2 à venir</strong><br>
-            Encoder tes décisions : suivi ✅ / ignoré ❌ / modifié 🔄<br>
-            Avec commentaire libre et suivi de performance réelle vs système
-        </div>
-        """, unsafe_allow_html=True)
+        st.caption("Encode ta décision pour chaque ticker — sauvegardé par semaine")
+
+        # Calcul de la semaine courante (lundi)
+        today = date.today()
+        semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
+
+        # Chargement des décisions existantes pour cette semaine
+        decisions_existantes = {}
+        dec_data = api_get("/decisions", params={"semaine": semaine_courante})
+        if dec_data and "decisions" in dec_data:
+            for d in dec_data["decisions"]:
+                decisions_existantes[d["ticker"]] = d
+
+        for ticker_row in ranking:
+            ticker = ticker_row["ticker"]
+            rang   = ticker_row["rank"]
+            dec_ex = decisions_existantes.get(ticker, {})
+
+            with st.expander(f"#{rang} — {ticker}  {' ✅' if dec_ex.get('decision') == 'suivi' else ' ❌' if dec_ex.get('decision') == 'ignore' else ' 🔄' if dec_ex.get('decision') == 'modifie' else ''}"):
+                col_dec, col_com, col_btn = st.columns([2, 4, 1])
+
+                options    = ["—", "suivi", "ignore", "modifie"]
+                labels     = ["— (non décidé)", "✅ Suivi", "❌ Ignoré", "🔄 Modifié"]
+                current    = dec_ex.get("decision", "—")
+                current_idx = options.index(current) if current in options else 0
+
+                with col_dec:
+                    choix = st.selectbox(
+                        "Décision",
+                        options=labels,
+                        index=current_idx,
+                        key=f"dec_{ticker}",
+                        label_visibility="collapsed",
+                    )
+
+                with col_com:
+                    commentaire = st.text_input(
+                        "Commentaire",
+                        value=dec_ex.get("commentaire", ""),
+                        placeholder="Commentaire libre (optionnel)...",
+                        key=f"com_{ticker}",
+                        label_visibility="collapsed",
+                    )
+
+                with col_btn:
+                    if st.button("💾", key=f"save_{ticker}", help="Sauvegarder"):
+                        decision_val = options[labels.index(choix)]
+                        if decision_val == "—":
+                            st.warning("Sélectionne une décision avant de sauvegarder.")
+                        else:
+                            payload = {
+                                "semaine":     semaine_courante,
+                                "ticker":      ticker,
+                                "rang":        rang,
+                                "decision":    decision_val,
+                                "commentaire": commentaire or None,
+                            }
+                            try:
+                                r = requests.post(f"{API_BASE}/decisions", json=payload, timeout=10)
+                                if r.status_code == 200:
+                                    st.success(f"Décision sauvegardée pour {ticker}")
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                else:
+                                    st.error(f"Erreur API : {r.text}")
+                            except Exception as e:
+                                st.error(f"Erreur : {e}")
 
         # --- v3 placeholder: AI advisor ---
         st.divider()
@@ -508,9 +568,67 @@ elif page == "📈 Backtest":
         else:
             st.error("Erreur lors du lancement du backtest.")
 
+# ============================================================
+# PAGE 4 — DÉCISIONS HUMAINES
+# ============================================================
+
+elif page == "📋 Décisions":
+
+    st.markdown("# 📋 Historique des Décisions")
+    st.caption("Toutes tes décisions hebdomadaires, semaine par semaine")
+
+    # Chargement de toutes les décisions
+    all_dec = api_get("/decisions")
+
+    if all_dec and "decisions" in all_dec:
+        semaines_dispo = sorted(all_dec["semaines"].keys(), reverse=True)
+
+        if not semaines_dispo:
+            st.info("Aucune décision enregistrée pour l'instant.")
+        else:
+            # Sélecteur de semaine
+            semaine_sel = st.selectbox(
+                "Semaine",
+                semaines_dispo,
+                format_func=lambda s: f"Semaine du {s}",
+            )
+
+            stats = all_dec["semaines"].get(semaine_sel, {})
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total décisions", stats.get("total", 0))
+            c2.metric("✅ Suivis",        stats.get("suivi", 0))
+            c3.metric("❌ Ignorés",       stats.get("ignore", 0))
+            c4.metric("🔄 Modifiés",      stats.get("modifie", 0))
+
+            st.divider()
+
+            # Tableau des décisions de la semaine sélectionnée
+            dec_semaine = [d for d in all_dec["decisions"] if d["semaine"] == semaine_sel]
+
+            if dec_semaine:
+                df_dec = pd.DataFrame(dec_semaine)
+                df_dec = df_dec.rename(columns={
+                    "rang":        "#",
+                    "ticker":      "Ticker",
+                    "decision":    "Décision",
+                    "commentaire": "Commentaire",
+                    "updated_at":  "Modifié le",
+                })
+                df_dec["Décision"] = df_dec["Décision"].map({
+                    "suivi":   "✅ Suivi",
+                    "ignore":  "❌ Ignoré",
+                    "modifie": "🔄 Modifié",
+                })
+                cols_show = ["#", "Ticker", "Décision", "Commentaire", "Modifié le"]
+                cols_show = [c for c in cols_show if c in df_dec.columns]
+                st.dataframe(df_dec[cols_show], use_container_width=True, hide_index=True)
+            else:
+                st.info("Aucune décision pour cette semaine.")
+    else:
+        st.info("Aucune décision enregistrée pour l'instant.")
 
 # ============================================================
-# PAGE 4 — SYSTÈME
+# PAGE 5 — SYSTÈME
 # ============================================================
 
 elif page == "⚙️ Système":
