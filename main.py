@@ -667,6 +667,247 @@ def close_position(position_id: int, payload: PositionClosePayload):
     except Exception as e:
         return {"error": str(e)}
 
+# ============================================================
+# ENDPOINT — ÉVALUATION POSITIONS OUVERTES (v4.1)
+# ============================================================
+
+@app.get("/positions-ouvertes-eval")
+def evaluate_open_positions():
+    """
+    Retourne toutes les positions ouvertes avec évaluation temps réel
+    des 5 conditions de sortie v4.1.
+
+    Pour chaque position :
+      - P&L latent (% et €)
+      - Feu par condition : OK (🟢), ALERTE (🟡), VIOLÉE (🔴)
+      - Trailing stop calculé depuis le high watermark réel
+
+    Temps d'exécution : ~2-5s (max 5 tickers à charger).
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    # Vérifier que les fonctions backtest_ranking sont disponibles
+    if load_all_price_data is None:
+        return {"error": "backtest_ranking.py non disponible — fonctions non importées"}
+
+    try:
+        # 1. Charger les positions ouvertes
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, ticker, date_achat, prix_achat, quantite,
+                       montant_investi, decision_id, source, commentaire
+                FROM positions
+                WHERE statut = 'OUVERT'
+                ORDER BY date_achat ASC
+            """)).fetchall()
+
+        if not rows:
+            return {"nb_positions": 0, "positions": [], "date_evaluation": str(date.today())}
+
+        positions_db = []
+        tickers_needed = set()
+        for r in rows:
+            positions_db.append({
+                "id":              r[0],
+                "ticker":          r[1],
+                "date_achat":      r[2],
+                "prix_achat":      float(r[3]),
+                "quantite":        float(r[4]),
+                "montant_investi": float(r[5]) if r[5] else None,
+                "decision_id":     r[6],
+                "source":          r[7],
+                "commentaire":     r[8],
+            })
+            tickers_needed.add(r[1])
+
+        # 2. Charger les données de prix pour ces tickers uniquement
+        ticker_data = load_all_price_data(list(tickers_needed))
+
+        # 3. Calculer les indicateurs pour chaque ticker
+        for ticker in ticker_data:
+            ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
+
+        # 4. Charger contexte sectoriel et macro
+        secteur_mapping = load_secteur_mapping()
+        force_data      = load_all_secteur_force()
+        macro_data      = load_macro_data()
+        macro_regime    = {}
+        if macro_data:
+            # Trouver la dernière date disponible dans les données macro
+            latest_macro_dates = [df.index.max() for df in macro_data.values() if not df.empty]
+            if latest_macro_dates:
+                macro_eval_date = min(latest_macro_dates)
+                macro_regime = get_macro_regime(macro_data, macro_eval_date)
+
+        # 5. Évaluer chaque position
+        results = []
+        for pos in positions_db:
+            ticker = pos["ticker"]
+            df_t = ticker_data.get(ticker)
+
+            if df_t is None or df_t.empty:
+                results.append({
+                    **pos,
+                    "date_achat":     str(pos["date_achat"]),
+                    "error":          f"Pas de données prix pour {ticker}",
+                    "conditions":     {},
+                    "alerte_globale": "INCONNU",
+                })
+                continue
+
+            # Dernière date avec des données
+            latest_date = df_t.index.max()
+            if latest_date not in df_t.index:
+                results.append({
+                    **pos,
+                    "date_achat":     str(pos["date_achat"]),
+                    "error":          f"Pas de données récentes pour {ticker}",
+                    "conditions":     {},
+                    "alerte_globale": "INCONNU",
+                })
+                continue
+
+            current_price = float(df_t.loc[latest_date, "prix_ajuste"])
+            current_atr   = float(df_t.loc[latest_date, "atr_14"]) if not pd.isna(df_t.loc[latest_date, "atr_14"]) else 0
+
+            # --- P&L latent ---
+            pnl_pct = round(100.0 * (current_price - pos["prix_achat"]) / pos["prix_achat"], 2)
+            pnl_eur = round((current_price - pos["prix_achat"]) * pos["quantite"], 2)
+            jours   = (latest_date.date() - pos["date_achat"]).days
+
+            # --- Trailing stop : calculer depuis date_achat ---
+            date_achat_ts = pd.Timestamp(pos["date_achat"])
+            df_since_entry = df_t[df_t.index >= date_achat_ts]
+
+            # K adaptatif basé sur l'ATR actuel
+            k = compute_adaptive_k(current_atr, current_price) if current_atr > 0 else 3.0
+
+            # High watermark = max(prix_achat, max close depuis entrée)
+            if not df_since_entry.empty:
+                max_price = max(pos["prix_achat"], float(df_since_entry["prix_ajuste"].max()))
+            else:
+                max_price = pos["prix_achat"]
+
+            # Trailing stop = high watermark - k × ATR
+            trailing_stop = max_price - k * current_atr if current_atr > 0 else 0
+            stop_distance_pct = round(100.0 * (current_price - trailing_stop) / current_price, 2) if current_price > 0 else 0
+
+            # --- Évaluation des 5 conditions ---
+            conditions = {}
+
+            # 1. Trailing stop
+            if current_price <= trailing_stop:
+                conditions["trailing_stop"] = {"status": "VIOLATED", "feu": "🔴"}
+            elif stop_distance_pct < 2.0:
+                conditions["trailing_stop"] = {"status": "WARNING", "feu": "🟡"}
+            else:
+                conditions["trailing_stop"] = {"status": "OK", "feu": "🟢"}
+            conditions["trailing_stop"]["stop_level"]     = round(trailing_stop, 2)
+            conditions["trailing_stop"]["distance_pct"]   = stop_distance_pct
+            conditions["trailing_stop"]["k"]              = k
+            conditions["trailing_stop"]["max_price"]      = round(max_price, 2)
+
+            # 2. Prix < SMA 200
+            sma_200 = df_t.loc[latest_date, "sma_200"] if "sma_200" in df_t.columns else None
+            if sma_200 is not None and not pd.isna(sma_200):
+                sma_200 = float(sma_200)
+                sma_dist_pct = round(100.0 * (current_price - sma_200) / sma_200, 2)
+                if current_price < sma_200:
+                    conditions["trend_sma200"] = {"status": "VIOLATED", "feu": "🔴"}
+                elif sma_dist_pct < 3.0:
+                    conditions["trend_sma200"] = {"status": "WARNING", "feu": "🟡"}
+                else:
+                    conditions["trend_sma200"] = {"status": "OK", "feu": "🟢"}
+                conditions["trend_sma200"]["sma_200"]      = round(sma_200, 2)
+                conditions["trend_sma200"]["distance_pct"] = sma_dist_pct
+            else:
+                conditions["trend_sma200"] = {"status": "NO_DATA", "feu": "⚪"}
+
+            # 3. Momentum R² < 0
+            mom_r2 = df_t.loc[latest_date, "mom_r2"] if "mom_r2" in df_t.columns else None
+            if mom_r2 is not None and not pd.isna(mom_r2):
+                mom_r2 = float(mom_r2)
+                if mom_r2 < 0:
+                    conditions["momentum_r2"] = {"status": "VIOLATED", "feu": "🔴"}
+                elif mom_r2 < 0.05:
+                    conditions["momentum_r2"] = {"status": "WARNING", "feu": "🟡"}
+                else:
+                    conditions["momentum_r2"] = {"status": "OK", "feu": "🟢"}
+                conditions["momentum_r2"]["value"] = round(mom_r2, 4)
+            else:
+                conditions["momentum_r2"] = {"status": "NO_DATA", "feu": "⚪"}
+
+            # 4. Secteur en force relative
+            sector_ok = get_secteur_force_for_ticker(ticker, secteur_mapping, force_data, latest_date)
+            if not sector_ok:
+                conditions["secteur"] = {"status": "VIOLATED", "feu": "🔴"}
+            else:
+                conditions["secteur"] = {"status": "OK", "feu": "🟢"}
+            secteur_info = secteur_mapping.get(ticker, {})
+            conditions["secteur"]["secteur_name"] = secteur_info.get("secteur", "—")
+
+            # 5. Macro regime
+            zone = get_ticker_zone(ticker, secteur_mapping)
+            macro_bull = macro_regime.get(zone, True)
+            if not macro_bull:
+                conditions["macro"] = {"status": "VIOLATED", "feu": "🔴"}
+            else:
+                conditions["macro"] = {"status": "OK", "feu": "🟢"}
+            conditions["macro"]["zone"] = zone
+
+            # --- Alerte globale ---
+            violated = [k for k, v in conditions.items() if v.get("status") == "VIOLATED"]
+            warnings = [k for k, v in conditions.items() if v.get("status") == "WARNING"]
+
+            if violated:
+                alerte = "SORTIE_RECOMMANDÉE"
+            elif warnings:
+                alerte = "VIGILANCE"
+            else:
+                alerte = "SAIN"
+
+            results.append({
+                "id":              pos["id"],
+                "ticker":          ticker,
+                "date_achat":      str(pos["date_achat"]),
+                "prix_achat":      pos["prix_achat"],
+                "quantite":        pos["quantite"],
+                "montant_investi": pos["montant_investi"],
+                "prix_actuel":     round(current_price, 2),
+                "pnl_pct":         pnl_pct,
+                "pnl_eur":         pnl_eur,
+                "jours_detention": jours,
+                "conditions":      conditions,
+                "nb_violated":     len(violated),
+                "violated":        violated,
+                "nb_warnings":     len(warnings),
+                "warnings":        warnings,
+                "alerte_globale":  alerte,
+                "data_date":       str(latest_date.date()),
+                "decision_id":     pos["decision_id"],
+                "source":          pos["source"],
+                "commentaire":     pos["commentaire"],
+            })
+
+        # Stats globales
+        nb_violated = sum(1 for r in results if r.get("alerte_globale") == "SORTIE_RECOMMANDÉE")
+        nb_warning  = sum(1 for r in results if r.get("alerte_globale") == "VIGILANCE")
+        nb_sain     = sum(1 for r in results if r.get("alerte_globale") == "SAIN")
+
+        return {
+            "date_evaluation": str(date.today()),
+            "nb_positions":    len(results),
+            "nb_sortie_reco":  nb_violated,
+            "nb_vigilance":    nb_warning,
+            "nb_sain":         nb_sain,
+            "positions":       results,
+        }
+
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
 @app.get("/fill-high-low")
 async def trigger_fill_high_low(background_tasks: BackgroundTasks):
     """
