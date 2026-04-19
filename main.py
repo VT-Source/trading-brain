@@ -85,7 +85,7 @@ INCREMENTAL_SAVE_DAYS     = 5
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "6.2.0",
+        "version"         : "6.3.0",
         "engine_connected": engine is not None
     }
 
@@ -435,6 +435,234 @@ def get_decisions(semaine: Optional[str] = None):
             "nb_total":  len(decisions),
             "semaines":  semaines,
             "decisions": decisions,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============================================================
+# ENDPOINTS — POSITIONS (v4.1)
+# ============================================================
+
+@app.post("/positions")
+def open_position(payload: PositionOpenPayload):
+    """
+    Ouvre une nouvelle position (saisie manuelle après exécution broker).
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    sources_valides = {"ranking", "manuel"}
+    if payload.source not in sources_valides:
+        return {"error": f"Source invalide. Valeurs acceptées : {sources_valides}"}
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO positions (ticker, date_achat, prix_achat, quantite,
+                                       decision_id, source, commentaire)
+                VALUES (:ticker, :date_achat, :prix_achat, :quantite,
+                        :decision_id, :source, :commentaire)
+                RETURNING id, montant_investi
+            """), {
+                "ticker":      payload.ticker.upper(),
+                "date_achat":  payload.date_achat,
+                "prix_achat":  payload.prix_achat,
+                "quantite":    payload.quantite,
+                "decision_id": payload.decision_id,
+                "source":      payload.source,
+                "commentaire": payload.commentaire,
+            })
+            row = result.fetchone()
+
+        return {
+            "status":          "ok",
+            "id":              row[0],
+            "ticker":          payload.ticker.upper(),
+            "montant_investi": float(row[1]),
+            "message":         f"Position ouverte : {payload.quantite} × {payload.ticker.upper()} à {payload.prix_achat}",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/positions")
+def list_positions(status: Optional[str] = None):
+    """
+    Liste les positions.
+    - ?status=open   → positions ouvertes uniquement
+    - ?status=closed → positions fermées uniquement
+    - sans paramètre → toutes
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    try:
+        where_clause = ""
+        if status == "open":
+            where_clause = "WHERE p.statut = 'OUVERT'"
+        elif status == "closed":
+            where_clause = "WHERE p.statut = 'FERMÉ'"
+
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT p.id, p.ticker, p.date_achat, p.prix_achat, p.quantite,
+                       p.montant_investi, p.statut,
+                       p.date_vente, p.prix_vente, p.raison_vente,
+                       p.resultat_eur, p.resultat_pct,
+                       p.decision_id, p.source, p.commentaire,
+                       p.created_at, p.updated_at
+                FROM positions p
+                {where_clause}
+                ORDER BY p.date_achat DESC, p.id DESC
+            """)).fetchall()
+
+        positions = []
+        for r in rows:
+            positions.append({
+                "id":              r[0],
+                "ticker":          r[1],
+                "date_achat":      str(r[2]),
+                "prix_achat":      float(r[3]),
+                "quantite":        float(r[4]),
+                "montant_investi": float(r[5]) if r[5] else None,
+                "statut":          r[6],
+                "date_vente":      str(r[7]) if r[7] else None,
+                "prix_vente":      float(r[8]) if r[8] else None,
+                "raison_vente":    r[9],
+                "resultat_eur":    float(r[10]) if r[10] else None,
+                "resultat_pct":    float(r[11]) if r[11] else None,
+                "decision_id":     r[12],
+                "source":          r[13],
+                "commentaire":     r[14],
+                "created_at":      str(r[15]),
+                "updated_at":      str(r[16]),
+            })
+
+        ouvertes = [p for p in positions if p["statut"] == "OUVERT"]
+        fermees  = [p for p in positions if p["statut"] == "FERMÉ"]
+
+        return {
+            "nb_total":    len(positions),
+            "nb_ouvertes": len(ouvertes),
+            "nb_fermees":  len(fermees),
+            "positions":   positions,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.patch("/positions/{position_id}")
+def edit_position(position_id: int, payload: PositionEditPayload):
+    """
+    Modifie une position ouverte (correction prix, quantité, commentaire...).
+    Seules les positions OUVERTES peuvent être éditées.
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    updates = []
+    params = {"position_id": position_id}
+
+    if payload.prix_achat is not None:
+        updates.append("prix_achat = :prix_achat")
+        params["prix_achat"] = payload.prix_achat
+    if payload.quantite is not None:
+        updates.append("quantite = :quantite")
+        params["quantite"] = payload.quantite
+    if payload.date_achat is not None:
+        updates.append("date_achat = :date_achat")
+        params["date_achat"] = payload.date_achat
+    if payload.commentaire is not None:
+        updates.append("commentaire = :commentaire")
+        params["commentaire"] = payload.commentaire
+    if payload.decision_id is not None:
+        updates.append("decision_id = :decision_id")
+        params["decision_id"] = payload.decision_id
+
+    if not updates:
+        return {"error": "Aucun champ à modifier"}
+
+    updates.append("updated_at = NOW()")
+
+    try:
+        with engine.begin() as conn:
+            check = conn.execute(text("""
+                SELECT statut FROM positions WHERE id = :position_id
+            """), {"position_id": position_id}).fetchone()
+
+            if not check:
+                return {"error": f"Position {position_id} introuvable"}
+            if check[0] != "OUVERT":
+                return {"error": f"Position {position_id} déjà fermée — modification impossible"}
+
+            conn.execute(text(f"""
+                UPDATE positions
+                SET {', '.join(updates)}
+                WHERE id = :position_id
+            """), params)
+
+        return {
+            "status":  "ok",
+            "id":      position_id,
+            "updated": [u.split(" = ")[0] for u in updates if u != "updated_at = NOW()"],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/positions/{position_id}/close")
+def close_position(position_id: int, payload: PositionClosePayload):
+    """
+    Ferme une position ouverte (saisie manuelle après vente sur broker).
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    raisons_valides = {
+        "TRAILING_STOP", "TREND_BROKEN", "MOMENTUM_LOST",
+        "SECTOR_WEAK", "MACRO_BEARISH", "MANUEL"
+    }
+    if payload.raison_vente not in raisons_valides:
+        return {"error": f"Raison invalide. Valeurs acceptées : {raisons_valides}"}
+
+    try:
+        with engine.begin() as conn:
+            check = conn.execute(text("""
+                SELECT statut, ticker, prix_achat, quantite
+                FROM positions WHERE id = :position_id
+            """), {"position_id": position_id}).fetchone()
+
+            if not check:
+                return {"error": f"Position {position_id} introuvable"}
+            if check[0] != "OUVERT":
+                return {"error": f"Position {position_id} déjà fermée"}
+
+            conn.execute(text("""
+                UPDATE positions
+                SET statut       = 'FERMÉ',
+                    date_vente   = :date_vente,
+                    prix_vente   = :prix_vente,
+                    raison_vente = :raison_vente,
+                    updated_at   = NOW()
+                WHERE id = :position_id
+            """), {
+                "position_id":  position_id,
+                "date_vente":   payload.date_vente,
+                "prix_vente":   payload.prix_vente,
+                "raison_vente": payload.raison_vente,
+            })
+
+        pnl_pct = round(100.0 * (payload.prix_vente - float(check[2])) / float(check[2]), 2)
+        pnl_eur = round((payload.prix_vente - float(check[2])) * float(check[3]), 2)
+
+        return {
+            "status":       "ok",
+            "id":           position_id,
+            "ticker":       check[1],
+            "resultat_pct": pnl_pct,
+            "resultat_eur": pnl_eur,
+            "raison_vente": payload.raison_vente,
+            "message":      f"Position {check[1]} fermée — {'+' if pnl_pct >= 0 else ''}{pnl_pct}% ({'+' if pnl_eur >= 0 else ''}{pnl_eur}€)",
         }
     except Exception as e:
         return {"error": str(e)}
