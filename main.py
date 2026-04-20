@@ -9,7 +9,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import date, timedelta
 from fastapi import FastAPI, BackgroundTasks
-from pydantic import BaseModel
+from models_api import (
+    DecisionPayload,
+    PositionOpenPayload,
+    PositionClosePayload,
+    PositionEditPayload,
+)
 from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -115,7 +120,7 @@ def start_scheduler():
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "6.3.0",
+        "version"         : "6.4.0",
         "engine_connected": engine is not None
     }
 
@@ -338,40 +343,6 @@ def macro_status():
  
     except Exception as e:
         return {"error": str(e)}
-
-# ============================================================
-# ENDPOINTS — DÉCISIONS HUMAINES (v2)
-# ============================================================
-
-class DecisionPayload(BaseModel):
-    semaine:     str            # format YYYY-MM-DD (lundi de la semaine)
-    ticker:      str
-    rang:        Optional[int]  = None
-    decision:    str            # 'suivi' | 'ignore' | 'modifie'
-    commentaire: Optional[str]  = None
-
-class PositionOpenPayload(BaseModel):
-    ticker:      str
-    date_achat:  str              # format YYYY-MM-DD
-    prix_achat:  float
-    quantite:    float
-    decision_id: Optional[int]  = None
-    source:      Optional[str]  = "ranking"   # 'ranking' | 'manuel'
-    commentaire: Optional[str]  = None
- 
- 
-class PositionClosePayload(BaseModel):
-    date_vente:   str            # format YYYY-MM-DD
-    prix_vente:   float
-    raison_vente: str            # TRAILING_STOP | TREND_BROKEN | MOMENTUM_LOST | SECTOR_WEAK | MACRO_BEARISH | MANUEL
- 
- 
-class PositionEditPayload(BaseModel):
-    prix_achat:  Optional[float] = None
-    quantite:    Optional[float] = None
-    date_achat:  Optional[str]   = None
-    commentaire: Optional[str]   = None
-    decision_id: Optional[int]   = None
 
 @app.post("/decisions")
 def upsert_decision(payload: DecisionPayload):
