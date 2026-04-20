@@ -223,7 +223,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "📈 Backtest", "📋 Décisions", "⚙️ Système"],
+        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest", "📋 Décisions", "⚙️ Système"],
         label_visibility="collapsed",
     )
 
@@ -491,9 +491,269 @@ elif page == "🌍 Macro & Secteurs":
         else:
             st.warning("Aucun secteur en force relative — marché potentiellement risk-off.")
 
+# ============================================================
+# PAGE 3 — PORTEFEUILLE
+# ============================================================
+
+elif page == "💼 Portefeuille":
+
+    st.markdown("# 💼 Portefeuille")
+
+    tab_ouvertes, tab_ouvrir, tab_historique = st.tabs([
+        "📊 Positions ouvertes", "➕ Ouvrir une position", "📜 Historique fermées"
+    ])
+
+    # ----------------------------------------------------------
+    # TAB 1 — Positions ouvertes + évaluation conditions v4.1
+    # ----------------------------------------------------------
+    with tab_ouvertes:
+        st.markdown("### 📊 Positions ouvertes — Conditions de sortie v4.1")
+
+        with st.spinner("Évaluation des conditions de sortie..."):
+            eval_data = api_get("/positions-ouvertes-eval")
+
+        if eval_data and "positions" in eval_data:
+            nb_pos = eval_data.get("nb_positions", 0)
+
+            if nb_pos == 0:
+                st.info("Aucune position ouverte. Utilise l'onglet ➕ pour en ouvrir une.")
+            else:
+                # --- Stats globales ---
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Positions", nb_pos)
+                c2.metric("🟢 Saines", eval_data.get("nb_sain", 0))
+                c3.metric("🟡 Vigilance", eval_data.get("nb_vigilance", 0))
+                c4.metric("🔴 Sortie reco.", eval_data.get("nb_sortie_reco", 0))
+
+                st.caption(f"Données au {eval_data.get('date_evaluation', '?')}")
+                st.divider()
+
+                # --- Détail par position ---
+                for pos in eval_data["positions"]:
+                    alerte = pos.get("alerte_globale", "INCONNU")
+                    if alerte == "SORTIE_RECOMMANDÉE":
+                        feu_global = "🔴"
+                        border_color = "#e94560"
+                    elif alerte == "VIGILANCE":
+                        feu_global = "🟡"
+                        border_color = "#f59e0b"
+                    else:
+                        feu_global = "🟢"
+                        border_color = "#34d399"
+
+                    pnl_pct = pos.get("pnl_pct", 0)
+                    pnl_eur = pos.get("pnl_eur", 0)
+                    pnl_color = "#34d399" if pnl_pct >= 0 else "#e94560"
+                    pnl_sign = "+" if pnl_pct >= 0 else ""
+
+                    with st.container(border=True):
+                        # Header : ticker + alerte + P&L
+                        h1, h2, h3, h4 = st.columns([2, 2, 3, 3])
+                        h1.markdown(f"### {feu_global} {pos['ticker']}")
+                        h2.metric("Jours", pos.get("jours_detention", "?"))
+                        h3.metric("P&L %", f"{pnl_sign}{pnl_pct}%")
+                        h4.metric("P&L €", f"{pnl_sign}{pnl_eur:.2f}€")
+
+                        # Info position
+                        i1, i2, i3 = st.columns(3)
+                        i1.caption(f"Achat : {pos.get('prix_achat', '?')}€ × {pos.get('quantite', '?')}")
+                        i2.caption(f"Prix actuel : {pos.get('prix_actuel', '?')}€")
+                        i3.caption(f"Data : {pos.get('data_date', '?')}")
+
+                        # --- Feux conditions ---
+                        conditions = pos.get("conditions", {})
+
+                        cols = st.columns(5)
+
+                        # 1. Trailing stop
+                        ts = conditions.get("trailing_stop", {})
+                        cols[0].markdown(f"**{ts.get('feu', '⚪')} Trailing Stop**")
+                        cols[0].caption(
+                            f"Stop: {ts.get('stop_level', '?')}€ "
+                            f"(k={ts.get('k', '?')}, dist: {ts.get('distance_pct', '?')}%)"
+                        )
+
+                        # 2. Trend SMA 200
+                        tr = conditions.get("trend_sma200", {})
+                        cols[1].markdown(f"**{tr.get('feu', '⚪')} SMA 200**")
+                        cols[1].caption(
+                            f"SMA: {tr.get('sma_200', '?')}€ "
+                            f"(dist: {tr.get('distance_pct', '?')}%)"
+                        )
+
+                        # 3. Momentum R²
+                        mr = conditions.get("momentum_r2", {})
+                        cols[2].markdown(f"**{mr.get('feu', '⚪')} Mom R²**")
+                        cols[2].caption(f"Valeur: {mr.get('value', '?')}")
+
+                        # 4. Secteur
+                        sc = conditions.get("secteur", {})
+                        cols[3].markdown(f"**{sc.get('feu', '⚪')} Secteur**")
+                        cols[3].caption(f"{sc.get('secteur_name', '?')}")
+
+                        # 5. Macro
+                        mc = conditions.get("macro", {})
+                        cols[4].markdown(f"**{mc.get('feu', '⚪')} Macro**")
+                        cols[4].caption(f"Zone: {mc.get('zone', '?')}")
+
+                        # --- Violated / warnings summary ---
+                        violated = pos.get("violated", [])
+                        warnings = pos.get("warnings", [])
+                        if violated:
+                            st.error(f"⚠️ Conditions violées : {', '.join(violated)}")
+                        elif warnings:
+                            st.warning(f"Conditions en vigilance : {', '.join(warnings)}")
+
+                        # --- Bouton fermer ---
+                        with st.expander("🔒 Fermer cette position"):
+                            with st.form(key=f"close_{pos['id']}"):
+                                fc1, fc2 = st.columns(2)
+                                prix_vente = fc1.number_input(
+                                    "Prix de vente",
+                                    min_value=0.01,
+                                    value=float(pos.get("prix_actuel", 0)),
+                                    step=0.01,
+                                    key=f"pv_{pos['id']}",
+                                )
+                                date_vente = fc2.date_input(
+                                    "Date de vente",
+                                    value=date.today(),
+                                    key=f"dv_{pos['id']}",
+                                )
+                                raison_vente = st.selectbox(
+                                    "Raison",
+                                    ["TRAILING_STOP", "TREND_BROKEN", "MOMENTUM_LOST",
+                                     "SECTOR_WEAK", "MACRO_BEARISH", "MANUEL"],
+                                    index=5,
+                                    key=f"rv_{pos['id']}",
+                                )
+
+                                if st.form_submit_button("Confirmer la fermeture", use_container_width=True):
+                                    try:
+                                        resp = requests.post(
+                                            f"{API_BASE}/positions/{pos['id']}/close",
+                                            json={
+                                                "prix_vente":   prix_vente,
+                                                "date_vente":   str(date_vente),
+                                                "raison_vente": raison_vente,
+                                            },
+                                            timeout=15,
+                                        )
+                                        result = resp.json()
+                                        if result.get("status") == "ok":
+                                            st.success(result.get("message", "Position fermée."))
+                                            st.cache_data.clear()
+                                            st.rerun()
+                                        else:
+                                            st.error(result.get("error", "Erreur inconnue"))
+                                    except Exception as e:
+                                        st.error(f"Erreur : {e}")
+
+        elif eval_data and "error" in eval_data:
+            st.error(f"Erreur API : {eval_data['error']}")
+        else:
+            st.error("Impossible de charger l'évaluation des positions.")
+
+    # ----------------------------------------------------------
+    # TAB 2 — Ouvrir une position
+    # ----------------------------------------------------------
+    with tab_ouvrir:
+        st.markdown("### ➕ Ouvrir une nouvelle position")
+        st.caption("Saisie manuelle après exécution sur ton broker")
+
+        with st.form("open_position_form"):
+            o1, o2 = st.columns(2)
+            ticker = o1.text_input("Ticker", placeholder="ex: NVDA").strip().upper()
+            prix_achat = o2.number_input("Prix d'achat", min_value=0.01, step=0.01)
+
+            o3, o4 = st.columns(2)
+            quantite = o3.number_input("Quantité", min_value=0.01, step=0.01, value=1.0)
+            date_achat = o4.date_input("Date d'achat", value=date.today())
+
+            o5, o6 = st.columns(2)
+            source = o5.selectbox("Source", ["ranking", "manuel"])
+            commentaire = o6.text_input("Commentaire (optionnel)", placeholder="ex: top 1 semaine 14")
+
+            submitted = st.form_submit_button("Ouvrir la position", use_container_width=True)
+
+            if submitted:
+                if not ticker:
+                    st.error("Le ticker est obligatoire.")
+                elif prix_achat <= 0:
+                    st.error("Le prix d'achat doit être > 0.")
+                else:
+                    try:
+                        resp = requests.post(
+                            f"{API_BASE}/positions",
+                            json={
+                                "ticker":      ticker,
+                                "prix_achat":  prix_achat,
+                                "quantite":    quantite,
+                                "date_achat":  str(date_achat),
+                                "source":      source,
+                                "commentaire": commentaire or None,
+                                "decision_id": None,
+                            },
+                            timeout=15,
+                        )
+                        result = resp.json()
+                        if result.get("status") == "ok":
+                            st.success(f"✅ {result.get('message', 'Position ouverte.')}")
+                            st.cache_data.clear()
+                        else:
+                            st.error(result.get("error", "Erreur inconnue"))
+                    except Exception as e:
+                        st.error(f"Erreur : {e}")
+
+    # ----------------------------------------------------------
+    # TAB 3 — Historique des positions fermées
+    # ----------------------------------------------------------
+    with tab_historique:
+        st.markdown("### 📜 Positions fermées")
+
+        closed_data = api_get("/positions", params={"status": "closed"})
+
+        if closed_data and "positions" in closed_data:
+            fermees = closed_data["positions"]
+
+            if not fermees:
+                st.info("Aucune position fermée pour l'instant.")
+            else:
+                # Stats résumé
+                df_f = pd.DataFrame(fermees)
+                nb_win  = len(df_f[df_f["resultat_pct"].apply(lambda x: (x or 0) > 0)])
+                nb_loss = len(df_f[df_f["resultat_pct"].apply(lambda x: (x or 0) <= 0)])
+                total_eur = df_f["resultat_eur"].apply(lambda x: x or 0).sum()
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total fermées", len(fermees))
+                c2.metric("Gagnantes", nb_win)
+                c3.metric("Perdantes", nb_loss)
+                c4.metric("P&L total", f"{total_eur:+,.2f}€")
+
+                st.divider()
+
+                # Tableau détaillé
+                df_display = df_f[[
+                    "ticker", "date_achat", "prix_achat", "date_vente",
+                    "prix_vente", "resultat_pct", "resultat_eur", "raison_vente",
+                ]].copy()
+                df_display.columns = [
+                    "Ticker", "Achat", "Prix achat", "Vente",
+                    "Prix vente", "P&L %", "P&L €", "Raison",
+                ]
+
+                for col in ["Prix achat", "Prix vente", "P&L %", "P&L €"]:
+                    df_display[col] = df_display[col].apply(
+                        lambda x: f"{x:+.2f}" if x is not None else "—"
+                    )
+
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.error("Impossible de charger les positions fermées.")
 
 # ============================================================
-# PAGE 3 — BACKTEST
+# PAGE 4 — BACKTEST
 # ============================================================
 
 elif page == "📈 Backtest":
@@ -569,7 +829,7 @@ elif page == "📈 Backtest":
             st.error("Erreur lors du lancement du backtest.")
 
 # ============================================================
-# PAGE 4 — DÉCISIONS HUMAINES
+# PAGE 5 — DÉCISIONS HUMAINES
 # ============================================================
 
 elif page == "📋 Décisions":
@@ -628,7 +888,7 @@ elif page == "📋 Décisions":
         st.info("Aucune décision enregistrée pour l'instant.")
 
 # ============================================================
-# PAGE 5 — SYSTÈME
+# PAGE 6 — SYSTÈME
 # ============================================================
 
 elif page == "⚙️ Système":
