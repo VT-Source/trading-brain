@@ -5,6 +5,8 @@ import joblib
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from datetime import date, timedelta
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
@@ -79,6 +81,31 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
 INCREMENTAL_LOOKBACK_DAYS = 220
 INCREMENTAL_SAVE_DAYS     = 5
 
+# ============================================================
+# SCHEDULER INTÉGRÉ (BackgroundScheduler)
+# ============================================================
+
+scheduler = BackgroundScheduler(timezone="Europe/Brussels")
+
+@app.on_event("startup")
+def start_scheduler():
+    scheduler.add_job(lambda: sync_prix_logic(full=False),
+                      CronTrigger(day_of_week="mon-fri", hour=5, minute=30),
+                      id="sync_prix", replace_existing=True, misfire_grace_time=600)
+    scheduler.add_job(lambda: run_analysis_logic(full=False),
+                      CronTrigger(day_of_week="mon-fri", hour=6, minute=0),
+                      id="analyse", replace_existing=True, misfire_grace_time=600)
+    scheduler.add_job(lambda: sync_secteurs_etf_logic(full=False),
+                      CronTrigger(day_of_week="mon-fri", hour=6, minute=15),
+                      id="sync_etf", replace_existing=True, misfire_grace_time=600)
+    scheduler.add_job(sync_metadata_logic,
+                      CronTrigger(day_of_week="mon-fri", hour=6, minute=30),
+                      id="sync_metadata", replace_existing=True, misfire_grace_time=600)
+    scheduler.add_job(lambda: compute_and_store_ranking(top_n=20),
+                      CronTrigger(day_of_week="mon", hour=6, minute=45),
+                      id="compute_ranking", replace_existing=True, misfire_grace_time=600)
+    scheduler.start()
+    print("⏰ Scheduler intégré démarré (BackgroundScheduler)")
 
 # ============================================================
 # ENDPOINTS API
