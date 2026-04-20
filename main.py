@@ -126,7 +126,7 @@ def start_scheduler():
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "6.4.0",
+        "version"         : "6.5.0",
         "engine_connected": engine is not None
     }
 
