@@ -36,6 +36,8 @@ try:
         load_macro_data,
         get_macro_regime,
         get_ticker_zone,
+        get_ticker_zone,
+        get_secteur_force_for_ticker,
     )
 except ImportError:
     def run_backtest_ranking_logic(**kwargs):
@@ -51,6 +53,7 @@ except ImportError:
     load_macro_data = None
     get_macro_regime = None
     get_ticker_zone = None
+    get_secteur_force_for_ticker = None
 
 load_dotenv()
 
