@@ -13,7 +13,7 @@ from sqlalchemy import text
 
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 
 
 def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
