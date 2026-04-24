@@ -28,6 +28,9 @@ joblib
 # --- Orchestration ---
 apscheduler
 
+# --- Pour appel API Anthopic
+anthropic
+
 # --- Dashboard ---
 streamlit
 
