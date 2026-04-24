@@ -1,5 +1,7 @@
 import io
 import os
+import json
+import traceback
 import time
 import joblib
 import pandas as pd
@@ -48,7 +50,6 @@ try:
         load_all_secteur_force,
         load_macro_data,
         get_macro_regime,
-        get_ticker_zone,
         get_ticker_zone,
         get_secteur_force_for_ticker,
     )
@@ -231,7 +232,6 @@ def ranking_live(top_n: int = 20):
         return {"error": "engine non connecté"}
  
     try:
-        import json
  
         with engine.connect() as conn:
             last_date = conn.execute(text(
@@ -299,7 +299,6 @@ def macro_status():
         return {"error": "engine non connecté"}
  
     try:
-        import pandas as pd
  
         # Charger les données d'indices
         with engine.connect() as conn:
@@ -912,7 +911,6 @@ def evaluate_open_positions():
         }
 
     except Exception as e:
-        import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 @app.get("/fill-high-low")
@@ -1163,7 +1161,6 @@ async def trigger_backtest_ranking(
         "message": f"Backtest hybrid v4.1 lancé — top {top_n}, {label}.",
     }
  
-        
 # ============================================================
 # CHARGEMENT DU MODÈLE DEPUIS POSTGRESQL
 # ============================================================
@@ -1178,7 +1175,7 @@ def load_model_from_db():
         return None, None
     try:
         with engine.connect() as conn:
-                        row = conn.execute(text("""
+            row = conn.execute(text("""
                 SELECT model_data, columns_data, accuracy, updated_at
                 FROM models_store
                 WHERE model_name = 'trading_forest'
@@ -1281,7 +1278,6 @@ def compute_and_store_ranking(top_n: int = 20):
  
         # 6. Enrichir et préparer les records
         macro_regime = get_macro_regime(macro_data, latest_date)
-        import json
         today = date.today()
  
         records = []
@@ -1392,7 +1388,7 @@ def run_analysis_logic(full: bool = False):
             df['prix_ajuste'] = df['prix_ajuste'].fillna(df['prix_cloture'])
             df = df.dropna(subset=['prix_ajuste']).sort_values(['ticker', 'date'])
 
-            def compute_all_indicators(group):
+            def compute_analysis_indicators(group):
                 if len(group) < 50: return group
                 price = group['prix_ajuste']
                 vol   = group['volume']
@@ -1460,7 +1456,7 @@ def run_analysis_logic(full: bool = False):
                 )
                 return group
 
-            df = df.groupby('ticker', group_keys=False).apply(compute_all_indicators)
+            df = df.groupby('ticker', group_keys=False).apply(compute_analysis_indicators)
 
             # 5. Score ML
             if model is not None:
