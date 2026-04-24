@@ -23,6 +23,7 @@ from sync import (
     fill_high_low_logic,
     sync_secteurs_etf_logic,
 )
+from ai_opinion import generate_opinion, generate_opinions_batch, get_opinions
 from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -93,6 +94,20 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
 INCREMENTAL_LOOKBACK_DAYS = 220
 INCREMENTAL_SAVE_DAYS     = 5
 
+def _auto_generate_opinions():
+    """Génère les avis IA pour le top 5 après le ranking du lundi."""
+    ranking_data = ranking_live(top_n=5)
+    if "error" in ranking_data:
+        print(f"⚠️ Auto AI opinions : pas de ranking disponible")
+        return
+    today = date.today()
+    semaine = str(today - pd.Timedelta(days=today.weekday()))
+    tickers_data = [
+        {**r, "rang": r["rank"]}
+        for r in ranking_data.get("ranking", [])[:5]
+    ]
+    generate_opinions_batch(engine, tickers_data, semaine, source="auto")
+    
 # ============================================================
 # SCHEDULER INTÉGRÉ (BackgroundScheduler)
 # ============================================================
@@ -116,6 +131,9 @@ def start_scheduler():
     scheduler.add_job(lambda: compute_and_store_ranking(top_n=20),
                       CronTrigger(day_of_week="mon", hour=6, minute=45),
                       id="compute_ranking", replace_existing=True, misfire_grace_time=600)
+    scheduler.add_job(lambda: _auto_generate_opinions(),
+                      CronTrigger(day_of_week="mon", hour=7, minute=0),
+                      id="ai_opinions", replace_existing=True, misfire_grace_time=600)
     scheduler.start()
     print("⏰ Scheduler intégré démarré (BackgroundScheduler)")
 
@@ -444,6 +462,73 @@ def get_decisions(semaine: Optional[str] = None):
         }
     except Exception as e:
         return {"error": str(e)}
+
+# ============================================================
+# ENDPOINTS — AVIS IA
+# ============================================================
+
+@app.post("/generate-ai-opinion")
+async def trigger_ai_opinion(background_tasks: BackgroundTasks,
+                              ticker: str = None, top_n: int = 5):
+    """
+    Génère un avis IA via Claude Sonnet + web search.
+    - ticker=NVDA       → avis ad hoc pour un ticker
+    - sans ticker       → avis auto pour le top N du ranking
+    """
+    today = date.today()
+    semaine = str(today - pd.Timedelta(days=today.weekday()))
+
+    if ticker:
+        # Mode ad hoc — un seul ticker
+        background_tasks.add_task(generate_opinion, engine, ticker.upper(),
+                                  semaine, source="manual")
+        return {
+            "status": "processing",
+            "message": f"Génération avis IA pour {ticker.upper()} lancée.",
+        }
+    else:
+        # Mode auto — top N du ranking
+        ranking_data = ranking_live(top_n=top_n)
+        if "error" in ranking_data:
+            return {"error": f"Impossible de lire le ranking : {ranking_data['error']}"}
+
+        tickers_data = [
+            {
+                "ticker":    r["ticker"],
+                "rang":      r["rank"],
+                "score":     r["score"],
+                "mom_r2":    r["mom_r2"],
+                "rvol":      r["rvol"],
+                "obv_slope": r["obv_slope"],
+                "prix":      r["prix"],
+                "sma_200":   r["sma_200"],
+                "atr_14":    r["atr_14"],
+                "k":         r["k"],
+                "zone":      r["zone"],
+                "secteur":   r["secteur"],
+            }
+            for r in ranking_data.get("ranking", [])[:top_n]
+        ]
+
+        background_tasks.add_task(generate_opinions_batch, engine,
+                                  tickers_data, semaine, "auto")
+        tickers_list = [t["ticker"] for t in tickers_data]
+        return {
+            "status": "processing",
+            "message": f"Génération avis IA pour {len(tickers_data)} tickers : {tickers_list}",
+        }
+
+
+@app.get("/ai-opinions")
+def get_ai_opinions(semaine: str = None, ticker: str = None):
+    """
+    Lecture des avis IA.
+    - ?semaine=2026-04-21           → avis de la semaine
+    - ?ticker=NVDA                  → dernier avis pour ce ticker
+    - ?semaine=2026-04-21&ticker=NVDA → avis spécifique
+    - sans paramètre                → dernière semaine disponible
+    """
+    return get_opinions(engine, semaine=semaine, ticker=ticker)
 
 # ============================================================
 # ENDPOINTS — POSITIONS (v4.1)
