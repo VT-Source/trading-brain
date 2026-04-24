@@ -467,7 +467,7 @@ def get_decisions(semaine: Optional[str] = None):
 # ENDPOINTS — AVIS IA
 # ============================================================
 
-@app.post("/generate-ai-opinion")
+@app.get("/generate-ai-opinion")
 async def trigger_ai_opinion(background_tasks: BackgroundTasks,
                               ticker: str = None, top_n: int = 5):
     """
