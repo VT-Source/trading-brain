@@ -71,17 +71,6 @@ def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
         conviction = _extract_conviction(analyse_full)
         resume = _extract_resume(analyse_full)
 
-      def _save_opinion(engine, ticker, semaine, rang, conviction,
-                  analyse, resume, source, model_used, tokens_used):
-    """Persiste l'avis en base (UPSERT sur semaine+ticker)."""
-    # Nettoyage caractères nuls (incompatibles PostgreSQL)
-    if analyse:
-        analyse = analyse.replace("\x00", "")
-    if resume:
-        resume = resume.replace("\x00", "")
-    with engine.begin() as conn:
-        ...
-    
         # --- Persister en base (UPSERT) ---
         _save_opinion(engine, ticker, semaine, rang, conviction,
                       analyse_full, resume, source, MODEL, tokens_used)
@@ -293,7 +282,6 @@ def _extract_resume(analyse: str) -> str:
     for marker in ["RÉSUMÉ :", "RÉSUMÉ:", "RESUME :", "RESUME:"]:
         if marker in analyse:
             after = analyse.split(marker, 1)[1]
-            # Prendre jusqu'au prochain titre (ligne commençant par ANALYSE ou **)
             lines = after.strip().split("\n")
             resume_lines = []
             for line in lines:
@@ -310,7 +298,7 @@ def _extract_resume(analyse: str) -> str:
 def _save_opinion(engine, ticker, semaine, rang, conviction,
                   analyse, resume, source, model_used, tokens_used):
     """Persiste l'avis en base (UPSERT sur semaine+ticker)."""
-# Nettoyage caractères nuls (incompatibles PostgreSQL)
+    # Nettoyage caractères nuls (incompatibles PostgreSQL)
     if analyse:
         analyse = analyse.replace("\x00", "")
     if resume:
