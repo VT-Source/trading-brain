@@ -146,14 +146,14 @@ def get_opinions(engine, semaine: str = None, ticker: str = None) -> dict:
         with engine.connect() as conn:
             if semaine and ticker:
                 rows = conn.execute(text("""
-                    SELECT ticker, semaine, rang, conviction, analyse, resume,
+                    SELECT ticker, semaine, rang, conviction, "analyse", resume,
                            source, model_used, tokens_used, generated_at
                     FROM avis_ia
                     WHERE semaine = :semaine AND ticker = :ticker
                 """), {"semaine": semaine, "ticker": ticker.upper()}).fetchall()
             elif semaine:
                 rows = conn.execute(text("""
-                    SELECT ticker, semaine, rang, conviction, analyse, resume,
+                    SELECT ticker, semaine, rang, conviction, "analyse", resume,
                            source, model_used, tokens_used, generated_at
                     FROM avis_ia
                     WHERE semaine = :semaine
@@ -161,7 +161,7 @@ def get_opinions(engine, semaine: str = None, ticker: str = None) -> dict:
                 """), {"semaine": semaine}).fetchall()
             elif ticker:
                 rows = conn.execute(text("""
-                    SELECT ticker, semaine, rang, conviction, analyse, resume,
+                    SELECT ticker, semaine, rang, conviction, "analyse", resume,
                            source, model_used, tokens_used, generated_at
                     FROM avis_ia
                     WHERE ticker = :ticker
@@ -170,7 +170,7 @@ def get_opinions(engine, semaine: str = None, ticker: str = None) -> dict:
                 """), {"ticker": ticker.upper()}).fetchall()
             else:
                 rows = conn.execute(text("""
-                    SELECT ticker, semaine, rang, conviction, analyse, resume,
+                    SELECT ticker, semaine, rang, conviction, "analyse", resume,
                            source, model_used, tokens_used, generated_at
                     FROM avis_ia
                     WHERE semaine = (SELECT MAX(semaine) FROM avis_ia)
@@ -306,7 +306,7 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO avis_ia
-                (ticker, semaine, rang, conviction, analyse, resume,
+                (ticker, semaine, rang, conviction, "analyse", resume,
                  source, model_used, tokens_used, generated_at)
             VALUES
                 (:ticker, :semaine, :rang, :conviction, :analyse, :resume,
@@ -315,7 +315,7 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
             DO UPDATE SET
                 rang         = EXCLUDED.rang,
                 conviction   = EXCLUDED.conviction,
-                analyse      = EXCLUDED.analyse,
+                "analyse"    = EXCLUDED."analyse",
                 resume       = EXCLUDED.resume,
                 source       = EXCLUDED.source,
                 model_used   = EXCLUDED.model_used,
