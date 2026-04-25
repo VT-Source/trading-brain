@@ -15,6 +15,32 @@ from sqlalchemy import text
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL = "claude-sonnet-4-6"
 
+_TABLE_CREATED = False
+
+def _ensure_avis_ia_table(engine):
+    """Crée la table avis_ia si elle n'existe pas (même engine = même schéma que l'API)."""
+    global _TABLE_CREATED
+    if _TABLE_CREATED:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS avis_ia (
+                id            SERIAL PRIMARY KEY,
+                ticker        VARCHAR(20)   NOT NULL,
+                semaine       VARCHAR(10)   NOT NULL,
+                rang          INTEGER,
+                conviction    VARCHAR(10)   NOT NULL DEFAULT 'MODÉRÉ',
+                "analyse"     TEXT,
+                resume        VARCHAR(500),
+                source        VARCHAR(10)   DEFAULT 'manual',
+                model_used    VARCHAR(50),
+                tokens_used   INTEGER,
+                generated_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (semaine, ticker)
+            )
+        """))
+    _TABLE_CREATED = True
+    print("✅ Table avis_ia vérifiée/créée via SQLAlchemy")
 
 def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
                      quant_data: dict = None, source: str = "manual") -> dict:
@@ -141,7 +167,9 @@ def get_opinions(engine, semaine: str = None, ticker: str = None) -> dict:
     """
     if engine is None:
         return {"error": "engine non connecté"}
-
+      
+    _ensure_avis_ia_table(engine)
+  
     try:
         with engine.connect() as conn:
             if semaine and ticker:
@@ -298,6 +326,7 @@ def _extract_resume(analyse: str) -> str:
 def _save_opinion(engine, ticker, semaine, rang, conviction,
                   analyse, resume, source, model_used, tokens_used):
     """Persiste l'avis en base (UPSERT sur semaine+ticker)."""
+    _ensure_avis_ia_table(engine)
     # Nettoyage caractères nuls (incompatibles PostgreSQL)
     if analyse:
         analyse = analyse.replace("\x00", "")
