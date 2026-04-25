@@ -1,15 +1,11 @@
 # ============================================================
-# dashboard.py — Trading Brain Dashboard v1.0
+# dashboard.py — Trading Brain Dashboard v4.0
 # VT-Source/trading-brain
 # ============================================================
 # Streamlit dashboard pour visualiser :
 #   - Ranking hebdomadaire live (signaux v4.1)
 #   - Régime macro & force sectorielle
 #   - Résultats backtest historiques
-#
-# Architecture préparée pour :
-#   - v2 : Décisions humaines (suivi/ignoré/modifié)
-#   - v3 : Avis IA complémentaire par ticker
 #
 # Lancement local  : streamlit run dashboard.py
 # Lancement Railway: voir Procfile / commande de déploiement
@@ -329,44 +325,128 @@ if page == "📊 Ranking Hebdo":
         else:
             st.warning("Aucun ticker éligible au ranking — vérifier filtres macro/sectoriels.")
 
-# --- v2: Human decisions inline ---
+# --- Section unifiée : Analyse par ticker ---
         st.divider()
-        st.markdown("### 🧑‍💼 Décisions humaines")
-        st.caption("Encode ta décision pour chaque ticker — sauvegardé par semaine")
-
+        st.markdown("### 🔍 Analyse par ticker")
+        st.caption("Avis IA + décision humaine pour chaque candidat")
+ 
         # Calcul de la semaine courante (lundi)
         today = date.today()
         semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
-
-        # Chargement des décisions existantes pour cette semaine
+ 
+        # Chargement des décisions existantes
         decisions_existantes = {}
         dec_data = api_get("/decisions", params={"semaine": semaine_courante})
         if dec_data and "decisions" in dec_data:
             for d in dec_data["decisions"]:
                 decisions_existantes[d["ticker"]] = d
-
+ 
+        # Chargement des avis IA existants
+        avis_existants = {}
+        avis_data = api_get("/ai-opinions", params={"semaine": semaine_courante})
+        if avis_data and "avis" in avis_data:
+            for a in avis_data["avis"]:
+                avis_existants[a["ticker"]] = a
+ 
+        # Résumé semaine en haut
+        nb_fort   = sum(1 for a in avis_existants.values() if a.get("conviction") == "FORT")
+        nb_modere = sum(1 for a in avis_existants.values() if a.get("conviction") == "MODÉRÉ")
+        nb_faible = sum(1 for a in avis_existants.values() if a.get("conviction") == "FAIBLE")
+        nb_avis   = len(avis_existants)
+ 
+        if nb_avis > 0:
+            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+            col_s1.metric("Avis IA générés", nb_avis)
+            col_s2.metric("🟢 Fort", nb_fort)
+            col_s3.metric("🟡 Modéré", nb_modere)
+            col_s4.metric("🔴 Faible", nb_faible)
+        else:
+            st.info("Aucun avis IA généré pour cette semaine. Utilise le bouton ci-dessous ou lance `/generate-ai-opinion` via l'API.")
+ 
+        # Bouton pour générer les avis du top 5
+        col_gen, col_space = st.columns([1, 3])
+        with col_gen:
+            if st.button("🤖 Générer avis IA (top 5)", use_container_width=True):
+                with st.spinner("Génération en cours... (~2 min pour 5 tickers)"):
+                    result = api_get("/generate-ai-opinion")
+                if result:
+                    st.success(result.get("message", "Avis IA lancé en arrière-plan"))
+                    st.caption("Rafraîchis la page dans ~2 min pour voir les résultats.")
+                else:
+                    st.error("Erreur lors du lancement")
+ 
+        st.divider()
+ 
+        # --- Expanders par ticker ---
         for ticker_row in ranking:
             ticker = ticker_row["ticker"]
             rang   = ticker_row["rank"]
             dec_ex = decisions_existantes.get(ticker, {})
-
-            with st.expander(f"#{rang} — {ticker}  {' ✅' if dec_ex.get('decision') == 'suivi' else ' ❌' if dec_ex.get('decision') == 'ignore' else ' 🔄' if dec_ex.get('decision') == 'modifie' else ''}"):
+            avis   = avis_existants.get(ticker, {})
+ 
+            # Construire le label de l'expander
+            conviction = avis.get("conviction", "")
+            conv_emoji = {"FORT": "🟢", "MODÉRÉ": "🟡", "FAIBLE": "🔴"}.get(conviction, "⚪")
+            dec_emoji  = {"suivi": "✅", "ignore": "❌", "modifie": "🔄"}.get(dec_ex.get("decision", ""), "")
+ 
+            label = f"#{rang} — {ticker}  {conv_emoji} {conviction}  {dec_emoji}"
+ 
+            with st.expander(label):
+ 
+                # --- Ligne 1 : Indicateurs clés ---
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Score", f"{ticker_row.get('score', 0):.4f}")
+                c2.metric("Mom R²", f"{ticker_row.get('mom_r2', 0):.4f}")
+                c3.metric("RVOL", f"{ticker_row.get('rvol', 0):.2f}")
+                c4.metric("Prix", f"${ticker_row.get('prix', 0):.2f}")
+                c5.metric("K adapt.", f"{ticker_row.get('k', 0):.2f}")
+ 
+                # --- Avis IA ---
+                if avis:
+                    st.markdown("---")
+                    st.markdown(f"**🤖 Avis IA** — Conviction : **{conv_emoji} {conviction}**")
+ 
+                    resume = avis.get("resume", "")
+                    if resume:
+                        st.info(resume)
+ 
+                    analyse = avis.get("analyse", "")
+                    if analyse:
+                        with st.expander("📄 Analyse complète", expanded=False):
+                            st.markdown(analyse)
+ 
+                    st.caption(f"Modèle : {avis.get('model_used', '?')} — {avis.get('tokens_used', '?')} tokens — {avis.get('generated_at', '?')[:16]}")
+                else:
+                    st.markdown("---")
+                    st.caption("Pas d'avis IA pour cette semaine.")
+                    if st.button(f"🤖 Analyser {ticker}", key=f"ai_{ticker}"):
+                        with st.spinner(f"Analyse IA de {ticker} en cours..."):
+                            result = api_get("/generate-ai-opinion", params={"ticker": ticker})
+                        if result:
+                            st.success(f"Analyse de {ticker} lancée en arrière-plan. Rafraîchis dans ~30s.")
+                        else:
+                            st.error("Erreur lors du lancement")
+ 
+                # --- Décision humaine ---
+                st.markdown("---")
+                st.markdown("**🧑‍💼 Décision**")
+ 
                 col_dec, col_com, col_btn = st.columns([2, 4, 1])
-
+ 
                 options    = ["—", "suivi", "ignore", "modifie"]
-                labels     = ["— (non décidé)", "✅ Suivi", "❌ Ignoré", "🔄 Modifié"]
+                labels_dec = ["— (non décidé)", "✅ Suivi", "❌ Ignoré", "🔄 Modifié"]
                 current    = dec_ex.get("decision", "—")
                 current_idx = options.index(current) if current in options else 0
-
+ 
                 with col_dec:
                     choix = st.selectbox(
                         "Décision",
-                        options=labels,
+                        options=labels_dec,
                         index=current_idx,
                         key=f"dec_{ticker}",
                         label_visibility="collapsed",
                     )
-
+ 
                 with col_com:
                     commentaire = st.text_input(
                         "Commentaire",
@@ -375,10 +455,10 @@ if page == "📊 Ranking Hebdo":
                         key=f"com_{ticker}",
                         label_visibility="collapsed",
                     )
-
+ 
                 with col_btn:
                     if st.button("💾", key=f"save_{ticker}", help="Sauvegarder"):
-                        decision_val = options[labels.index(choix)]
+                        decision_val = options[labels_dec.index(choix)]
                         if decision_val == "—":
                             st.warning("Sélectionne une décision avant de sauvegarder.")
                         else:
@@ -399,23 +479,11 @@ if page == "📊 Ranking Hebdo":
                                     st.error(f"Erreur API : {r.text}")
                             except Exception as e:
                                 st.error(f"Erreur : {e}")
-
-        # --- v3 placeholder: AI advisor ---
-        st.divider()
-        st.markdown("### 🤖 Avis IA")
-        st.markdown("""
-        <div class="placeholder-box">
-            <strong>v3 à venir</strong><br>
-            Un bot IA donnera un avis complémentaire sur chaque ticker du ranking<br>
-            (analyse fondamentale, news récentes, risques spécifiques)
-        </div>
-        """, unsafe_allow_html=True)
-
+ 
     elif data and "error" in data:
         st.error(f"Erreur API: {data['error']}")
     else:
         st.info("Impossible de charger le ranking. Vérifier que l'API est accessible.")
-
 
 # ============================================================
 # PAGE 2 — MACRO & SECTEURS
