@@ -219,7 +219,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest", "🎯 Performance IA", "📋 Décisions", "⚙️ Système"],
+        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Perf IA", "📋 Décisions", "⚙️ Système"],
         label_visibility="collapsed",
     )
 
@@ -824,7 +824,7 @@ elif page == "💼 Portefeuille":
 # PAGE 4 — BACKTEST
 # ============================================================
 
-elif page == "📈 Backtest":
+elif page == "📈 Backtest & Perf IA":
 
     st.markdown("# 📈 Résultats Backtest v4.1")
     st.caption("Derniers résultats validés — mai 2022 → fév 2026 — 400 tickers")
@@ -896,125 +896,98 @@ elif page == "📈 Backtest":
         else:
             st.error("Erreur lors du lancement du backtest.")
 
-# ============================================================
-# PAGE 5 — PERFORMANCE IA
-# ============================================================
+    # ── Performance IA ──────────────────────────────────────────
 
-elif page == "🎯 Performance IA":
+    st.divider()
+    st.markdown("## 🎯 Performance des Avis IA")
+    st.caption("Suivi de la qualité prédictive — rendements réels à +1s / +2s / +4s")
 
-    st.markdown("# 🎯 Performance des Avis IA")
-    st.caption("Suivi de la qualité prédictive des avis IA — rendements réels à +1s / +2s / +4s")
-
-    # --- Chargement des données ---
     with st.spinner("Chargement des avis IA..."):
-        data = api_get("/ai-opinions?all=true")
+        perf_data = api_get("/ai-opinions", params={"all": "true"})
 
-    if not data or "error" in data:
+    if not perf_data or "error" in perf_data:
         st.warning("Impossible de charger les avis IA.")
     else:
-        avis_list = data.get("avis", [])
+        avis_list = perf_data.get("avis", [])
 
         if not avis_list:
-            st.info("Aucun avis IA enregistré pour le moment. Les données se rempliront progressivement chaque semaine.")
+            st.info("Aucun avis IA enregistré. Les données se rempliront progressivement chaque semaine.")
         else:
-            df = pd.DataFrame(avis_list)
+            df_ia = pd.DataFrame(avis_list)
+            df_rend = df_ia.dropna(subset=["rendement_1s", "rendement_2s", "rendement_4s"], how="all")
 
-            # Filtrer les avis avec au moins un rendement disponible
-            df_with_rend = df.dropna(subset=["rendement_1s", "rendement_2s", "rendement_4s"], how="all")
+            nb_total = len(df_ia)
+            nb_avec = len(df_rend)
 
-            # --- Métriques globales ---
-            st.markdown("### 📊 Vue d'ensemble")
-
-            nb_total = len(df)
-            nb_avec_rend = len(df_with_rend)
-            nb_en_attente = nb_total - nb_avec_rend
-            nb_semaines = df["semaine"].nunique()
-
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             c1.metric("Avis générés", nb_total)
-            c2.metric("Avec rendement", nb_avec_rend)
-            c3.metric("En attente", nb_en_attente)
-            c4.metric("Semaines couvertes", nb_semaines)
+            c2.metric("Avec rendement", nb_avec)
+            c3.metric("Semaines couvertes", df_ia["semaine"].nunique())
 
-            if nb_avec_rend == 0:
-                st.info("Aucun rendement encore disponible — les données se complètent automatiquement chaque lundi à 07h30.")
+            if nb_avec == 0:
+                st.info("Aucun rendement encore disponible — mise à jour automatique chaque lundi 07h30.")
             else:
-                st.divider()
-
-                # --- Performance par conviction ---
-                st.markdown("### 🏷️ Rendement moyen par conviction")
+                # --- Par conviction ---
+                st.markdown("#### Rendement moyen par conviction")
 
                 convictions = ["FORT", "MODÉRÉ", "FAIBLE"]
-                horizons = [("rendement_1s", "+1 sem"), ("rendement_2s", "+2 sem"), ("rendement_4s", "+4 sem")]
+                horizons = [("rendement_1s", "+1s"), ("rendement_2s", "+2s"), ("rendement_4s", "+4s")]
 
-                perf_data = []
+                rows_conv = []
                 for conv in convictions:
-                    df_conv = df_with_rend[df_with_rend["conviction"] == conv]
-                    row = {"Conviction": conv, "Nb avis": len(df_conv)}
-                    for col, label in horizons:
-                        vals = df_conv[col].dropna()
+                    dc = df_rend[df_rend["conviction"] == conv]
+                    row = {"Conviction": conv, "Nb": len(dc)}
+                    for col, lbl in horizons:
+                        vals = dc[col].dropna()
                         if len(vals) > 0:
-                            row[f"Rend moy {label}"] = f"{vals.mean():.2%}"
-                            row[f"Hit rate {label}"] = f"{(vals > 0).mean():.0%}"
+                            row[f"Rend {lbl}"] = f"{vals.mean():.2%}"
+                            row[f"Hit {lbl}"] = f"{(vals > 0).mean():.0%}"
                         else:
-                            row[f"Rend moy {label}"] = "—"
-                            row[f"Hit rate {label}"] = "—"
-                    perf_data.append(row)
+                            row[f"Rend {lbl}"] = "—"
+                            row[f"Hit {lbl}"] = "—"
+                    rows_conv.append(row)
 
-                df_perf = pd.DataFrame(perf_data)
-                st.dataframe(df_perf, use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_conv), use_container_width=True, hide_index=True)
 
-                st.divider()
+                # --- Global ---
+                st.markdown("#### Rendement global")
 
-                # --- Rendement global toutes convictions ---
-                st.markdown("### 📈 Rendement global (toutes convictions)")
-
-                global_data = []
-                for col, label in horizons:
-                    vals = df_with_rend[col].dropna()
+                rows_global = []
+                for col, lbl in horizons:
+                    vals = df_rend[col].dropna()
                     if len(vals) > 0:
-                        global_data.append({
-                            "Horizon": label,
-                            "Nb avis": len(vals),
-                            "Rendement moyen": f"{vals.mean():.2%}",
-                            "Rendement médian": f"{vals.median():.2%}",
-                            "Hit rate (% positif)": f"{(vals > 0).mean():.0%}",
-                            "Meilleur": f"{vals.max():.2%}",
-                            "Pire": f"{vals.min():.2%}",
+                        rows_global.append({
+                            "Horizon": lbl,
+                            "Nb": len(vals),
+                            "Moy": f"{vals.mean():.2%}",
+                            "Médiane": f"{vals.median():.2%}",
+                            "Hit rate": f"{(vals > 0).mean():.0%}",
+                            "Best": f"{vals.max():.2%}",
+                            "Worst": f"{vals.min():.2%}",
                         })
 
-                if global_data:
-                    st.dataframe(pd.DataFrame(global_data), use_container_width=True, hide_index=True)
+                if rows_global:
+                    st.dataframe(pd.DataFrame(rows_global), use_container_width=True, hide_index=True)
 
-                st.divider()
+                # --- Détail ---
+                with st.expander("📋 Détail par avis"):
+                    df_det = df_rend[["semaine", "ticker", "rang", "conviction", "score_composite",
+                                      "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
+                    df_det = df_det.sort_values(["semaine", "rang"], ascending=[False, True])
 
-                # --- Détail par avis ---
-                st.markdown("### 📋 Détail des avis avec rendements")
+                    for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
+                        df_det[col] = df_det[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
+                    if "score_composite" in df_det.columns:
+                        df_det["score_composite"] = df_det["score_composite"].apply(
+                            lambda x: f"{x:.3f}" if pd.notna(x) else "—"
+                        )
 
-                df_detail = df_with_rend[["semaine", "ticker", "rang", "conviction", "score_composite",
-                                          "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
-                df_detail = df_detail.sort_values(["semaine", "rang"], ascending=[False, True])
+                    df_det.columns = ["Semaine", "Ticker", "Rang", "Conviction", "Score",
+                                      "Rend +1s", "Rend +2s", "Rend +4s"]
+                    st.dataframe(df_det, use_container_width=True, hide_index=True)
 
-                # Formater les rendements en %
-                for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
-                    df_detail[col] = df_detail[col].apply(
-                        lambda x: f"{x:.2%}" if pd.notna(x) else "—"
-                    )
-                if "score_composite" in df_detail.columns:
-                    df_detail["score_composite"] = df_detail["score_composite"].apply(
-                        lambda x: f"{x:.3f}" if pd.notna(x) else "—"
-                    )
-
-                df_detail.columns = ["Semaine", "Ticker", "Rang", "Conviction", "Score",
-                                     "Rend +1s", "Rend +2s", "Rend +4s"]
-
-                st.dataframe(df_detail, use_container_width=True, hide_index=True)
-
-                # --- Bouton mise à jour manuelle ---
-                st.divider()
-                st.markdown("### 🔄 Mise à jour des rendements")
-                st.caption("Les rendements sont calculés automatiquement chaque lundi à 07h30. Tu peux aussi lancer une mise à jour manuelle.")
-                if st.button("🔄 Mettre à jour les rendements maintenant", use_container_width=True):
+                # --- Bouton MAJ manuelle ---
+                if st.button("🔄 Mettre à jour les rendements", use_container_width=True):
                     r = api_get("/update-suivi-rendements")
                     if r:
                         st.success(r.get("message", "Mise à jour lancée"))
@@ -1022,7 +995,7 @@ elif page == "🎯 Performance IA":
                         st.error("Erreur lors de la mise à jour")
 
 # ============================================================
-# PAGE 6 — DÉCISIONS HUMAINES
+# PAGE 5 — DÉCISIONS HUMAINES
 # ============================================================
 
 elif page == "📋 Décisions":
@@ -1081,7 +1054,7 @@ elif page == "📋 Décisions":
         st.info("Aucune décision enregistrée pour l'instant.")
 
 # ============================================================
-# PAGE 7 — SYSTÈME
+# PAGE 6 — SYSTÈME
 # ============================================================
 
 elif page == "⚙️ Système":
