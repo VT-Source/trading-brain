@@ -527,15 +527,16 @@ async def trigger_ai_opinion(background_tasks: BackgroundTasks,
 
 
 @app.get("/ai-opinions")
-def get_ai_opinions(semaine: str = None, ticker: str = None):
+def get_ai_opinions(semaine: str = None, ticker: str = None, all: bool = False):
     """
     Lecture des avis IA.
+    - ?all=true                     → tous les avis (toutes semaines)
     - ?semaine=2026-04-21           → avis de la semaine
     - ?ticker=NVDA                  → dernier avis pour ce ticker
     - ?semaine=2026-04-21&ticker=NVDA → avis spécifique
     - sans paramètre                → dernière semaine disponible
     """
-    return get_opinions(engine, semaine=semaine, ticker=ticker)
+    return get_opinions(engine, semaine=semaine, ticker=ticker, all=all)
 
 @app.get("/update-suivi-rendements")
 async def trigger_suivi_rendements(background_tasks: BackgroundTasks):

@@ -228,13 +228,14 @@ def generate_opinions_batch(engine, tickers_data: list, semaine: str,
 # LECTURE AVIS
 # ============================================================
 
-def get_opinions(engine, semaine: str = None, ticker: str = None) -> dict:
+def get_opinions(engine, semaine: str = None, ticker: str = None, all: bool = False) -> dict:
     """
     Lit les avis IA depuis la base.
-    - semaine seule → tous les avis de la semaine
-    - ticker seul → dernier avis pour ce ticker
-    - les deux → avis spécifique
-    - aucun → dernière semaine disponible
+    - all=True               → tous les avis (toutes semaines)
+    - semaine seule           → tous les avis de la semaine
+    - ticker seul             → dernier avis pour ce ticker
+    - les deux                → avis spécifique
+    - aucun                   → dernière semaine disponible
     """
     if engine is None:
         return {"error": "engine non connecté"}
@@ -252,7 +253,12 @@ def get_opinions(engine, semaine: str = None, ticker: str = None) -> dict:
 
     try:
         with engine.connect() as conn:
-            if semaine and ticker:
+            if all:
+                rows = conn.execute(text(f"""
+                    SELECT {cols} FROM avis_ia
+                    ORDER BY semaine DESC, rang ASC NULLS LAST
+                """)).fetchall()
+            elif semaine and ticker:
                 rows = conn.execute(text(f"""
                     SELECT {cols} FROM avis_ia
                     WHERE semaine = :semaine AND ticker = :ticker
