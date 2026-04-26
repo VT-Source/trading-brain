@@ -23,7 +23,7 @@ from sync import (
     fill_high_low_logic,
     sync_secteurs_etf_logic,
 )
-from ai_opinion import generate_opinion, generate_opinions_batch, get_opinions
+from ai_opinion import generate_opinion, generate_opinions_batch, get_opinions, update_suivi_rendements, _migrate_avis_ia_columns
 from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -116,6 +116,10 @@ scheduler = BackgroundScheduler(timezone="Europe/Brussels")
 
 @app.on_event("startup")
 def start_scheduler():
+    # Migration colonnes v1.2 (safe — ignore si déjà faites)
+    if engine:
+        _migrate_avis_ia_columns(engine)
+
     scheduler.add_job(lambda: sync_prix_logic(engine, full=False),
                       CronTrigger(day_of_week="mon-fri", hour=5, minute=30),
                       id="sync_prix", replace_existing=True, misfire_grace_time=600)
@@ -134,6 +138,9 @@ def start_scheduler():
     scheduler.add_job(lambda: _auto_generate_opinions(),
                       CronTrigger(day_of_week="mon", hour=7, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
+    scheduler.add_job(lambda: update_suivi_rendements(engine),
+                      CronTrigger(day_of_week="mon", hour=7, minute=30),
+                      id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
     scheduler.start()
     print("⏰ Scheduler intégré démarré (BackgroundScheduler)")
 
@@ -145,7 +152,7 @@ def start_scheduler():
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "6.5.0",
+        "version"         : "6.6.0",
         "engine_connected": engine is not None
     }
 
@@ -529,6 +536,19 @@ def get_ai_opinions(semaine: str = None, ticker: str = None):
     - sans paramètre                → dernière semaine disponible
     """
     return get_opinions(engine, semaine=semaine, ticker=ticker)
+
+@app.get("/update-suivi-rendements")
+async def trigger_suivi_rendements(background_tasks: BackgroundTasks):
+    """
+    Met à jour les rendements à +1s/+2s/+4s pour les avis IA passés.
+    Automatique chaque lundi 07h30 via scheduler.
+    Peut aussi être déclenché manuellement.
+    """
+    background_tasks.add_task(update_suivi_rendements, engine)
+    return {
+        "status": "processing",
+        "message": "Mise à jour des rendements de suivi IA lancée en arrière-plan.",
+    }
 
 # ============================================================
 # ENDPOINTS — POSITIONS (v4.1)
