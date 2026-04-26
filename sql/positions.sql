@@ -1,15 +1,14 @@
 -- ============================================================
--- positions.sql — Journal de suivi du portefeuille v3.1
+-- positions.sql — Journal de suivi du portefeuille v4.1
 -- Trading Brain | VT-Source
 -- ============================================================
 -- Principe : Saisie 100% manuelle par VT-Source après
 --            exécution sur broker externe (Degiro, IBKR...)
 --            Le système ne place aucun ordre automatiquement.
 -- ============================================================
-
--- ============================================================
--- positions.sql — Journal de suivi du portefeuille v3.1
--- Trading Brain | VT-Source
+-- ⚠️  Ce fichier reflète la structure RÉELLE en production
+--     (vérifiée le 2026-04-26 via information_schema + pg_constraint).
+--     Ne pas modifier la base sans mettre à jour ce fichier.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -21,11 +20,11 @@ CREATE TABLE IF NOT EXISTS positions (
     -- Entrée (saisie manuelle après achat sur broker)
     date_achat       DATE         NOT NULL,
     prix_achat       NUMERIC      NOT NULL,
-    montant_investi  NUMERIC      NOT NULL,
+    quantite         NUMERIC      NOT NULL,
 
-    -- Quantité calculée automatiquement
-    quantite         NUMERIC GENERATED ALWAYS AS
-                     (ROUND(montant_investi / NULLIF(prix_achat, 0), 4))
+    -- Montant calculé automatiquement
+    montant_investi  NUMERIC GENERATED ALWAYS AS
+                     (ROUND(quantite * prix_achat, 2))
                      STORED,
 
     -- Statut
@@ -37,18 +36,18 @@ CREATE TABLE IF NOT EXISTS positions (
     prix_vente       NUMERIC,
     raison_vente     VARCHAR(30)
                      CHECK (raison_vente IN (
-                         'OBJECTIF',
-                         'STOP_LOSS',
-                         'RSI',
-                         'TEMPOREL',
+                         'TRAILING_STOP',
+                         'TREND_BROKEN',
+                         'MOMENTUM_LOST',
+                         'SECTOR_WEAK',
+                         'MACRO_BEARISH',
                          'MANUEL'
                      )),
 
     -- Résultats calculés automatiquement à la fermeture
     resultat_eur     NUMERIC GENERATED ALWAYS AS (
                          ROUND(
-                             (prix_vente - prix_achat)
-                             * (montant_investi / NULLIF(prix_achat, 0)),
+                             (prix_vente - prix_achat) * quantite,
                          2)
                      ) STORED,
     resultat_pct     NUMERIC GENERATED ALWAYS AS (
@@ -57,6 +56,12 @@ CREATE TABLE IF NOT EXISTS positions (
                              / NULLIF(prix_achat, 0))::numeric,
                          2)
                      ) STORED,
+
+    -- Traçabilité
+    decision_id      INTEGER,
+    source           VARCHAR(20)  NOT NULL DEFAULT 'ranking'
+                     CHECK (source IN ('ranking', 'manuel')),
+    commentaire      TEXT,
 
     -- Métadonnées
     created_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
@@ -90,14 +95,7 @@ SELECT
         / NULLIF(p.prix_achat, 0))::numeric,
     2)                                                    AS pl_pct,
     (CURRENT_DATE - p.date_achat)                         AS j_detention,
-    aph.rsi_14,
-    CASE
-        WHEN aph.prix_ajuste >= p.prix_achat * 1.05  THEN 'OBJECTIF ✅'
-        WHEN aph.prix_ajuste <= p.prix_achat * 0.93  THEN 'STOP LOSS 🛑'
-        WHEN aph.rsi_14 > 65                          THEN 'RSI ÉLEVÉ ⚠️'
-        WHEN (CURRENT_DATE - p.date_achat) >= 15      THEN 'TEMPOREL ⏱️'
-        ELSE 'Conserver 🟡'
-    END                                                   AS alerte_vente
+    aph.rsi_14
 FROM positions p
 LEFT JOIN actions_prix_historique aph
     ON aph.ticker = p.ticker
@@ -107,19 +105,20 @@ LEFT JOIN actions_prix_historique aph
         WHERE ticker = p.ticker
     )
 WHERE p.statut = 'OUVERT';
+
 -- ============================================================
--- Commentaire : Exemples d'utilisation
+-- Exemples d'utilisation
 -- ============================================================
--- Ajouter une position après achat sur broker :
---   INSERT INTO positions (ticker, date_achat, prix_achat, montant_investi)
---   VALUES ('NVDA', '2026-03-03', 124.50, 1000.00);
+-- Ouvrir une position après achat sur broker :
+--   INSERT INTO positions (ticker, date_achat, prix_achat, quantite, source)
+--   VALUES ('NVDA', '2026-03-03', 124.50, 8, 'ranking');
 --
 -- Fermer une position après vente sur broker :
 --   UPDATE positions
 --   SET statut='FERMÉ', date_vente='2026-03-11',
---       prix_vente=130.75, raison_vente='OBJECTIF'
+--       prix_vente=130.75, raison_vente='TRAILING_STOP'
 --   WHERE ticker='NVDA' AND statut='OUVERT';
 --
--- Voir toutes les positions ouvertes avec alertes :
+-- Voir toutes les positions ouvertes :
 --   SELECT * FROM v_positions_ouvertes ORDER BY j_detention DESC;
 -- ============================================================
