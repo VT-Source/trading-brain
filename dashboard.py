@@ -219,7 +219,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Analyse", "📋 Décisions", "⚙️ Système"],
+        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Perf IA", "📋 Décisions", "⚙️ Système"],
         label_visibility="collapsed",
     )
 
