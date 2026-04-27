@@ -182,35 +182,74 @@ def _auto_generate_opinions():
 
 scheduler = BackgroundScheduler(timezone="Europe/Brussels")
 
+# --- Suivi santé des jobs scheduler ---
+job_status = {}
+
+def _run_job(job_id: str, func, *args, **kwargs):
+    """Wrapper qui enregistre le résultat de chaque job scheduler."""
+    import time as _time
+    start = _time.time()
+    job_status[job_id] = {
+        "status": "running",
+        "started_at": pd.Timestamp.now(tz="Europe/Brussels").isoformat(),
+    }
+    try:
+        result = func(*args, **kwargs)
+        elapsed = round(_time.time() - start, 1)
+        job_status[job_id] = {
+            "status": "ok",
+            "last_success": pd.Timestamp.now(tz="Europe/Brussels").isoformat(),
+            "duration_s": elapsed,
+            "result": _summarize_result(result),
+        }
+    except Exception as e:
+        elapsed = round(_time.time() - start, 1)
+        job_status[job_id] = {
+            "status": "error",
+            "last_error": pd.Timestamp.now(tz="Europe/Brussels").isoformat(),
+            "duration_s": elapsed,
+            "error": str(e),
+        }
+        print(f"❌ Job '{job_id}' échoué après {elapsed}s : {e}")
+
+def _summarize_result(result):
+    """Extrait un résumé compact du résultat d'un job (pour ne pas stocker des payloads énormes)."""
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        # Garder uniquement status/error/count keys
+        return {k: v for k, v in result.items()
+                if k in ("status", "error", "updated", "total_checked", "nb_ranked",
+                         "nb_opinions", "data_date", "message")}
+    return str(result)[:200]
+
 @app.on_event("startup")
 def start_scheduler():
     # Migration colonnes v1.2 (safe — ignore si déjà faites)
     if engine:
         _migrate_avis_ia_columns(engine)
 
-    scheduler.add_job(lambda: sync_prix_logic(engine, full=False),
+    scheduler.add_job(lambda: _run_job("sync_prix", sync_prix_logic, engine, full=False),
                       CronTrigger(day_of_week="mon-fri", hour=20, minute=30),
                       id="sync_prix", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: run_analysis_logic(full=False),
+    scheduler.add_job(lambda: _run_job("analyse", run_analysis_logic, full=False),
                       CronTrigger(day_of_week="mon-fri", hour=21, minute=0),
                       id="analyse", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: sync_secteurs_etf_logic(engine, full=False),
+    scheduler.add_job(lambda: _run_job("sync_etf", sync_secteurs_etf_logic, engine, full=False),
                       CronTrigger(day_of_week="mon-fri", hour=21, minute=15),
                       id="sync_etf", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: sync_metadata_logic(engine),
+    scheduler.add_job(lambda: _run_job("sync_metadata", sync_metadata_logic, engine),
                       CronTrigger(day_of_week="mon-fri", hour=21, minute=30),
                       id="sync_metadata", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: compute_and_store_ranking(top_n=20),
+    scheduler.add_job(lambda: _run_job("compute_ranking", compute_and_store_ranking, top_n=20),
                       CronTrigger(day_of_week="sat", hour=5, minute=45),
                       id="compute_ranking", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: _auto_generate_opinions(),
+    scheduler.add_job(lambda: _run_job("ai_opinions", _auto_generate_opinions),
                       CronTrigger(day_of_week="sat", hour=6, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: update_suivi_rendements(engine),
+    scheduler.add_job(lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
                       CronTrigger(day_of_week="sat", hour=6, minute=30),
                       id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
-    scheduler.start()
-    print("⏰ Scheduler intégré démarré (BackgroundScheduler)")
 
 # ============================================================
 # ENDPOINTS API
@@ -222,6 +261,31 @@ def home():
         "status"          : "Service Trading IA Actif",
         "version"         : "6.6.0",
         "engine_connected": engine is not None
+    }
+
+@app.get("/health-jobs")
+def health_jobs():
+    """
+    État de santé des jobs scheduler.
+    Retourne le dernier statut de chaque job (ok/error/running),
+    timestamp, durée, et résumé du résultat.
+    """
+    # Déterminer l'alerte globale
+    errors = [jid for jid, info in job_status.items() if info.get("status") == "error"]
+    running = [jid for jid, info in job_status.items() if info.get("status") == "running"]
+
+    if errors:
+        global_status = "DEGRADED"
+    elif not job_status:
+        global_status = "NO_DATA"
+    else:
+        global_status = "HEALTHY"
+
+    return {
+        "global_status": global_status,
+        "errors": errors,
+        "running": running,
+        "jobs": job_status,
     }
 
 @app.get("/check-model")
