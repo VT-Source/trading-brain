@@ -978,7 +978,7 @@ def evaluate_open_positions():
             # Trailing stop = high watermark - k × ATR
             trailing_stop = max_price - k * current_atr if current_atr > 0 else 0
             stop_distance_pct = round(100.0 * (current_price - trailing_stop) / current_price, 2) if current_price > 0 else 0
-
+            
             # --- Évaluation des 5 conditions ---
             conditions = {}
 
