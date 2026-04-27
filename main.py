@@ -94,6 +94,74 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
 INCREMENTAL_LOOKBACK_DAYS = 220
 INCREMENTAL_SAVE_DAYS     = 5
 
+# ============================================================
+# CALCUL INDICATEURS À LA VOLÉE — pour avis IA ad hoc
+# ============================================================
+
+def _compute_quant_for_ticker(ticker: str) -> tuple:
+    """
+    Calcule les indicateurs momentum à la volée pour un seul ticker.
+    Utilise les fonctions de backtest_ranking.py (~2-3s).
+    Retourne (quant_data: dict | None, rang: int | None).
+    Le rang vient du ranking_hebdo s'il y est, sinon None.
+    """
+    if load_all_price_data is None or compute_all_indicators is None:
+        return None, None
+
+    try:
+        ticker_data = load_all_price_data([ticker])
+        if not ticker_data or ticker not in ticker_data:
+            return None, None
+
+        ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
+        df = ticker_data[ticker]
+        if df.empty:
+            return None, None
+
+        row = df.iloc[-1]
+        prix = row.get("prix_ajuste")
+        if pd.isna(prix):
+            return None, None
+
+        sma_200   = row.get("sma_200")
+        atr_14    = row.get("atr_14", 0)
+        mom_r2    = row.get("mom_r2")
+        rvol      = row.get("rvol")
+        obv_slope = row.get("obv_slope")
+
+        secteur_mapping = load_secteur_mapping()
+        zone = get_ticker_zone(ticker, secteur_mapping)
+        secteur = secteur_mapping.get(ticker, {}).get("secteur", "—")
+        k = compute_adaptive_k(float(atr_14), float(prix)) if pd.notna(atr_14) and float(atr_14) > 0 else 3.0
+
+        # Chercher le rang dans le ranking hebdo (s'il y est)
+        rang = None
+        ranking_data = ranking_live(top_n=400)
+        if "ranking" in ranking_data:
+            for r in ranking_data["ranking"]:
+                if r["ticker"] == ticker:
+                    rang = r["rank"]
+                    break
+
+        quant_data = {
+            "ticker":    ticker,
+            "score":     None,
+            "mom_r2":    round(float(mom_r2), 4) if pd.notna(mom_r2) else None,
+            "rvol":      round(float(rvol), 2) if pd.notna(rvol) else None,
+            "obv_slope": round(float(obv_slope), 2) if pd.notna(obv_slope) else None,
+            "prix":      round(float(prix), 2),
+            "sma_200":   round(float(sma_200), 2) if pd.notna(sma_200) else None,
+            "atr_14":    round(float(atr_14), 2) if pd.notna(atr_14) else None,
+            "k":         round(k, 2),
+            "zone":      zone,
+            "secteur":   secteur,
+        }
+        return quant_data, rang
+
+    except Exception as e:
+        print(f"⚠️ _compute_quant_for_ticker({ticker}) : {e}")
+        return None, None
+
 def _auto_generate_opinions():
     """Génère les avis IA pour le top 5 après le ranking du lundi."""
     ranking_data = ranking_live(top_n=5)
@@ -485,13 +553,19 @@ async def trigger_ai_opinion(background_tasks: BackgroundTasks,
     today = date.today()
     semaine = str(today - pd.Timedelta(days=today.weekday()))
 
-    if ticker:
-        # Mode ad hoc — un seul ticker
-        background_tasks.add_task(generate_opinion, engine, ticker.upper(),
-                                  semaine, source="manual")
+if ticker:
+        # Mode ad hoc — calcul indicateurs live (~2-3s) puis avis IA
+        ticker_upper = ticker.upper()
+        quant_data, rang = _compute_quant_for_ticker(ticker_upper)
+
+        background_tasks.add_task(generate_opinion, engine, ticker_upper,
+                                  semaine, rang=rang, quant_data=quant_data,
+                                  source="manual")
         return {
             "status": "processing",
-            "message": f"Génération avis IA pour {ticker.upper()} lancée.",
+            "message": f"Génération avis IA pour {ticker_upper} lancée"
+                       f"{f' (rang #{rang})' if rang else ' (hors ranking)'}"
+                       f" — indicateurs live.",
         }
     else:
         # Mode auto — top N du ranking
