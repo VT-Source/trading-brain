@@ -962,21 +962,33 @@ def evaluate_open_positions():
             pnl_eur = round((current_price - pos["prix_achat"]) * pos["quantite"], 2)
             jours   = (latest_date.date() - pos["date_achat"]).days
 
-            # --- Trailing stop : calculer depuis date_achat ---
+            # --- Trailing stop : simulation itérative depuis date_achat ---
+            # Aligné sur backtest_ranking.py check_absolute_exit() :
+            #   - k fixé à l'entrée (pas recalculé chaque jour)
+            #   - stop ne descend jamais (max avec le stop précédent)
             date_achat_ts = pd.Timestamp(pos["date_achat"])
             df_since_entry = df_t[df_t.index >= date_achat_ts]
 
-            # K adaptatif basé sur l'ATR actuel
-            k = compute_adaptive_k(current_atr, current_price) if current_atr > 0 else 3.0
-
-            # High watermark = max(prix_achat, max close depuis entrée)
+            # K adaptatif fixé à l'entrée (comme le backtest)
             if not df_since_entry.empty:
-                max_price = max(pos["prix_achat"], float(df_since_entry["prix_ajuste"].max()))
+                entry_atr = float(df_since_entry.iloc[0]["atr_14"]) if not pd.isna(df_since_entry.iloc[0]["atr_14"]) else current_atr
+                k = compute_adaptive_k(entry_atr, pos["prix_achat"]) if entry_atr > 0 else 3.0
             else:
-                max_price = pos["prix_achat"]
+                entry_atr = current_atr
+                k = 3.0
 
-            # Trailing stop = high watermark - k × ATR
-            trailing_stop = max_price - k * current_atr if current_atr > 0 else 0
+            # Simulation itérative du stop (ne descend jamais)
+            max_price = pos["prix_achat"]
+            trailing_stop = pos["prix_achat"] - k * entry_atr if entry_atr > 0 else 0
+
+            for idx in df_since_entry.index:
+                p = float(df_since_entry.loc[idx, "prix_ajuste"])
+                a = float(df_since_entry.loc[idx, "atr_14"]) if not pd.isna(df_since_entry.loc[idx, "atr_14"]) else entry_atr
+                if p > max_price:
+                    max_price = p
+                new_stop = max_price - k * a
+                trailing_stop = max(trailing_stop, new_stop)
+
             stop_distance_pct = round(100.0 * (current_price - trailing_stop) / current_price, 2) if current_price > 0 else 0
             
             # --- Évaluation des 5 conditions ---
