@@ -1134,6 +1134,52 @@ elif page == "⚙️ Système":
 
     st.divider()
 
+# --- Scheduler health ---
+    st.markdown("### ⏰ Santé Scheduler")
+    with st.spinner("Vérification jobs..."):
+        jobs_health = api_get("/health-jobs")
+
+    if jobs_health:
+        global_st = jobs_health.get("global_status", "NO_DATA")
+        if global_st == "HEALTHY":
+            st.success("Tous les jobs OK")
+        elif global_st == "DEGRADED":
+            st.error(f"⚠️ Jobs en erreur : {', '.join(jobs_health.get('errors', []))}")
+        else:
+            st.warning("Aucun job exécuté depuis le dernier redémarrage")
+
+        jobs = jobs_health.get("jobs", {})
+        if jobs:
+            job_labels = {
+                "sync_prix":        "💰 Sync Prix",
+                "analyse":          "🧮 Analyse AT",
+                "sync_etf":         "📊 Sync ETF",
+                "sync_metadata":    "🔄 Metadata",
+                "compute_ranking":  "🏆 Ranking",
+                "ai_opinions":      "🤖 Avis IA",
+                "suivi_rendements": "📈 Rendements",
+            }
+            rows_jobs = []
+            for job_id, info in jobs.items():
+                status = info.get("status", "?")
+                feu = {"ok": "🟢", "error": "🔴", "running": "🔵"}.get(status, "⚪")
+                ts = info.get("last_success") or info.get("last_error") or info.get("started_at") or "—"
+                # Garder juste HH:MM:SS de l'ISO string
+                if ts != "—" and "T" in ts:
+                    ts = ts.split("T")[1][:8]
+                rows_jobs.append({
+                    "Job":     job_labels.get(job_id, job_id),
+                    "Statut":  f"{feu} {status.upper()}",
+                    "Durée":   f"{info.get('duration_s', '—')}s" if info.get('duration_s') else "—",
+                    "Heure":   ts,
+                    "Détail":  info.get("error") or str(info.get("result", ""))[:80] or "—",
+                })
+            st.dataframe(pd.DataFrame(rows_jobs), use_container_width=True, hide_index=True)
+    else:
+        st.warning("Impossible de charger l'état des jobs.")
+
+    st.divider()
+
     # --- Model status ---
     st.markdown("### 🤖 Modèle ML")
     with st.spinner("Vérification modèle..."):
