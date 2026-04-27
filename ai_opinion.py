@@ -223,6 +223,169 @@ def generate_opinions_batch(engine, tickers_data: list, semaine: str,
 
     return results
 
+def generate_position_opinion(engine, position_data: dict, 
+                               eval_data: dict, source: str = "manual") -> dict:
+    """
+    Génère un avis IA 'garder ou vendre' pour une position ouverte.
+    
+    Paramètres
+    ----------
+    position_data : dict — données position (ticker, prix_achat, quantite, date_achat, etc.)
+    eval_data : dict — évaluation v4.1 (conditions, feux, P&L, prix_actuel, etc.)
+    source : str — 'manual' (bouton dashboard) ou 'auto' (futur batch)
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"error": "ANTHROPIC_API_KEY non configurée"}
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    _ensure_avis_ia_table(engine)
+    _migrate_avis_ia_columns(engine)
+
+    ticker = position_data["ticker"]
+    
+    # --- Construire le contexte position ---
+    pos_context = _build_position_context(position_data, eval_data)
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": _build_position_prompt(ticker, pos_context),
+                }
+            ],
+        )
+
+        analyse_full = ""
+        for block in response.content:
+            if block.type == "text":
+                analyse_full += block.text
+
+        tokens_used = response.usage.input_tokens + response.usage.output_tokens
+        conviction = _extract_conviction(analyse_full)
+        resume = _extract_resume(analyse_full)
+
+        # --- Persister avec source='position' ---
+        today = date.today()
+        semaine = str(today - timedelta(days=today.weekday()))
+
+        _save_opinion(engine, ticker, semaine, rang=None,
+                      conviction=conviction, analyse=analyse_full,
+                      resume=resume, source=f"position_{source}",
+                      model_used=MODEL, tokens_used=tokens_used,
+                      quant_data={
+                          "prix": eval_data.get("prix_actuel"),
+                          "sma_200": eval_data.get("conditions", {}).get("sma", {}).get("sma_200"),
+                          "atr_14": eval_data.get("conditions", {}).get("trailing_stop", {}).get("atr_14"),
+                      })
+
+        return {
+            "status": "ok",
+            "ticker": ticker,
+            "conviction": conviction,
+            "resume": resume,
+            "analyse": analyse_full,
+            "tokens_used": tokens_used,
+            "model": MODEL,
+        }
+    except anthropic.APIError as e:
+        print(f"❌ Erreur API Anthropic pour position {ticker} : {e}")
+        return {"error": f"Erreur API Anthropic : {e}"}
+    except Exception as e:
+        print(f"❌ Erreur generate_position_opinion({ticker}) : {e}")
+        return {"error": str(e)}
+
+
+def _build_position_context(position_data: dict, eval_data: dict) -> str:
+    """Formate le contexte d'une position ouverte pour le prompt IA."""
+    lines = []
+    
+    ticker = position_data.get("ticker", "?")
+    lines.append(f"Ticker : {ticker}")
+    lines.append(f"Date d'achat : {position_data.get('date_achat', '?')}")
+    lines.append(f"Prix d'achat : {position_data.get('prix_achat', '?')}€")
+    lines.append(f"Quantité : {position_data.get('quantite', '?')}")
+    lines.append(f"Montant investi : {position_data.get('montant_investi', '?')}€")
+    lines.append(f"Jours de détention : {eval_data.get('jours_detention', '?')}")
+    lines.append("")
+    
+    # P&L
+    pnl_pct = eval_data.get("pnl_pct", 0)
+    pnl_eur = eval_data.get("pnl_eur", 0)
+    pnl_sign = "+" if pnl_pct >= 0 else ""
+    lines.append(f"Prix actuel : {eval_data.get('prix_actuel', '?')}€")
+    lines.append(f"P&L : {pnl_sign}{pnl_pct}% ({pnl_sign}{pnl_eur:.2f}€)")
+    lines.append("")
+    
+    # Conditions de sortie v4.1
+    lines.append("CONDITIONS DE SORTIE v4.1 :")
+    conditions = eval_data.get("conditions", {})
+    
+    cond_labels = {
+        "trailing_stop": "Trailing Stop ATR",
+        "sma": "Prix vs SMA 200",
+        "momentum": "Momentum R²",
+        "secteur": "Secteur Force Relative",
+        "macro": "Macro (indice zone)",
+    }
+    
+    for key, label in cond_labels.items():
+        cond = conditions.get(key, {})
+        feu = cond.get("feu", "⚪")
+        detail = cond.get("detail", "")
+        lines.append(f"  {feu} {label} : {detail}")
+    
+    # Alerte globale
+    alerte = eval_data.get("alerte_globale", "INCONNU")
+    lines.append("")
+    lines.append(f"ALERTE GLOBALE : {alerte}")
+    
+    violated = eval_data.get("violated", [])
+    warnings = eval_data.get("warnings", [])
+    if violated:
+        lines.append(f"Conditions VIOLÉES : {', '.join(violated)}")
+    if warnings:
+        lines.append(f"Conditions en VIGILANCE : {', '.join(warnings)}")
+    
+    return "\n".join(lines)
+
+
+def _build_position_prompt(ticker: str, pos_context: str) -> str:
+    """Prompt spécifique pour l'analyse garder/vendre d'une position ouverte."""
+    return f"""Tu es un analyste quantitatif senior. Tu dois produire un avis 
+"GARDER ou VENDRE" pour une position ouverte, dans le cadre d'une stratégie momentum.
+
+DONNÉES DE LA POSITION :
+{pos_context}
+
+CONTEXTE STRATÉGIE :
+- Stratégie momentum v4.1 hybrid : entrée ranking cross-ticker, sortie sur conditions absolues
+- 5 conditions de sortie : trailing stop ATR, prix < SMA200, momentum R² < 0, 
+  secteur hors force, macro bearish. N'importe laquelle suffit pour vendre.
+- Durée moyenne de détention cible : ~30 jours
+- L'objectif n'est PAS de timer le top — c'est de rester tant que la tendance est intacte
+
+INSTRUCTIONS :
+1. Utilise le web search pour chercher les actualités récentes sur {ticker}
+   (earnings, guidance, catalyseurs, risques, news sectorielles).
+2. Croise les données quantitatives (feux v4.1) avec le contexte fondamental.
+3. Donne un avis structuré en français.
+
+FORMAT DE RÉPONSE (respecter exactement) :
+CONVICTION : [GARDER / VENDRE / RENFORCER]
+RÉSUMÉ : [1-2 phrases max — la conclusion actionnable]
+
+ANALYSE :
+- Situation technique : [état des 5 conditions v4.1, tendance prix]
+- Catalyseurs / Risques : [actualités récentes trouvées via web search]
+- Contexte position : [P&L, durée, cohérence avec la stratégie]
+- Recommandation : [garder / vendre / renforcer, avec justification et éventuellement un seuil de sortie]
+"""
 
 # ============================================================
 # LECTURE AVIS
