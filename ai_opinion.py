@@ -20,7 +20,7 @@ from sqlalchemy import text
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL = "claude-sonnet-4-6"
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.1"
 
 _TABLE_CREATED = False
 
@@ -436,7 +436,7 @@ def update_suivi_rendements(engine) -> dict:
 # ============================================================
 
 def _build_quant_context(ticker: str, rang: int, quant_data: dict) -> str:
-    """Formate les données quantitatives pour le prompt."""
+    """Formate les données quantitatives pour le prompt, avec résumé en langage naturel."""
     if not quant_data:
         return f"Ticker : {ticker}\nAucune donnée quantitative disponible."
 
@@ -461,6 +461,48 @@ def _build_quant_context(ticker: str, rang: int, quant_data: dict) -> str:
         val = quant_data.get(key)
         if val is not None:
             lines.append(f"{label} : {val}")
+
+    # --- Résumé en langage naturel (feux) ---
+    lines.append("")
+    lines.append("DIAGNOSTIC RAPIDE :")
+
+    prix = quant_data.get("prix")
+    sma = quant_data.get("sma_200")
+    mom = quant_data.get("mom_r2")
+    rvol = quant_data.get("rvol")
+    obv = quant_data.get("obv_slope")
+
+    if prix and sma:
+        pct_above = (prix - sma) / sma * 100
+        if prix > sma:
+            lines.append(f"  Tendance : 🟢 Prix {pct_above:+.1f}% au-dessus de la SMA200")
+        else:
+            lines.append(f"  Tendance : 🔴 Prix {pct_above:+.1f}% en dessous de la SMA200")
+
+    if mom is not None:
+        if mom > 0.3:
+            lines.append(f"  Momentum : 🟢 Fort (R²={mom:.4f})")
+        elif mom > 0:
+            lines.append(f"  Momentum : 🟡 Positif mais modéré (R²={mom:.4f})")
+        else:
+            lines.append(f"  Momentum : 🔴 Négatif (R²={mom:.4f})")
+
+    if rvol is not None:
+        if rvol > 2.0:
+            lines.append(f"  Volume : 🟢 Élevé (RVOL={rvol:.2f}x)")
+        elif rvol > 1.0:
+            lines.append(f"  Volume : 🟡 Normal (RVOL={rvol:.2f}x)")
+        else:
+            lines.append(f"  Volume : 🔴 Faible (RVOL={rvol:.2f}x)")
+
+    if obv is not None:
+        if obv > 0:
+            lines.append(f"  Accumulation : 🟢 OBV en hausse (slope={obv:,.0f})")
+        else:
+            lines.append(f"  Accumulation : 🔴 OBV en baisse (slope={obv:,.0f})")
+
+    if not any(v is not None for v in [mom, rvol, obv]):
+        lines.append("  ⚠️ Indicateurs momentum non disponibles (ticker hors univers ranking)")
 
     return "\n".join(lines)
 
