@@ -243,7 +243,7 @@ with st.sidebar:
 if page == "📊 Ranking Hebdo":
 
     st.markdown("# 📊 Ranking Hebdomadaire")
-    st.caption("Top candidats du momentum ranking v4.1 — calculé chaque lundi sur ~400 tickers")
+    st.caption("Top candidats du momentum ranking v4.1 — calculé chaque Samedi sur ~400 tickers")
 
     # --- Fetch ranking ---
     with st.spinner("Calcul du ranking en cours... (~30s sur 400 tickers)"):
@@ -330,7 +330,7 @@ if page == "📊 Ranking Hebdo":
         st.markdown("### 🔍 Analyse par ticker")
         st.caption("Avis IA + décision humaine pour chaque candidat")
  
-        # Calcul de la semaine courante (lundi)
+        # Calcul de la semaine courante (Samedi)
         today = date.today()
         semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
  
@@ -925,7 +925,7 @@ elif page == "📈 Backtest & Perf IA":
             c3.metric("Semaines couvertes", df_ia["semaine"].nunique())
 
             if nb_avec == 0:
-                st.info("Aucun rendement encore disponible — mise à jour automatique chaque lundi 07h30.")
+                st.info("Aucun rendement encore disponible — mise à jour automatique chaque Samedi 07h30.")
             else:
                 # --- Par conviction ---
                 st.markdown("#### Rendement moyen par conviction")
@@ -1116,7 +1116,7 @@ elif page == "⚙️ Système":
     st.markdown("### 📐 Architecture v4.1")
     st.code("""
 ENTRÉE (hebdomadaire, relative)
-  Chaque lundi → scorer ~400 tickers
+  Chaque Samedi → scorer ~400 tickers
   Score = 50% Mom R² + 25% RVOL + 25% OBV
   Filtres : prix > SMA200, secteur en force, mom_r2 > 0, macro bull
   → Top candidat remplit les slots libres (max 5)
