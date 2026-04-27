@@ -553,7 +553,7 @@ async def trigger_ai_opinion(background_tasks: BackgroundTasks,
     today = date.today()
     semaine = str(today - pd.Timedelta(days=today.weekday()))
 
-if ticker:
+    if ticker:
         # Mode ad hoc — calcul indicateurs live (~2-3s) puis avis IA
         ticker_upper = ticker.upper()
         quant_data, rang = _compute_quant_for_ticker(ticker_upper)
