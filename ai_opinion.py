@@ -526,7 +526,7 @@ def update_suivi_rendements(engine) -> dict:
         for row in rows:
             avis_id = row[0]
             ticker = row[1]
-            semaine_str = row[2]
+            semaine_str = str(row[2])
             prix_emission = row[3]
 
             try:
