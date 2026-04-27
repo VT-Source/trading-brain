@@ -542,6 +542,103 @@ def get_decisions(semaine: Optional[str] = None):
 # ENDPOINTS — AVIS IA
 # ============================================================
 
+@app.get("/generate-position-opinion")
+async def trigger_position_opinion(background_tasks: BackgroundTasks,
+                                    position_id: int = None):
+    """
+    Génère un avis IA 'garder ou vendre' pour une position ouverte.
+    - position_id=3  → avis pour la position #3
+    - sans id        → avis pour TOUTES les positions ouvertes
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+    
+    # Importer la fonction
+    from ai_opinion import generate_position_opinion
+
+    if position_id:
+        # --- Mode single ---
+        # Récupérer les données de la position + évaluation
+        eval_result = evaluate_open_positions()
+        if "error" in eval_result:
+            return eval_result
+        
+        target_pos = None
+        for pos in eval_result.get("positions", []):
+            if pos.get("id") == position_id:
+                target_pos = pos
+                break
+        
+        if not target_pos:
+            return {"error": f"Position {position_id} non trouvée ou non ouverte"}
+        
+        # Construire position_data depuis la DB
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT ticker, date_achat, prix_achat, quantite, 
+                       montant_investi, source, commentaire
+                FROM positions WHERE id = :pid AND statut = 'OUVERT'
+            """), {"pid": position_id}).fetchone()
+        
+        if not row:
+            return {"error": f"Position {position_id} introuvable"}
+        
+        position_data = {
+            "ticker": row[0],
+            "date_achat": str(row[1]),
+            "prix_achat": float(row[2]),
+            "quantite": float(row[3]),
+            "montant_investi": float(row[4]) if row[4] else None,
+            "source": row[5],
+            "commentaire": row[6],
+        }
+        
+        background_tasks.add_task(
+            generate_position_opinion, engine, position_data, target_pos, "manual"
+        )
+        return {
+            "status": "processing",
+            "message": f"Analyse IA 'garder/vendre' pour {row[0]} (position #{position_id}) lancée",
+        }
+    
+    else:
+        # --- Mode batch — toutes les positions ouvertes ---
+        eval_result = evaluate_open_positions()
+        if "error" in eval_result:
+            return eval_result
+        
+        positions = eval_result.get("positions", [])
+        if not positions:
+            return {"status": "ok", "message": "Aucune position ouverte"}
+        
+        for pos in positions:
+            with engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT ticker, date_achat, prix_achat, quantite, 
+                           montant_investi, source, commentaire
+                    FROM positions WHERE id = :pid
+                """), {"pid": pos["id"]}).fetchone()
+            
+            if row:
+                position_data = {
+                    "ticker": row[0],
+                    "date_achat": str(row[1]),
+                    "prix_achat": float(row[2]),
+                    "quantite": float(row[3]),
+                    "montant_investi": float(row[4]) if row[4] else None,
+                    "source": row[5],
+                    "commentaire": row[6],
+                }
+                background_tasks.add_task(
+                    generate_position_opinion, engine, position_data, pos, "manual"
+                )
+        
+        tickers = [p["ticker"] for p in positions]
+        return {
+            "status": "processing",
+            "message": f"Analyse IA lancée pour {len(positions)} positions : {tickers}",
+        }
+
 @app.get("/generate-ai-opinion")
 async def trigger_ai_opinion(background_tasks: BackgroundTasks,
                               ticker: str = None, top_n: int = 5):
