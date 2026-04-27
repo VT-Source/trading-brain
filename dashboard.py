@@ -596,6 +596,20 @@ elif page == "💼 Portefeuille":
                 st.caption(f"Données au {eval_data.get('date_evaluation', '?')}")
                 st.divider()
 
+                # --- Bouton analyse IA toutes positions ---
+                col_ai_all, col_space = st.columns([1, 3])
+                with col_ai_all:
+                    if st.button("🤖 Analyser toutes les positions", use_container_width=True):
+                        with st.spinner("Lancement analyse IA..."):
+                            ai_all = api_get("/generate-position-opinion")
+                        if ai_all and ai_all.get("status") == "processing":
+                            st.success(ai_all.get("message", "Analyse lancée"))
+                            st.caption("Rafraîchis dans ~1-2 min pour voir les résultats.")
+                        elif ai_all:
+                            st.error(ai_all.get("error", "Erreur"))
+                
+                st.divider()
+                
                 # --- Détail par position ---
                 for pos in eval_data["positions"]:
                     alerte = pos.get("alerte_globale", "INCONNU")
@@ -672,6 +686,54 @@ elif page == "💼 Portefeuille":
                         elif warnings:
                             st.warning(f"Conditions en vigilance : {', '.join(warnings)}")
 
+                        # --- Bouton avis IA position ---
+                        btn_col, result_col = st.columns([1, 3])
+                        with btn_col:
+                            if st.button("🤖 Analyser", key=f"ai_{pos['id']}",
+                                         use_container_width=True):
+                                st.session_state[f"ai_loading_{pos['id']}"] = True
+
+                        if st.session_state.get(f"ai_loading_{pos['id']}", False):
+                            with st.spinner(f"Analyse IA de {pos['ticker']} en cours (~30s)..."):
+                                ai_result = api_get(
+                                    f"/generate-position-opinion?position_id={pos['id']}"
+                                )
+                            st.session_state[f"ai_loading_{pos['id']}"] = False
+                            if ai_result and ai_result.get("status") == "processing":
+                                st.info(f"🤖 {ai_result.get('message', 'Analyse lancée')}")
+                                st.caption("Rafraîchis dans ~30s pour voir le résultat.")
+                            elif ai_result and "error" in ai_result:
+                                st.error(ai_result["error"])
+
+                        # Afficher le dernier avis IA position si existant
+                        pos_opinion = api_get(
+                            f"/ai-opinions?ticker={pos['ticker']}"
+                        )
+                        if pos_opinion and isinstance(pos_opinion, dict):
+                            opinions = pos_opinion.get("opinions", [])
+                            # Chercher un avis source=position_*
+                            pos_avis = None
+                            for op in opinions:
+                                if op.get("source", "").startswith("position_"):
+                                    pos_avis = op
+                                    break
+                            if pos_avis:
+                                conv = pos_avis.get("conviction", "?")
+                                conv_emoji = {
+                                    "GARDER": "🟢", "RENFORCER": "🟢",
+                                    "VENDRE": "🔴",
+                                }.get(conv, "🟡")
+                                st.markdown(f"**🤖 Dernier avis : {conv_emoji} {conv}**")
+                                resume = pos_avis.get("resume", "")
+                                if resume:
+                                    st.info(resume)
+                                with st.expander("📄 Analyse complète"):
+                                    st.markdown(pos_avis.get("analyse", ""))
+                                st.caption(
+                                    f"{pos_avis.get('tokens_used', '?')} tokens — "
+                                    f"{pos_avis.get('generated_at', '?')[:16]}"
+                                )
+                        
                         # --- Bouton fermer ---
                         with st.expander("🔒 Fermer cette position"):
                             with st.form(key=f"close_{pos['id']}"):
