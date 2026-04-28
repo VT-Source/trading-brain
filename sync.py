@@ -166,7 +166,7 @@ def sync_metadata_logic(engine):
                     metadata = {
                         "ticker"    : ticker_symbol,
                         "name"      : data.get("longName"),
-                        "secteur"   : data.get("sector"),
+                        "secteur"   : (data.get("sector") or "").title() or None,
                         "industrie" : data.get("industry"),
                         "pays"      : data.get("country"),
                         "monnaie"   : data.get("currency"),
