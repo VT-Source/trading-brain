@@ -37,10 +37,10 @@ def _ensure_avis_ia_table(engine):
                 ticker          VARCHAR(20)   NOT NULL,
                 semaine         VARCHAR(10)   NOT NULL,
                 rang            INTEGER,
-                conviction      VARCHAR(10)   NOT NULL DEFAULT 'MODÉRÉ',
+                conviction      VARCHAR(20)   NOT NULL DEFAULT 'MODÉRÉ',
                 "analyse"       TEXT,
                 resume          VARCHAR(500),
-                source          VARCHAR(10)   DEFAULT 'manual',
+                source          VARCHAR(20)   DEFAULT 'manual',
                 model_used      VARCHAR(50),
                 tokens_used     INTEGER,
                 generated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
@@ -92,6 +92,13 @@ def _migrate_avis_ia_columns(engine):
         ("rendement_4s",    "DOUBLE PRECISION"),
     ]
     with engine.begin() as conn:
+        # Élargir colonnes trop étroites (migration depuis v1.0/v1.1)
+        for col, new_type in [("source", "VARCHAR(20)"), ("conviction", "VARCHAR(20)")]:
+            try:
+                conn.execute(text(f"ALTER TABLE avis_ia ALTER COLUMN {col} TYPE {new_type}"))
+            except Exception:
+                pass
+
         for col_name, col_type in new_columns:
             try:
                 conn.execute(text(
