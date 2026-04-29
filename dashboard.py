@@ -710,7 +710,7 @@ elif page == "💼 Portefeuille":
                             f"/ai-opinions?ticker={pos['ticker']}"
                         )
                         if pos_opinion and isinstance(pos_opinion, dict):
-                            opinions = pos_opinion.get("opinions", [])
+                            opinions = pos_opinion.get("opinions", []) or pos_opinion.get("avis", [])
                             # Chercher un avis source=position_*
                             pos_avis = None
                             for op in opinions:
