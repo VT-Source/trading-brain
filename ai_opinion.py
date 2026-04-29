@@ -241,20 +241,23 @@ def generate_position_opinion(engine, position_data: dict,
     eval_data : dict — évaluation v4.1 (conditions, feux, P&L, prix_actuel, etc.)
     source : str — 'manual' (bouton dashboard) ou 'auto' (futur batch)
     """
+    import traceback
+    ticker = position_data.get("ticker", "?")
+    print(f"🤖 [position] Début analyse IA pour {ticker}...")
+
     if not ANTHROPIC_API_KEY:
+        print(f"❌ [position] ANTHROPIC_API_KEY non configurée")
         return {"error": "ANTHROPIC_API_KEY non configurée"}
     if engine is None:
+        print(f"❌ [position] engine non connecté")
         return {"error": "engine non connecté"}
 
-    _ensure_avis_ia_table(engine)
-    _migrate_avis_ia_columns(engine)
-
-    ticker = position_data["ticker"]
-    
-    # --- Construire le contexte position ---
-    pos_context = _build_position_context(position_data, eval_data)
-
     try:
+        _ensure_avis_ia_table(engine)
+
+        # --- Construire le contexte position ---
+        pos_context = _build_position_context(position_data, eval_data)
+        print(f"   [position] Contexte construit, appel Claude en cours...")
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model=MODEL,
@@ -276,6 +279,7 @@ def generate_position_opinion(engine, position_data: dict,
         tokens_used = response.usage.input_tokens + response.usage.output_tokens
         conviction = _extract_conviction(analyse_full)
         resume = _extract_resume(analyse_full)
+        print(f"   [position] Réponse Claude reçue — {tokens_used} tokens, conviction={conviction}")
 
         # --- Persister avec source='position' ---
         today = date.today()
@@ -290,6 +294,7 @@ def generate_position_opinion(engine, position_data: dict,
                           "sma_200": eval_data.get("conditions", {}).get("sma", {}).get("sma_200"),
                           "atr_14": eval_data.get("conditions", {}).get("trailing_stop", {}).get("atr_14"),
                       })
+        print(f"   ✅ [position] Avis {ticker} sauvegardé en base (semaine={semaine})")
 
         return {
             "status": "ok",
@@ -302,9 +307,11 @@ def generate_position_opinion(engine, position_data: dict,
         }
     except anthropic.APIError as e:
         print(f"❌ Erreur API Anthropic pour position {ticker} : {e}")
+        traceback.print_exc()
         return {"error": f"Erreur API Anthropic : {e}"}
     except Exception as e:
         print(f"❌ Erreur generate_position_opinion({ticker}) : {e}")
+        traceback.print_exc()
         return {"error": str(e)}
 
 
@@ -711,14 +718,26 @@ IMPORTANT :
 
 
 def _extract_conviction(analyse: str) -> str:
-    """Extrait le niveau de conviction depuis la réponse."""
+    """Extrait le niveau de conviction depuis la réponse.
+    Supporte les deux formats :
+      - Ranking : FORT / MODÉRÉ / FAIBLE
+      - Position : GARDER / VENDRE / RENFORCER
+    """
     analyse_upper = analyse.upper()
+    # --- Format position (garder/vendre/renforcer) ---
+    if "CONVICTION : GARDER" in analyse_upper or "CONVICTION: GARDER" in analyse_upper:
+        return "GARDER"
+    if "CONVICTION : VENDRE" in analyse_upper or "CONVICTION: VENDRE" in analyse_upper:
+        return "VENDRE"
+    if "CONVICTION : RENFORCER" in analyse_upper or "CONVICTION: RENFORCER" in analyse_upper:
+        return "RENFORCER"
+    # --- Format ranking (fort/modéré/faible) ---
     if "CONVICTION : FORT" in analyse_upper or "CONVICTION: FORT" in analyse_upper:
         return "FORT"
-    elif "CONVICTION : FAIBLE" in analyse_upper or "CONVICTION: FAIBLE" in analyse_upper:
+    if "CONVICTION : FAIBLE" in analyse_upper or "CONVICTION: FAIBLE" in analyse_upper:
         return "FAIBLE"
-    else:
-        return "MODÉRÉ"
+    # Fallback
+    return "MODÉRÉ"
 
 
 def _extract_resume(analyse: str) -> str:
