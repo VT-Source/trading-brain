@@ -251,6 +251,9 @@ def start_scheduler():
                       CronTrigger(day_of_week="sat", hour=6, minute=30),
                       id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
 
+    scheduler.start()
+    print("⏰ Scheduler démarré — 7 jobs planifiés (Europe/Brussels)")
+
 # ============================================================
 # ENDPOINTS API
 # ============================================================
