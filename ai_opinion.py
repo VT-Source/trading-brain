@@ -1,6 +1,6 @@
 # ============================================================
 # ai_opinion.py — Avis IA par ticker (Claude Sonnet + web search)
-# Trading Brain | VT-Source | v1.2
+# Trading Brain | VT-Source | v1.3
 # ============================================================
 # Reçoit `engine` en paramètre (injection de dépendance).
 # Appelé par main.py (endpoints + scheduler).
@@ -10,6 +10,13 @@
 #   - Colonnes rendement +1s/+2s/+4s (remplies par job scheduler)
 #   - Traçabilité prompt_version
 #   - Fonction update_suivi_rendements() pour compléter les rendements
+#
+# v1.3 — Séparation ranking vs position :
+#   - Nouvelle colonne type_avis ('ranking' | 'position')
+#   - update_suivi_rendements ne traite que les avis 'ranking'
+#     (les avis position se mesurent via la P&L réelle des positions)
+#   - generate_opinion : type_avis='ranking' par défaut
+#   - generate_position_opinion : force type_avis='position'
 # ============================================================
 
 import os
@@ -56,6 +63,8 @@ def _ensure_avis_ia_table(engine):
                 secteur_force   BOOLEAN,
                 macro_bullish   BOOLEAN,
                 prompt_version  VARCHAR(20),
+                -- v1.3 : type d'avis (ranking = avis d'achat hebdo / position = garder-vendre)
+                type_avis       VARCHAR(20),
                 -- v1.2 : suivi rendements (remplis par job scheduler)
                 prix_1s         DOUBLE PRECISION,
                 prix_2s         DOUBLE PRECISION,
@@ -71,7 +80,7 @@ def _ensure_avis_ia_table(engine):
 
 
 def _migrate_avis_ia_columns(engine):
-    """Ajoute les colonnes v1.2 si elles n'existent pas (migration safe)."""
+    """Ajoute les colonnes v1.2/v1.3 si elles n'existent pas (migration safe)."""
     new_columns = [
         ("score_composite", "DOUBLE PRECISION"),
         ("mom_r2",          "DOUBLE PRECISION"),
@@ -84,6 +93,7 @@ def _migrate_avis_ia_columns(engine):
         ("secteur_force",   "BOOLEAN"),
         ("macro_bullish",   "BOOLEAN"),
         ("prompt_version",  "VARCHAR(20)"),
+        ("type_avis",       "VARCHAR(20)"),
         ("prix_1s",         "DOUBLE PRECISION"),
         ("prix_2s",         "DOUBLE PRECISION"),
         ("prix_4s",         "DOUBLE PRECISION"),
@@ -108,7 +118,23 @@ def _migrate_avis_ia_columns(engine):
             except Exception:
                 # Colonne existe déjà — OK
                 pass
-    print("✅ Migration colonnes avis_ia v1.2 terminée")
+
+        # v1.3 : backfill type_avis pour les anciens avis
+        try:
+            conn.execute(text("""
+                UPDATE avis_ia
+                SET type_avis = 'position'
+                WHERE source LIKE 'position_%' AND type_avis IS NULL
+            """))
+            conn.execute(text("""
+                UPDATE avis_ia
+                SET type_avis = 'ranking'
+                WHERE (source IS NULL OR source NOT LIKE 'position_%') AND type_avis IS NULL
+            """))
+        except Exception as e:
+            print(f"  ⚠️ Backfill type_avis : {e}")
+
+    print("✅ Migration colonnes avis_ia v1.3 terminée")
 
 
 # ============================================================
@@ -116,7 +142,8 @@ def _migrate_avis_ia_columns(engine):
 # ============================================================
 
 def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
-                     quant_data: dict = None, source: str = "manual") -> dict:
+                     quant_data: dict = None, source: str = "manual",
+                     type_avis: str = "ranking") -> dict:
     """
     Génère un avis IA pour un ticker donné via Claude Sonnet + web search.
 
@@ -128,6 +155,7 @@ def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
     rang : int — rang dans le ranking (None si appel ad hoc)
     quant_data : dict — données quantitatives (score, mom_r2, rvol, obv_slope, etc.)
     source : str — 'auto' (scheduler) ou 'manual' (dashboard)
+    type_avis : str — 'ranking' (avis d'achat) ou 'position' (garder/vendre)
 
     Retourne
     --------
@@ -173,7 +201,7 @@ def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
         # --- Persister en base (UPSERT) avec snapshot ---
         _save_opinion(engine, ticker, semaine, rang, conviction,
                       analyse_full, resume, source, MODEL, tokens_used,
-                      quant_data)
+                      quant_data, type_avis=type_avis)
 
         return {
             "status":      "ok",
@@ -220,6 +248,7 @@ def generate_opinions_batch(engine, tickers_data: list, semaine: str,
             rang=td.get("rang"),
             quant_data=td,
             source=source,
+            type_avis="ranking",
         )
         results.append(result)
 
@@ -281,7 +310,7 @@ def generate_position_opinion(engine, position_data: dict,
         resume = _extract_resume(analyse_full)
         print(f"   [position] Réponse Claude reçue — {tokens_used} tokens, conviction={conviction}")
 
-        # --- Persister avec source='position' ---
+        # --- Persister avec source='position' et type_avis='position' ---
         today = date.today()
         semaine = str(today - timedelta(days=today.weekday()))
 
@@ -293,7 +322,8 @@ def generate_position_opinion(engine, position_data: dict,
                           "prix": eval_data.get("prix_actuel"),
                           "sma_200": eval_data.get("conditions", {}).get("sma", {}).get("sma_200"),
                           "atr_14": eval_data.get("conditions", {}).get("trailing_stop", {}).get("atr_14"),
-                      })
+                      },
+                      type_avis="position")
         print(f"   ✅ [position] Avis {ticker} sauvegardé en base (semaine={semaine})")
 
         return {
@@ -419,14 +449,15 @@ def get_opinions(engine, semaine: str = None, ticker: str = None, all: bool = Fa
 
     _ensure_avis_ia_table(engine)
 
-    # Colonnes à lire (v1.2 enrichi)
+    # Colonnes à lire (v1.3 enrichi)
     cols = """ticker, semaine, rang, conviction, "analyse", resume,
               source, model_used, tokens_used, generated_at,
               score_composite, mom_r2, rvol, obv_slope,
               prix_emission, sma_200, atr_14, k_adaptatif,
               secteur_force, macro_bullish, prompt_version,
               prix_1s, prix_2s, prix_4s,
-              rendement_1s, rendement_2s, rendement_4s"""
+              rendement_1s, rendement_2s, rendement_4s,
+              type_avis"""
 
     try:
         with engine.connect() as conn:
@@ -492,6 +523,8 @@ def get_opinions(engine, semaine: str = None, ticker: str = None, all: bool = Fa
                 "rendement_1s":    r[24],
                 "rendement_2s":    r[25],
                 "rendement_4s":    r[26],
+                # v1.3 : type d'avis
+                "type_avis":       r[27],
             })
 
         return {"nb_avis": len(avis), "avis": avis}
@@ -510,11 +543,14 @@ def update_suivi_rendements(engine) -> dict:
 
     Logique :
     - Cherche les avis qui ont un prix_emission mais des rendements manquants
+    - Filtre uniquement type_avis='ranking' (les avis 'position' se mesurent
+      via la P&L réelle des positions, pas via un rendement théorique)
     - Pour chaque horizon (1s, 2s, 4s), vérifie si la date cible est atteinte
-    - Récupère le prix de clôture à la date cible depuis actions_prix_historique
+    - Récupère le prix de clôture le plus proche (≤ target_date) depuis
+      actions_prix_historique (gère week-ends et jours fériés)
     - Calcule et stocke le rendement
 
-    Appelé par le scheduler chaque lundi après le sync prix.
+    Appelé par le scheduler chaque jour ouvré à 23h45 (ou samedi selon config).
     """
     if engine is None:
         return {"error": "engine non connecté"}
@@ -526,16 +562,19 @@ def update_suivi_rendements(engine) -> dict:
 
     try:
         with engine.connect() as conn:
-            # Récupérer tous les avis avec prix_emission mais au moins un rendement manquant
+            # v1.3 : ne traiter que les avis 'ranking'
+            # (les avis 'position' = NULL hérité historique sont aussi inclus
+            #  pour ne rien casser sur les avis pré-migration)
             rows = conn.execute(text("""
                 SELECT id, ticker, semaine, prix_emission
                 FROM avis_ia
                 WHERE prix_emission IS NOT NULL
+                  AND (type_avis = 'ranking' OR type_avis IS NULL)
                   AND (rendement_1s IS NULL OR rendement_2s IS NULL OR rendement_4s IS NULL)
                 ORDER BY semaine ASC
             """)).fetchall()
 
-        print(f"📊 Suivi rendements : {len(rows)} avis à vérifier")
+        print(f"📊 Suivi rendements : {len(rows)} avis ranking à vérifier")
 
         for row in rows:
             avis_id = row[0]
@@ -760,7 +799,7 @@ def _extract_resume(analyse: str) -> str:
 
 def _save_opinion(engine, ticker, semaine, rang, conviction,
                   analyse, resume, source, model_used, tokens_used,
-                  quant_data=None):
+                  quant_data=None, type_avis="ranking"):
     """Persiste l'avis en base (UPSERT sur semaine+ticker) avec snapshot indicateurs."""
     _ensure_avis_ia_table(engine)
     # Nettoyage caractères nuls (incompatibles PostgreSQL)
@@ -779,13 +818,13 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
                  source, model_used, tokens_used, generated_at,
                  score_composite, mom_r2, rvol, obv_slope,
                  prix_emission, sma_200, atr_14, k_adaptatif,
-                 secteur_force, macro_bullish, prompt_version)
+                 secteur_force, macro_bullish, prompt_version, type_avis)
             VALUES
                 (:ticker, :semaine, :rang, :conviction, :analyse, :resume,
                  :source, :model_used, :tokens_used, NOW(),
                  :score_composite, :mom_r2, :rvol, :obv_slope,
                  :prix_emission, :sma_200, :atr_14, :k_adaptatif,
-                 :secteur_force, :macro_bullish, :prompt_version)
+                 :secteur_force, :macro_bullish, :prompt_version, :type_avis)
             ON CONFLICT (semaine, ticker)
             DO UPDATE SET
                 rang             = EXCLUDED.rang,
@@ -806,7 +845,8 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
                 k_adaptatif      = EXCLUDED.k_adaptatif,
                 secteur_force    = EXCLUDED.secteur_force,
                 macro_bullish    = EXCLUDED.macro_bullish,
-                prompt_version   = EXCLUDED.prompt_version
+                prompt_version   = EXCLUDED.prompt_version,
+                type_avis        = EXCLUDED.type_avis
         """), {
             "ticker":          ticker.upper(),
             "semaine":         semaine,
@@ -828,4 +868,5 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
             "secteur_force":   None,  # TODO: passer l'info depuis le ranking
             "macro_bullish":   None,  # TODO: passer l'info depuis le ranking
             "prompt_version":  PROMPT_VERSION,
+            "type_avis":       type_avis,
         })
