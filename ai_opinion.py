@@ -101,26 +101,35 @@ def _migrate_avis_ia_columns(engine):
         ("rendement_2s",    "DOUBLE PRECISION"),
         ("rendement_4s",    "DOUBLE PRECISION"),
     ]
-    with engine.begin() as conn:
-        # Élargir colonnes trop étroites (migration depuis v1.0/v1.1)
-        for col, new_type in [("source", "VARCHAR(20)"), ("conviction", "VARCHAR(20)")]:
-            try:
-                conn.execute(text(f"ALTER TABLE avis_ia ALTER COLUMN {col} TYPE {new_type}"))
-            except Exception:
-                pass
+    # IMPORTANT : on sépare chaque opération en sa propre transaction.
+    # Si on regroupe ALTER TABLE + UPDATE dans le même 'with engine.begin()',
+    # une erreur sur l'UPDATE rollback aussi le ALTER TABLE → la colonne
+    # n'est jamais réellement créée. (Bug observé sur Railway PostgreSQL.)
 
-        for col_name, col_type in new_columns:
-            try:
+    # 1. Élargir colonnes trop étroites (chacune dans sa propre transaction)
+    for col, new_type in [("source", "VARCHAR(20)"), ("conviction", "VARCHAR(20)")]:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE avis_ia ALTER COLUMN {col} TYPE {new_type}"))
+        except Exception:
+            pass
+
+    # 2. Ajouter chaque colonne manquante (chacune dans sa propre transaction)
+    for col_name, col_type in new_columns:
+        try:
+            with engine.begin() as conn:
                 conn.execute(text(
                     f'ALTER TABLE avis_ia ADD COLUMN {col_name} {col_type}'
                 ))
                 print(f"  ✅ Colonne {col_name} ajoutée")
-            except Exception:
-                # Colonne existe déjà — OK
-                pass
+        except Exception:
+            # Colonne existe déjà — OK
+            pass
 
-        # v1.3 : backfill type_avis pour les anciens avis
-        try:
+    # 3. Backfill type_avis dans une transaction séparée
+    #    (ainsi un éventuel échec ici ne casse pas la création des colonnes)
+    try:
+        with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE avis_ia
                 SET type_avis = 'position'
@@ -131,8 +140,8 @@ def _migrate_avis_ia_columns(engine):
                 SET type_avis = 'ranking'
                 WHERE (source IS NULL OR source NOT LIKE 'position_%') AND type_avis IS NULL
             """))
-        except Exception as e:
-            print(f"  ⚠️ Backfill type_avis : {e}")
+    except Exception as e:
+        print(f"  ⚠️ Backfill type_avis : {e}")
 
     print("✅ Migration colonnes avis_ia v1.3 terminée")
 
