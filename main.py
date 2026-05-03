@@ -74,6 +74,9 @@ load_dotenv()
 
 app = FastAPI()
 
+# --- VERSION ---
+APP_VERSION = "6.6.0"
+
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
@@ -134,14 +137,19 @@ def _compute_quant_for_ticker(ticker: str) -> tuple:
         secteur = secteur_mapping.get(ticker, {}).get("secteur", "—")
         k = compute_adaptive_k(float(atr_14), float(prix)) if pd.notna(atr_14) and float(atr_14) > 0 else 3.0
 
-        # Chercher le rang dans le ranking hebdo (s'il y est)
+        # Chercher le rang dans le ranking hebdo (requête ciblée — pas de full scan)
         rang = None
-        ranking_data = ranking_live(top_n=400)
-        if "ranking" in ranking_data:
-            for r in ranking_data["ranking"]:
-                if r["ticker"] == ticker:
-                    rang = r["rank"]
-                    break
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT rank FROM ranking_hebdo
+                    WHERE ticker = :t
+                      AND date_calcul = (SELECT MAX(date_calcul) FROM ranking_hebdo)
+                """), {"t": ticker}).fetchone()
+                if row:
+                    rang = int(row[0])
+        except Exception as e:
+            print(f"⚠️ Lecture rang ranking pour {ticker} échouée : {e}")
 
         quant_data = {
             "ticker":    ticker,
@@ -252,7 +260,7 @@ def start_scheduler():
                       id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
 
     scheduler.start()
-    print("⏰ Scheduler démarré — 7 jobs planifiés (Europe/Brussels)")
+    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 7 jobs planifiés (Europe/Brussels)")
 
 # ============================================================
 # ENDPOINTS API
@@ -262,7 +270,7 @@ def start_scheduler():
 def home():
     return {
         "status"          : "Service Trading IA Actif",
-        "version"         : "6.6.0",
+        "version"         : APP_VERSION,
         "engine_connected": engine is not None
     }
 
@@ -1693,7 +1701,7 @@ def run_analysis_logic(full: bool = False):
     if engine is None: return
 
     mode = "COMPLET" if full else "INCRÉMENTAL"
-    print(f"🚀 Démarrage Analyse v5.9.0 — mode {mode}...")
+    print(f"🚀 Démarrage Analyse v{APP_VERSION} — mode {mode}...")
 
     try:
         # 1. Liste des tickers
@@ -1800,16 +1808,10 @@ def run_analysis_logic(full: bool = False):
                     np.where(price < group['sma_50'] * 0.98, 'BEAR', 'NEUTRE')
                 )
 
-                # ============================================================
-                # SIGNAL ACHAT — v3.3 (obsolète, conservé en production)
-                # ⚠️ À remplacer par signal v3.5 après validation backtest
-                # ============================================================
-                group['signal_achat'] = (
-                    (group['rsi_14'] < 35) &
-                    (price > group['sma_200']) &
-                    (vol > group['vol_avg_20']) &
-                    (price < group['bb_lower'])
-                )
+                # SIGNAL ACHAT v3.3 supprimé (mean-reversion empiriquement invalidée).
+                # L'entrée v4.1 se fait via le ranking momentum top 5
+                # (compute_and_store_ranking → ranking_hebdo).
+                # La colonne actions_prix_historique.signal_achat n'est plus mise à jour.
                 return group
 
             df = df.groupby('ticker', group_keys=False).apply(compute_analysis_indicators)
@@ -1839,7 +1841,7 @@ def run_analysis_logic(full: bool = False):
             tmp_table    = f"_tmp_update_{i}"
             cols_to_save = [
                 'id', 'rsi_14', 'sma_200', 'bb_lower', 'bb_position',
-                'vol_avg_20', 'regime_marche', 'signal_achat', 'confiance_ml',
+                'vol_avg_20', 'regime_marche', 'confiance_ml',
                 'rsi_slope', 'vol_ratio', 'dist_sma200', 'atr_14'
             ]
             df_update = df_to_save[[c for c in cols_to_save if c in df_to_save.columns]].copy()
@@ -1854,7 +1856,6 @@ def run_analysis_logic(full: bool = False):
                         bb_position   = t.bb_position,
                         vol_avg_20    = t.vol_avg_20,
                         regime_marche = t.regime_marche,
-                        signal_achat  = t.signal_achat,
                         score_ia      = t.confiance_ml,
                         rsi_slope     = t.rsi_slope,
                         vol_ratio     = t.vol_ratio,
