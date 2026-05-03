@@ -973,88 +973,127 @@ elif page == "📈 Backtest & Perf IA":
         avis_list = perf_data.get("avis", [])
 
         if not avis_list:
-            st.info("Aucun avis IA enregistré. Les données se rempliront progressivement chaque semaine.")
+            st.info("Aucun avis IA enregistré.")
         else:
             df_ia = pd.DataFrame(avis_list)
-            df_rend = df_ia.dropna(subset=["rendement_1s", "rendement_2s", "rendement_4s"], how="all")
+            # Fallback si type_avis pas encore rempli (avis pré-migration)
+            if "type_avis" not in df_ia.columns:
+                df_ia["type_avis"] = "ranking"
+            df_ia["type_avis"] = df_ia["type_avis"].fillna("ranking")
 
-            nb_total = len(df_ia)
-            nb_avec = len(df_rend)
+            # Séparer en 2 dataframes
+            df_ranking  = df_ia[df_ia["type_avis"] == "ranking"].copy()
+            df_position = df_ia[df_ia["type_avis"] == "position"].copy()
+
+            horizons = [("rendement_1s", "+1s"), ("rendement_2s", "+2s"), ("rendement_4s", "+4s")]
+
+            # ──────────────────────────────────────────────
+            # SECTION A — AVIS D'ACHAT (ranking)
+            # ──────────────────────────────────────────────
+            st.markdown("### 📥 Avis d'achat (ranking hebdomadaire)")
+            st.caption("Conviction FORT/MODÉRÉ/FAIBLE → un rendement positif valide la prédiction")
+
+            df_rank_rend = df_ranking.dropna(subset=["rendement_1s", "rendement_2s", "rendement_4s"], how="all")
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Avis générés", nb_total)
-            c2.metric("Avec rendement", nb_avec)
-            c3.metric("Semaines couvertes", df_ia["semaine"].nunique())
+            c1.metric("Avis générés", len(df_ranking))
+            c2.metric("Avec rendement", len(df_rank_rend))
+            c3.metric("Semaines couvertes", df_ranking["semaine"].nunique() if len(df_ranking) > 0 else 0)
 
-            if nb_avec == 0:
-                st.info("Aucun rendement encore disponible — mise à jour automatique chaque Samedi 07h30.")
+            if len(df_rank_rend) == 0:
+                st.info("Aucun rendement encore disponible pour les avis d'achat.")
             else:
-                # --- Par conviction ---
-                st.markdown("#### Rendement moyen par conviction")
-
-                convictions = ["FORT", "MODÉRÉ", "FAIBLE"]
-                horizons = [("rendement_1s", "+1s"), ("rendement_2s", "+2s"), ("rendement_4s", "+4s")]
-
+                # Tableau par conviction
                 rows_conv = []
-                for conv in convictions:
-                    dc = df_rend[df_rend["conviction"] == conv]
+                for conv in ["FORT", "MODÉRÉ", "FAIBLE"]:
+                    dc = df_rank_rend[df_rank_rend["conviction"] == conv]
                     row = {"Conviction": conv, "Nb": len(dc)}
                     for col, lbl in horizons:
                         vals = dc[col].dropna()
                         if len(vals) > 0:
                             row[f"Rend {lbl}"] = f"{vals.mean():.2%}"
-                            row[f"Hit {lbl}"] = f"{(vals > 0).mean():.0%}"
+                            row[f"Hit {lbl}"]  = f"{(vals > 0).mean():.0%}"
                         else:
                             row[f"Rend {lbl}"] = "—"
-                            row[f"Hit {lbl}"] = "—"
+                            row[f"Hit {lbl}"]  = "—"
                     rows_conv.append(row)
-
                 st.dataframe(pd.DataFrame(rows_conv), use_container_width=True, hide_index=True)
 
-                # --- Global ---
-                st.markdown("#### Rendement global")
-
-                rows_global = []
-                for col, lbl in horizons:
-                    vals = df_rend[col].dropna()
-                    if len(vals) > 0:
-                        rows_global.append({
-                            "Horizon": lbl,
-                            "Nb": len(vals),
-                            "Moy": f"{vals.mean():.2%}",
-                            "Médiane": f"{vals.median():.2%}",
-                            "Hit rate": f"{(vals > 0).mean():.0%}",
-                            "Best": f"{vals.max():.2%}",
-                            "Worst": f"{vals.min():.2%}",
-                        })
-
-                if rows_global:
-                    st.dataframe(pd.DataFrame(rows_global), use_container_width=True, hide_index=True)
-
-                # --- Détail ---
-                with st.expander("📋 Détail par avis"):
-                    df_det = df_rend[["semaine", "ticker", "rang", "conviction", "score_composite",
-                                      "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
+                # Détail
+                with st.expander("📋 Détail avis d'achat"):
+                    df_det = df_rank_rend[["semaine", "ticker", "rang", "conviction",
+                                            "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
                     df_det = df_det.sort_values(["semaine", "rang"], ascending=[False, True])
-
                     for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
                         df_det[col] = df_det[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
-                    if "score_composite" in df_det.columns:
-                        df_det["score_composite"] = df_det["score_composite"].apply(
-                            lambda x: f"{x:.3f}" if pd.notna(x) else "—"
-                        )
-
-                    df_det.columns = ["Semaine", "Ticker", "Rang", "Conviction", "Score",
-                                      "Rend +1s", "Rend +2s", "Rend +4s"]
+                    df_det.columns = ["Semaine", "Ticker", "Rang", "Conviction",
+                                       "Rend +1s", "Rend +2s", "Rend +4s"]
                     st.dataframe(df_det, use_container_width=True, hide_index=True)
 
-                # --- Bouton MAJ manuelle ---
-                if st.button("🔄 Mettre à jour les rendements", use_container_width=True):
-                    r = api_get("/update-suivi-rendements")
-                    if r:
-                        st.success(r.get("message", "Mise à jour lancée"))
-                    else:
-                        st.error("Erreur lors de la mise à jour")
+            st.divider()
+
+            # ──────────────────────────────────────────────
+            # SECTION B — AVIS POSITIONS (garder/vendre/renforcer)
+            # ──────────────────────────────────────────────
+            st.markdown("### 📊 Avis sur positions ouvertes (garder/vendre/renforcer)")
+            st.caption("⚠️ Lecture inversée selon la conviction — voir interprétation ci-dessous")
+
+            if len(df_position) == 0:
+                st.info("Aucun avis sur position généré pour le moment.")
+            else:
+                df_pos_rend = df_position.dropna(subset=["rendement_1s", "rendement_2s", "rendement_4s"], how="all")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Avis générés", len(df_position))
+                c2.metric("Avec rendement", len(df_pos_rend))
+                c3.metric("Tickers couverts", df_position["ticker"].nunique())
+
+                if len(df_pos_rend) == 0:
+                    st.info("Aucun rendement encore disponible pour les avis position.")
+                else:
+                    st.markdown(
+                        "**Interprétation :** un avis `GARDER` ou `RENFORCER` est validé "
+                        "par un rendement **positif** ; un avis `VENDRE` est validé par un "
+                        "rendement **négatif** (le ticker aurait dû effectivement être vendu)."
+                    )
+                    rows_conv = []
+                    for conv in ["GARDER", "RENFORCER", "VENDRE"]:
+                        dc = df_pos_rend[df_pos_rend["conviction"] == conv]
+                        row = {"Conviction": conv, "Nb": len(dc)}
+                        for col, lbl in horizons:
+                            vals = dc[col].dropna()
+                            if len(vals) > 0:
+                                row[f"Rend {lbl}"]  = f"{vals.mean():.2%}"
+                                # Hit rate inversé pour VENDRE
+                                if conv == "VENDRE":
+                                    row[f"Hit {lbl}"] = f"{(vals < 0).mean():.0%}"
+                                else:
+                                    row[f"Hit {lbl}"] = f"{(vals > 0).mean():.0%}"
+                            else:
+                                row[f"Rend {lbl}"] = "—"
+                                row[f"Hit {lbl}"]  = "—"
+                        rows_conv.append(row)
+                    st.dataframe(pd.DataFrame(rows_conv), use_container_width=True, hide_index=True)
+
+                    with st.expander("📋 Détail avis positions"):
+                        df_det = df_pos_rend[["semaine", "ticker", "conviction",
+                                                "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
+                        df_det = df_det.sort_values(["semaine", "ticker"], ascending=[False, True])
+                        for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
+                            df_det[col] = df_det[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
+                        df_det.columns = ["Semaine", "Ticker", "Conviction",
+                                           "Rend +1s", "Rend +2s", "Rend +4s"]
+                        st.dataframe(df_det, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # --- Bouton MAJ manuelle ---
+            if st.button("🔄 Mettre à jour les rendements", use_container_width=True):
+                r = api_get("/update-suivi-rendements")
+                if r:
+                    st.success(r.get("message", "Mise à jour lancée"))
+                else:
+                    st.error("Erreur lors de la mise à jour")
 
 # ============================================================
 # PAGE 5 — DÉCISIONS HUMAINES
