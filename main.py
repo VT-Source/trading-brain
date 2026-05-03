@@ -256,7 +256,7 @@ def start_scheduler():
                       CronTrigger(day_of_week="sat", hour=6, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
     scheduler.add_job(lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
-                      CronTrigger(day_of_week="sat", hour=6, minute=30),
+                      CronTrigger(day_of_week="mon-fri", hour=23, minute=45),
                       id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
 
     scheduler.start()
