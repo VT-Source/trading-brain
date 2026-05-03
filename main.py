@@ -1,4 +1,5 @@
 import io
+import gc
 import os
 import json
 import traceback
@@ -82,7 +83,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=2,
+    max_overflow=3,
+    pool_recycle=1800,  # recycle connexions après 30 min (évite connexions zombies)
+) if DATABASE_URL else None
 
 # ============================================================
 # Contexte nécessaire pour chaque indicateur glissant :
@@ -219,6 +226,10 @@ def _run_job(job_id: str, func, *args, **kwargs):
             "error": str(e),
         }
         print(f"❌ Job '{job_id}' échoué après {elapsed}s : {e}")
+    finally:
+        # Force la libération mémoire après chaque job (DataFrames yfinance, pandas, etc.)
+        collected = gc.collect()
+        print(f"🧹 GC après '{job_id}' : {collected} objets collectés")
 
 def _summarize_result(result):
     """Extrait un résumé compact du résultat d'un job (pour ne pas stocker des payloads énormes)."""
@@ -265,6 +276,32 @@ def start_scheduler():
 # ============================================================
 # ENDPOINTS API
 # ============================================================
+
+@app.get("/debug-memory")
+def debug_memory():
+    """Diagnostic mémoire — RSS via /proc, GC stats."""
+    import resource
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Sur Linux ru_maxrss est en KB
+    return {
+        "rss_mb": round(rss_kb / 1024, 1),
+        "gc_objects": len(gc.get_objects()),
+        "gc_counts": gc.get_count(),  # (gen0, gen1, gen2)
+        "job_status": job_status,
+    }
+
+@app.post("/debug-gc")
+def debug_gc():
+    """Force un gc.collect() et retourne le nombre d'objets libérés."""
+    before = len(gc.get_objects())
+    collected = gc.collect()
+    after = len(gc.get_objects())
+    return {
+        "freed_objects": collected,
+        "objects_before": before,
+        "objects_after": after,
+        "delta": before - after,
+    }
 
 @app.get("/")
 def home():
