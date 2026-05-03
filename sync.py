@@ -259,24 +259,35 @@ def fill_high_low_logic(engine):
                     if df_to_save.empty:
                         continue
 
-                    clean_ticker   = ticker_symbol.lower().replace('.', '_').replace('-', '_').replace('^', '')
-                    tmp_table_name = f"_tmp_hl_{clean_ticker}"
-
-                    # CORE FIX: toute l'opération dans la même transaction
+                    # Utiliser une vraie TEMPORARY TABLE Postgres (auto-drop en fin de session)
                     with engine.begin() as conn:
-                        df_to_save.to_sql(tmp_table_name, conn, if_exists="replace", index=False)
-
-                        conn.execute(text(f"""
+                        # Créer une vraie temp table (tronquée et supprimée auto en fin de transaction)
+                        conn.execute(text("""
+                            CREATE TEMP TABLE tmp_hl_data (
+                                ticker         TEXT,
+                                date           DATE,
+                                prix_haut      DOUBLE PRECISION,
+                                prix_bas       DOUBLE PRECISION,
+                                prix_ouverture DOUBLE PRECISION
+                            ) ON COMMIT DROP
+                        """))
+                        
+                        # Insérer les données via to_sql sur la temp table
+                        df_to_save.to_sql(
+                            "tmp_hl_data", conn, 
+                            if_exists="append", index=False
+                        )
+                        
+                        conn.execute(text("""
                             UPDATE actions_prix_historique a SET
                                 prix_haut      = t.prix_haut,
                                 prix_bas       = t.prix_bas,
                                 prix_ouverture = t.prix_ouverture
-                            FROM {tmp_table_name} t
+                            FROM tmp_hl_data t
                             WHERE a.ticker = t.ticker
-                              AND a.date   = t.date::date
+                              AND a.date   = t.date
                         """))
-
-                        conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table_name}"))
+                        # Pas besoin de DROP : ON COMMIT DROP s'en charge
 
                     chunk_updated += len(df_to_save)
                     time.sleep(0.5)
