@@ -178,7 +178,9 @@ def _compute_quant_for_ticker(ticker: str) -> tuple:
         return None, None
 
 def _auto_generate_opinions():
-    """Génère les avis IA pour le top 5 après le ranking du lundi."""
+    """Génère les avis IA pour le top 5 — déclenché samedi 06h00 sur le
+    ranking calculé samedi 02h15 (clôtures du vendredi US).
+    1×/semaine pour maîtriser le coût API."""
     ranking_data = ranking_live(top_n=5)
     if "error" in ranking_data:
         print(f"⚠️ Auto AI opinions : pas de ranking disponible")
@@ -248,27 +250,36 @@ def start_scheduler():
     if engine:
         _migrate_avis_ia_columns(engine)
 
+    # --- Pipeline data nocturne (lun-sam) ---
     scheduler.add_job(lambda: _run_job("sync_prix", sync_prix_logic, engine, full=False),
-                      CronTrigger(day_of_week="mon-fri", hour=20, minute=30),
+                      CronTrigger(day_of_week="mon-sat", hour=1, minute=0),
                       id="sync_prix", replace_existing=True, misfire_grace_time=600)
     scheduler.add_job(lambda: _run_job("analyse", run_analysis_logic, full=False),
-                      CronTrigger(day_of_week="mon-fri", hour=21, minute=0),
+                      CronTrigger(day_of_week="mon-sat", hour=1, minute=30),
                       id="analyse", replace_existing=True, misfire_grace_time=600)
     scheduler.add_job(lambda: _run_job("sync_etf", sync_secteurs_etf_logic, engine, full=False),
-                      CronTrigger(day_of_week="mon-fri", hour=21, minute=15),
+                      CronTrigger(day_of_week="mon-sat", hour=1, minute=45),
                       id="sync_etf", replace_existing=True, misfire_grace_time=600)
     scheduler.add_job(lambda: _run_job("sync_metadata", sync_metadata_logic, engine),
-                      CronTrigger(day_of_week="mon-fri", hour=21, minute=30),
+                      CronTrigger(day_of_week="mon-sat", hour=2, minute=0),
                       id="sync_metadata", replace_existing=True, misfire_grace_time=600)
+
+    # --- Ranking quotidien (lun-sam 02h15) ---
+    # Lun-ven : ranking sur clôtures du jour-1
+    # Sam     : ranking sur clôtures du vendredi US (utilisé par l'AI samedi 06h00)
     scheduler.add_job(lambda: _run_job("compute_ranking", compute_and_store_ranking, top_n=20),
-                      CronTrigger(day_of_week="sat", hour=5, minute=45),
+                      CronTrigger(day_of_week="mon-sat", hour=2, minute=15),
                       id="compute_ranking", replace_existing=True, misfire_grace_time=600)
+
+    # --- Suivi rendements quotidien (lun-sam 02h30) ---
+    scheduler.add_job(lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
+                      CronTrigger(day_of_week="mon-sat", hour=2, minute=30),
+                      id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
+
+    # --- Avis IA auto top 5 (1×/semaine, samedi sur ranking du vendredi soir) ---
     scheduler.add_job(lambda: _run_job("ai_opinions", _auto_generate_opinions),
                       CronTrigger(day_of_week="sat", hour=6, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
-                      CronTrigger(day_of_week="mon-fri", hour=23, minute=45),
-                      id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
 
     scheduler.start()
     print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 7 jobs planifiés (Europe/Brussels)")
@@ -825,7 +836,7 @@ def get_ai_opinions(semaine: str = None, ticker: str = None, all: bool = False):
 async def trigger_suivi_rendements(background_tasks: BackgroundTasks):
     """
     Met à jour les rendements à +1s/+2s/+4s pour les avis IA passés.
-    Automatique chaque lundi 07h30 via scheduler.
+    Automatique chaque jour ouvré (lun-sam 02h30) via scheduler.
     Peut aussi être déclenché manuellement.
     """
     background_tasks.add_task(update_suivi_rendements, engine)
@@ -1635,9 +1646,15 @@ def get_secteurs_en_force() -> list[dict]:
 def compute_and_store_ranking(top_n: int = 20):
     """
     Calcule le ranking momentum sur tous les tickers et le persiste
-    dans ranking_hebdo. Appelé par le scheduler (lundi 06h45)
+    dans ranking_hebdo. Appelé par le scheduler (lun-sam 02h15)
     et par l'endpoint /compute-ranking.
- 
+
+    NB : malgré le nom historique 'ranking_hebdo', la table contient
+    désormais un ranking journalier (1 calcul/jour ouvré + samedi).
+    Chaque ligne est identifiée par (date_calcul, ticker). Les avis IA
+    et décisions humaines restent agrégés par semaine via la clé
+    'semaine' (lundi), indépendante de date_calcul.
+
     Durée estimée : 3-4 min sur 400 tickers.
     """
     if compute_composite_score is None:
@@ -1648,7 +1665,7 @@ def compute_and_store_ranking(top_n: int = 20):
         return {"error": "engine non connecté"}
  
     try:
-        print("📊 Calcul ranking hebdo...")
+        print("📊 Calcul ranking journalier...")
  
         # 1. Charger les tickers et données
         all_tickers = load_all_tickers()
@@ -1723,7 +1740,7 @@ def compute_and_store_ranking(top_n: int = 20):
                          CAST(:macro_regime AS jsonb), :nb_eligible, :nb_total, :data_date)
                 """), rec)
  
-        print(f"✅ Ranking hebdo sauvegardé : {len(records)} tickers, date données {latest_date.date()}")
+        print(f"✅ Ranking sauvegardé : {len(records)} tickers, date données {latest_date.date()}")
         return {"status": "ok", "nb_ranked": len(records), "data_date": str(latest_date.date())}
  
     except Exception as e:

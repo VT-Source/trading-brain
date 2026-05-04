@@ -3,7 +3,7 @@
 # VT-Source/trading-brain
 # ============================================================
 # Streamlit dashboard pour visualiser :
-#   - Ranking hebdomadaire live (signaux v4.1)
+#   - Ranking momentum journalier live (signaux v4.1)
 #   - Régime macro & force sectorielle
 #   - Résultats backtest historiques
 #
@@ -219,7 +219,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["📊 Ranking Hebdo", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Perf IA", "📋 Décisions", "⚙️ Système"],
+        ["📊 Ranking", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Perf IA", "📋 Décisions", "⚙️ Système"],
         label_visibility="collapsed",
     )
 
@@ -237,13 +237,13 @@ with st.sidebar:
 
 
 # ============================================================
-# PAGE 1 — RANKING HEBDO
+# PAGE 1 — RANKING
 # ============================================================
 
-if page == "📊 Ranking Hebdo":
+if page == "📊 Ranking":
 
-    st.markdown("# 📊 Ranking Hebdomadaire")
-    st.caption("Top candidats du momentum ranking v4.1 — calculé chaque Samedi sur ~400 tickers")
+    st.markdown("# 📊 Ranking momentum")
+    st.caption("Top candidats du momentum ranking v4.1 — calculé chaque jour ouvré sur ~400 tickers")
 
     # --- Fetch ranking ---
     with st.spinner("Calcul du ranking en cours... (~30s sur 400 tickers)"):
@@ -266,7 +266,9 @@ if page == "📊 Ranking Hebdo":
                 zones.append(f"{zone} {'🟢' if bull else '🔴'}")
             st.metric("Macro", " / ".join(zones) if zones else "—")
         with col4:
-            st.metric("Date données", meta.get("data_date", "—"))
+            calcul_date = meta.get("date_calcul", "—")
+            st.metric("Données du", meta.get("data_date", "—"),
+                      help=f"Ranking calculé le {calcul_date}")
 
         st.divider()
 
@@ -328,9 +330,10 @@ if page == "📊 Ranking Hebdo":
 # --- Section unifiée : Analyse par ticker ---
         st.divider()
         st.markdown("### 🔍 Analyse par ticker")
-        st.caption("Avis IA + décision humaine pour chaque candidat")
+        st.caption("Avis IA (généré le samedi) + décision humaine pour chaque candidat")
  
-        # Calcul de la semaine courante (Samedi)
+        # Lundi de la semaine en cours — clé hebdo pour avis IA et décisions humaines
+        # (le ranking est journalier mais ces objets restent agrégés par semaine)
         today = date.today()
         semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
  
@@ -990,7 +993,7 @@ elif page == "📈 Backtest & Perf IA":
             # ──────────────────────────────────────────────
             # SECTION A — AVIS D'ACHAT (ranking)
             # ──────────────────────────────────────────────
-            st.markdown("### 📥 Avis d'achat (ranking hebdomadaire)")
+            st.markdown("### 📥 Avis d'achat (ranking)")
             st.caption("Conviction FORT/MODÉRÉ/FAIBLE → un rendement positif valide la prédiction")
 
             df_rank_rend = df_ranking.dropna(subset=["rendement_1s", "rendement_2s", "rendement_4s"], how="all")
@@ -1262,8 +1265,8 @@ elif page == "⚙️ Système":
     # --- Architecture overview ---
     st.markdown("### 📐 Architecture v4.1")
     st.code("""
-ENTRÉE (hebdomadaire, relative)
-  Chaque Samedi → scorer ~400 tickers
+ENTRÉE (relative — ranking journalier)
+  Chaque jour ouvré (+ samedi) → scorer ~400 tickers
   Score = 50% Mom R² + 25% RVOL + 25% OBV
   Filtres : prix > SMA200, secteur en force, mom_r2 > 0, macro bull
   → Top candidat remplit les slots libres (max 5)
