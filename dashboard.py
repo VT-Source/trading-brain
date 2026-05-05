@@ -18,7 +18,7 @@ import requests
 from datetime import date, datetime
 
 # ============================================================
-# CONFIG
+# CONFIG.
 # ============================================================
 
 API_BASE = os.getenv("API_BASE_URL", "https://trading-brain-production-f082.up.railway.app")
