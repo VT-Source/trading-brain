@@ -11,12 +11,10 @@
 #   - Traçabilité prompt_version
 #   - Fonction update_suivi_rendements() pour compléter les rendements
 #
-# v1.3 — Séparation ranking vs position :
-#   - Nouvelle colonne type_avis ('ranking' | 'position')
-#   - update_suivi_rendements ne traite que les avis 'ranking'
-#     (les avis position se mesurent via la P&L réelle des positions)
-#   - generate_opinion : type_avis='ranking' par défaut
-#   - generate_position_opinion : force type_avis='position'
+# v1.4 — Robustesse suivi rendements :
+#   - update_suivi_rendements reconstitue prix_emission via
+#     actions_prix_historique si NULL en base (avis générés sans
+#     snapshot indicateurs, ex: avant migration v1.2).
 # ============================================================
 
 import os
@@ -575,13 +573,19 @@ def update_suivi_rendements(engine) -> dict:
             # v1.3 : ne traiter que les avis 'ranking'
             # (les avis 'position' = NULL hérité historique sont aussi inclus
             #  pour ne rien casser sur les avis pré-migration)
+            # v1.4 : fallback prix_emission via actions_prix_historique pour
+            # rattraper les avis générés sans snapshot indicateurs.
             rows = conn.execute(text("""
-                SELECT id, ticker, semaine, prix_emission
-                FROM avis_ia
-                WHERE prix_emission IS NOT NULL
-                  AND (type_avis = 'ranking' OR type_avis IS NULL)
-                  AND (rendement_1s IS NULL OR rendement_2s IS NULL OR rendement_4s IS NULL)
-                ORDER BY semaine ASC
+                SELECT a.id, a.ticker, a.semaine,
+                       COALESCE(a.prix_emission, (
+                           SELECT prix_cloture FROM actions_prix_historique
+                           WHERE ticker = a.ticker AND date <= a.semaine::date
+                           ORDER BY date DESC LIMIT 1
+                       )) AS prix_emission
+                FROM avis_ia a
+                WHERE (a.type_avis = 'ranking' OR a.type_avis IS NULL)
+                  AND (a.rendement_1s IS NULL OR a.rendement_2s IS NULL OR a.rendement_4s IS NULL)
+                ORDER BY a.semaine ASC
             """)).fetchall()
 
         print(f"📊 Suivi rendements : {len(rows)} avis ranking à vérifier")
