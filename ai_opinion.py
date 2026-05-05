@@ -20,6 +20,7 @@
 # ============================================================
 
 import os
+import re
 import anthropic
 from datetime import date, timedelta
 from sqlalchemy import text
@@ -770,21 +771,37 @@ def _extract_conviction(analyse: str) -> str:
     Supporte les deux formats :
       - Ranking : FORT / MODÉRÉ / FAIBLE
       - Position : GARDER / VENDRE / RENFORCER
+    Tolère les variantes Markdown (**FORT**, ## CONVICTION, ###),
+    les emojis intercalés (🟢, 🟡, 🔴) et les espaces multiples
+    entre 'CONVICTION' et le mot-clé.
     """
     analyse_upper = analyse.upper()
-    # --- Format position (garder/vendre/renforcer) ---
-    if "CONVICTION : GARDER" in analyse_upper or "CONVICTION: GARDER" in analyse_upper:
-        return "GARDER"
-    if "CONVICTION : VENDRE" in analyse_upper or "CONVICTION: VENDRE" in analyse_upper:
-        return "VENDRE"
-    if "CONVICTION : RENFORCER" in analyse_upper or "CONVICTION: RENFORCER" in analyse_upper:
-        return "RENFORCER"
-    # --- Format ranking (fort/modéré/faible) ---
-    if "CONVICTION : FORT" in analyse_upper or "CONVICTION: FORT" in analyse_upper:
-        return "FORT"
-    if "CONVICTION : FAIBLE" in analyse_upper or "CONVICTION: FAIBLE" in analyse_upper:
-        return "FAIBLE"
-    # Fallback
+
+    # Regex : "CONVICTION" suivi (jusqu'à 30 caractères de tolérance) du mot-clé.
+    # \W couvre la ponctuation, les espaces, les emojis et les ** markdown.
+    # Position d'abord (vocabulaire spécifique, moins ambigu que ranking).
+    patterns_position = [
+        (r"CONVICTION[\W_]{0,30}?GARDER",    "GARDER"),
+        (r"CONVICTION[\W_]{0,30}?VENDRE",    "VENDRE"),
+        (r"CONVICTION[\W_]{0,30}?RENFORCER", "RENFORCER"),
+    ]
+    patterns_ranking = [
+        (r"CONVICTION[\W_]{0,30}?FORT",      "FORT"),
+        (r"CONVICTION[\W_]{0,30}?FAIBLE",    "FAIBLE"),
+        (r"CONVICTION[\W_]{0,30}?MODÉRÉ",    "MODÉRÉ"),
+        (r"CONVICTION[\W_]{0,30}?MODERE",    "MODÉRÉ"),  # variante sans accent
+    ]
+
+    for pattern, label in patterns_position:
+        if re.search(pattern, analyse_upper):
+            return label
+    for pattern, label in patterns_ranking:
+        if re.search(pattern, analyse_upper):
+            return label
+
+    # Fallback explicite — log pour repérer les analyses non parsables
+    print(f"⚠️ _extract_conviction : aucun pattern matché, fallback MODÉRÉ. "
+          f"Début analyse : {analyse[:200]!r}")
     return "MODÉRÉ"
 
 

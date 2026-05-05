@@ -423,12 +423,14 @@ if page == "📊 Ranking":
  
                     resume = avis.get("resume", "")
                     if resume:
-                        st.info(resume)
- 
+                        # Échappe les $ pour empêcher Streamlit d'interpréter
+                        # les montants en dollars comme du LaTeX (texte en italique mathématique).
+                        st.info(resume.replace("$", r"\$"))
+
                     analyse = avis.get("analyse", "")
                     if analyse:
                         with st.expander("📄 Analyse complète", expanded=False):
-                            st.markdown(analyse)
+                            st.markdown(analyse.replace("$", r"\$"))
  
                     st.caption(f"Modèle : {avis.get('model_used', '?')} — {avis.get('tokens_used', '?')} tokens — {avis.get('generated_at', '?')[:16]}")
                 else:
@@ -741,9 +743,9 @@ elif page == "💼 Portefeuille":
                                 st.markdown(f"**🤖 Dernier avis : {conv_emoji} {conv}**")
                                 resume = pos_avis.get("resume", "")
                                 if resume:
-                                    st.info(resume)
+                                    st.info(resume.replace("$", r"\$"))
                                 with st.expander("📄 Analyse complète"):
-                                    st.markdown(pos_avis.get("analyse", ""))
+                                    st.markdown(pos_avis.get("analyse", "").replace("$", r"\$"))
                                 st.caption(
                                     f"{pos_avis.get('tokens_used', '?')} tokens — "
                                     f"{pos_avis.get('generated_at', '?')[:16]}"
