@@ -332,32 +332,44 @@ if page == "📊 Ranking":
         st.markdown("### 🔍 Analyse par ticker")
         st.caption("Avis IA (généré le samedi) + décision humaine pour chaque candidat")
  
-        # Lundi de la semaine en cours — clé hebdo pour avis IA et décisions humaines
-        # (le ranking est journalier mais ces objets restent agrégés par semaine)
-        today = date.today()
-        semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
- 
-        # Chargement des décisions existantes
+        # Chargement des avis IA — on récupère la dernière semaine disponible côté API
+        # plutôt que de la calculer ici. Le scheduler génère les avis le samedi et les
+        # rattache au lundi de cette semaine ; pendant la semaine d'après (lun→ven) la
+        # variable "lundi en cours" pointerait sur le lundi suivant et masquerait les
+        # avis du samedi précédent. On laisse donc l'API décider via MAX(semaine).
+        avis_existants = {}
+        avis_data = api_get("/ai-opinions")  # sans param → MAX(semaine) côté API
+        semaine_courante = None
+        if avis_data and "avis" in avis_data and avis_data["avis"]:
+            for a in avis_data["avis"]:
+                # Garder uniquement les avis 'ranking' (exclure les avis position
+                # qui peuvent partager la même clé semaine)
+                if a.get("type_avis", "ranking") in ("ranking", None):
+                    avis_existants[a["ticker"]] = a
+            # Semaine de référence = celle effectivement renvoyée par l'API
+            semaine_courante = avis_data["avis"][0].get("semaine")
+
+        # Fallback si aucun avis encore en base (toute première semaine du système)
+        if semaine_courante is None:
+            today = date.today()
+            semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
+
+        # Chargement des décisions humaines pour CETTE même semaine
+        # (cohérence garantie avec les avis IA affichés)
         decisions_existantes = {}
         dec_data = api_get("/decisions", params={"semaine": semaine_courante})
         if dec_data and "decisions" in dec_data:
             for d in dec_data["decisions"]:
                 decisions_existantes[d["ticker"]] = d
  
-        # Chargement des avis IA existants
-        avis_existants = {}
-        avis_data = api_get("/ai-opinions", params={"semaine": semaine_courante})
-        if avis_data and "avis" in avis_data:
-            for a in avis_data["avis"]:
-                avis_existants[a["ticker"]] = a
- 
         # Résumé semaine en haut
         nb_fort   = sum(1 for a in avis_existants.values() if a.get("conviction") == "FORT")
         nb_modere = sum(1 for a in avis_existants.values() if a.get("conviction") == "MODÉRÉ")
         nb_faible = sum(1 for a in avis_existants.values() if a.get("conviction") == "FAIBLE")
         nb_avis   = len(avis_existants)
- 
+
         if nb_avis > 0:
+            st.caption(f"📅 Avis IA de la **semaine du {semaine_courante}** — régénérés chaque samedi matin")
             col_s1, col_s2, col_s3, col_s4 = st.columns(4)
             col_s1.metric("Avis IA générés", nb_avis)
             col_s2.metric("🟢 Fort", nb_fort)
