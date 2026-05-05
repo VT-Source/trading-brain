@@ -1038,14 +1038,57 @@ elif page == "📈 Backtest & Perf IA":
 
                 # Détail
                 with st.expander("📋 Détail avis d'achat"):
-                    df_det = df_rank_rend[["semaine", "ticker", "rang", "conviction",
-                                            "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
-                    df_det = df_det.sort_values(["semaine", "rang"], ascending=[False, True])
-                    for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
-                        df_det[col] = df_det[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
-                    df_det.columns = ["Semaine", "Ticker", "Rang", "Conviction",
-                                       "Rend +1s", "Rend +2s", "Rend +4s"]
-                    st.dataframe(df_det, use_container_width=True, hide_index=True)
+                    # Source : df_ranking complet (pas df_rank_rend) pour permettre
+                    # d'afficher les avis récents sans rendement.
+                    df_det_src = df_ranking.copy()
+
+                    # Sélecteur de semaine + toggle rendement
+                    col_f1, col_f2 = st.columns([3, 2])
+                    with col_f1:
+                        semaines_dispo = sorted(
+                            df_det_src["semaine"].dropna().unique().tolist(),
+                            reverse=True,
+                        )
+                        semaines_sel = st.multiselect(
+                            "Semaines à afficher",
+                            options=semaines_dispo,
+                            default=semaines_dispo,
+                            key="ai_perf_ranking_weeks",
+                        )
+                    with col_f2:
+                        inclure_sans_rdt = st.checkbox(
+                            "Inclure avis sans rendement",
+                            value=True,
+                            key="ai_perf_ranking_include_norend",
+                            help="Décoche pour ne voir que les avis dont au moins "
+                                 "un horizon (+1s/+2s/+4s) est complété.",
+                        )
+
+                    # Filtrage
+                    df_det = df_det_src[df_det_src["semaine"].isin(semaines_sel)].copy()
+                    if not inclure_sans_rdt:
+                        df_det = df_det.dropna(
+                            subset=["rendement_1s", "rendement_2s", "rendement_4s"],
+                            how="all",
+                        )
+
+                    if len(df_det) == 0:
+                        st.info("Aucun avis ne correspond aux filtres sélectionnés.")
+                    else:
+                        df_det = df_det[["semaine", "ticker", "rang", "conviction",
+                                         "rendement_1s", "rendement_2s", "rendement_4s"]]
+                        df_det = df_det.sort_values(["semaine", "rang"],
+                                                    ascending=[False, True])
+                        for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
+                            df_det[col] = df_det[col].apply(
+                                lambda x: f"{x:.2%}" if pd.notna(x) else "—"
+                            )
+                        df_det.columns = ["Semaine", "Ticker", "Rang", "Conviction",
+                                          "Rend +1s", "Rend +2s", "Rend +4s"]
+                        st.caption(f"{len(df_det)} avis affichés sur "
+                                   f"{len(df_det_src)} total.")
+                        st.dataframe(df_det, use_container_width=True,
+                                     hide_index=True)
 
             st.divider()
 
@@ -1066,7 +1109,8 @@ elif page == "📈 Backtest & Perf IA":
                 c3.metric("Tickers couverts", df_position["ticker"].nunique())
 
                 if len(df_pos_rend) == 0:
-                    st.info("Aucun rendement encore disponible pour les avis position.")
+                    st.info("Aucun rendement encore disponible pour les avis position. "
+                            "Le détail brut est affiché ci-dessous.")
                 else:
                     st.markdown(
                         "**Interprétation :** un avis `GARDER` ou `RENFORCER` est validé "
@@ -1092,15 +1136,70 @@ elif page == "📈 Backtest & Perf IA":
                         rows_conv.append(row)
                     st.dataframe(pd.DataFrame(rows_conv), use_container_width=True, hide_index=True)
 
-                    with st.expander("📋 Détail avis positions"):
-                        df_det = df_pos_rend[["semaine", "ticker", "conviction",
-                                                "rendement_1s", "rendement_2s", "rendement_4s"]].copy()
-                        df_det = df_det.sort_values(["semaine", "ticker"], ascending=[False, True])
+                # Détail (sorti du if/else — toujours affiché s'il y a des avis position)
+                with st.expander("📋 Détail avis positions"):
+                    df_det_src = df_position.copy()
+
+                    # Sélecteur de semaine + sélecteur de ticker + toggle rendement
+                    col_f1, col_f2, col_f3 = st.columns([2, 2, 2])
+                    with col_f1:
+                        semaines_dispo_pos = sorted(
+                            df_det_src["semaine"].dropna().unique().tolist(),
+                            reverse=True,
+                        )
+                        semaines_sel_pos = st.multiselect(
+                            "Semaines",
+                            options=semaines_dispo_pos,
+                            default=semaines_dispo_pos,
+                            key="ai_perf_position_weeks",
+                        )
+                    with col_f2:
+                        tickers_dispo_pos = sorted(
+                            df_det_src["ticker"].dropna().unique().tolist()
+                        )
+                        tickers_sel_pos = st.multiselect(
+                            "Tickers",
+                            options=tickers_dispo_pos,
+                            default=tickers_dispo_pos,
+                            key="ai_perf_position_tickers",
+                        )
+                    with col_f3:
+                        inclure_sans_rdt_pos = st.checkbox(
+                            "Inclure avis sans rendement",
+                            value=True,
+                            key="ai_perf_position_include_norend",
+                            help="Décoche pour ne voir que les avis dont au moins "
+                                 "un horizon (+1s/+2s/+4s) est complété.",
+                        )
+
+                    # Filtrage
+                    df_det = df_det_src[
+                        df_det_src["semaine"].isin(semaines_sel_pos)
+                        & df_det_src["ticker"].isin(tickers_sel_pos)
+                    ].copy()
+                    if not inclure_sans_rdt_pos:
+                        df_det = df_det.dropna(
+                            subset=["rendement_1s", "rendement_2s", "rendement_4s"],
+                            how="all",
+                        )
+
+                    if len(df_det) == 0:
+                        st.info("Aucun avis ne correspond aux filtres sélectionnés.")
+                    else:
+                        df_det = df_det[["semaine", "ticker", "conviction",
+                                         "rendement_1s", "rendement_2s", "rendement_4s"]]
+                        df_det = df_det.sort_values(["semaine", "ticker"],
+                                                    ascending=[False, True])
                         for col in ["rendement_1s", "rendement_2s", "rendement_4s"]:
-                            df_det[col] = df_det[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
+                            df_det[col] = df_det[col].apply(
+                                lambda x: f"{x:.2%}" if pd.notna(x) else "—"
+                            )
                         df_det.columns = ["Semaine", "Ticker", "Conviction",
-                                           "Rend +1s", "Rend +2s", "Rend +4s"]
-                        st.dataframe(df_det, use_container_width=True, hide_index=True)
+                                          "Rend +1s", "Rend +2s", "Rend +4s"]
+                        st.caption(f"{len(df_det)} avis affichés sur "
+                                   f"{len(df_det_src)} total.")
+                        st.dataframe(df_det, use_container_width=True,
+                                     hide_index=True)
 
             st.divider()
 
