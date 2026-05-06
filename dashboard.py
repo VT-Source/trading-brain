@@ -332,27 +332,36 @@ if page == "📊 Ranking":
         st.markdown("### 🔍 Analyse par ticker")
         st.caption("Avis IA (généré le samedi) + décision humaine pour chaque candidat")
  
-        # Chargement des avis IA — on récupère la dernière semaine disponible côté API
-        # plutôt que de la calculer ici. Le scheduler génère les avis le samedi et les
-        # rattache au lundi de cette semaine ; pendant la semaine d'après (lun→ven) la
-        # variable "lundi en cours" pointerait sur le lundi suivant et masquerait les
-        # avis du samedi précédent. On laisse donc l'API décider via MAX(semaine).
+        # Chargement des avis IA — fenêtre glissante 7 jours.
+        # Depuis le passage en ranking journalier (2026-05-04), le ranking est consulté
+        # tous les jours mais les avis IA auto restent générés 1×/semaine (samedi 06h00).
+        # Filtrer sur MAX(semaine) seul masquait l'avis du samedi précédent dès le lundi
+        # suivant. Une fenêtre de 7j garde l'avis du dernier samedi accessible toute la
+        # semaine, et bascule automatiquement quand un nouveau samedi tourne.
         avis_existants = {}
-        avis_data = api_get("/ai-opinions")  # sans param → MAX(semaine) côté API
-        semaine_courante = None
+        semaines_affichees = set()
+        avis_data = api_get("/ai-opinions", params={"all": "true"})
+        today = date.today()
+        cutoff = pd.Timestamp(today) - pd.Timedelta(days=7)
         if avis_data and "avis" in avis_data and avis_data["avis"]:
             for a in avis_data["avis"]:
-                # Garder uniquement les avis 'ranking' (exclure les avis position
-                # qui peuvent partager la même clé semaine)
-                if a.get("type_avis", "ranking") in ("ranking", None):
+                # Exclure les avis 'position' (peuvent partager la même clé semaine)
+                if a.get("type_avis", "ranking") not in ("ranking", None):
+                    continue
+                # Filtre temporel : generated_at (timestamp réel) prioritaire,
+                # fallback sur semaine si absent.
+                gen_ts = pd.to_datetime(a.get("generated_at"), errors="coerce")
+                if pd.isna(gen_ts):
+                    gen_ts = pd.to_datetime(a.get("semaine"), errors="coerce")
+                if pd.isna(gen_ts) or gen_ts < cutoff:
+                    continue
+                # avis_data est trié semaine DESC côté API → premier rencontré = plus récent
+                if a["ticker"] not in avis_existants:
                     avis_existants[a["ticker"]] = a
-            # Semaine de référence = celle effectivement renvoyée par l'API
-            semaine_courante = avis_data["avis"][0].get("semaine")
+                    semaines_affichees.add(str(a.get("semaine", "")))
 
-        # Fallback si aucun avis encore en base (toute première semaine du système)
-        if semaine_courante is None:
-            today = date.today()
-            semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
+        # Semaine de référence pour les décisions humaines : lundi de la semaine en cours
+        semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
 
         # Chargement des décisions humaines pour CETTE même semaine
         # (cohérence garantie avec les avis IA affichés)
@@ -369,7 +378,12 @@ if page == "📊 Ranking":
         nb_avis   = len(avis_existants)
 
         if nb_avis > 0:
-            st.caption(f"📅 Avis IA de la **semaine du {semaine_courante}** — régénérés chaque samedi matin")
+            if len(semaines_affichees) == 1:
+                semaine_aff = next(iter(semaines_affichees))
+                st.caption(f"📅 Avis IA de la **semaine du {semaine_aff}** — régénérés chaque samedi matin (fenêtre 7j)")
+            else:
+                semaines_str = ", ".join(sorted(semaines_affichees, reverse=True))
+                st.caption(f"📅 Avis IA récents (7j) — semaines : **{semaines_str}** — régénérés chaque samedi matin")
             col_s1, col_s2, col_s3, col_s4 = st.columns(4)
             col_s1.metric("Avis IA générés", nb_avis)
             col_s2.metric("🟢 Fort", nb_fort)
