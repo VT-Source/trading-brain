@@ -342,18 +342,23 @@ if page == "📊 Ranking":
         semaines_affichees = set()
         avis_data = api_get("/ai-opinions", params={"all": "true"})
         today = date.today()
-        cutoff = pd.Timestamp(today) - pd.Timedelta(days=7)
+        cutoff = today - pd.Timedelta(days=7).to_pytimedelta()
         if avis_data and "avis" in avis_data and avis_data["avis"]:
             for a in avis_data["avis"]:
                 # Exclure les avis 'position' (peuvent partager la même clé semaine)
                 if a.get("type_avis", "ranking") not in ("ranking", None):
                     continue
                 # Filtre temporel : generated_at (timestamp réel) prioritaire,
-                # fallback sur semaine si absent.
-                gen_ts = pd.to_datetime(a.get("generated_at"), errors="coerce")
+                # fallback sur semaine si absent. On compare des dates pures
+                # pour éviter les problèmes de timezone (generated_at peut être
+                # tz-aware, semaine est une date naïve).
+                gen_ts = pd.to_datetime(a.get("generated_at"), errors="coerce", utc=True)
                 if pd.isna(gen_ts):
-                    gen_ts = pd.to_datetime(a.get("semaine"), errors="coerce")
-                if pd.isna(gen_ts) or gen_ts < cutoff:
+                    gen_ts = pd.to_datetime(a.get("semaine"), errors="coerce", utc=True)
+                if pd.isna(gen_ts):
+                    continue
+                gen_date = gen_ts.date()
+                if gen_date < cutoff:
                     continue
                 # avis_data est trié semaine DESC côté API → premier rencontré = plus récent
                 if a["ticker"] not in avis_existants:
