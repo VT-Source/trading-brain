@@ -13,7 +13,6 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import date, timedelta
 from fastapi import FastAPI, BackgroundTasks
 from models_api import (
-    DecisionPayload,
     PositionOpenPayload,
     PositionClosePayload,
     PositionEditPayload,
@@ -565,102 +564,6 @@ def macro_status():
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/decisions")
-def upsert_decision(payload: DecisionPayload):
-    """
-    Crée ou met à jour la décision humaine pour un ticker/semaine.
-    UPSERT : si (semaine, ticker) existe déjà, on écrase.
-    """
-    if engine is None:
-        return {"error": "engine non connecté"}
-
-    decisions_valides = {"suivi", "ignore", "modifie"}
-    if payload.decision not in decisions_valides:
-        return {"error": f"Décision invalide. Valeurs acceptées : {decisions_valides}"}
-
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO decisions_humaines (semaine, ticker, rang, decision, commentaire, updated_at)
-                VALUES (:semaine, :ticker, :rang, :decision, :commentaire, NOW())
-                ON CONFLICT (semaine, ticker)
-                DO UPDATE SET
-                    decision    = EXCLUDED.decision,
-                    commentaire = EXCLUDED.commentaire,
-                    rang        = EXCLUDED.rang,
-                    updated_at  = NOW()
-            """), {
-                "semaine":     payload.semaine,
-                "ticker":      payload.ticker.upper(),
-                "rang":        payload.rang,
-                "decision":    payload.decision,
-                "commentaire": payload.commentaire,
-            })
-        return {
-            "status":  "ok",
-            "semaine": payload.semaine,
-            "ticker":  payload.ticker.upper(),
-            "decision": payload.decision,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/decisions")
-def get_decisions(semaine: Optional[str] = None):
-    """
-    Retourne les décisions humaines.
-    - ?semaine=YYYY-MM-DD  → décisions de cette semaine uniquement
-    - sans paramètre        → toutes les semaines disponibles + leurs décisions
-    """
-    if engine is None:
-        return {"error": "engine non connecté"}
-
-    try:
-        with engine.connect() as conn:
-            if semaine:
-                rows = conn.execute(text("""
-                    SELECT semaine, ticker, rang, decision, commentaire, updated_at
-                    FROM decisions_humaines
-                    WHERE semaine = :semaine
-                    ORDER BY rang ASC NULLS LAST, ticker ASC
-                """), {"semaine": semaine}).fetchall()
-            else:
-                rows = conn.execute(text("""
-                    SELECT semaine, ticker, rang, decision, commentaire, updated_at
-                    FROM decisions_humaines
-                    ORDER BY semaine DESC, rang ASC NULLS LAST
-                """)).fetchall()
-
-        decisions = [
-            {
-                "semaine":     str(r[0]),
-                "ticker":      r[1],
-                "rang":        r[2],
-                "decision":    r[3],
-                "commentaire": r[4],
-                "updated_at":  str(r[5]),
-            }
-            for r in rows
-        ]
-
-        # Statistiques rapides par semaine
-        semaines = {}
-        for d in decisions:
-            s = d["semaine"]
-            if s not in semaines:
-                semaines[s] = {"suivi": 0, "ignore": 0, "modifie": 0, "total": 0}
-            semaines[s][d["decision"]] += 1
-            semaines[s]["total"] += 1
-
-        return {
-            "nb_total":  len(decisions),
-            "semaines":  semaines,
-            "decisions": decisions,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
 # ============================================================
 # ENDPOINTS — AVIS IA
 # ============================================================
@@ -865,16 +768,15 @@ def open_position(payload: PositionOpenPayload):
         with engine.begin() as conn:
             result = conn.execute(text("""
                 INSERT INTO positions (ticker, date_achat, prix_achat, quantite,
-                                       decision_id, source, commentaire)
+                                       source, commentaire)
                 VALUES (:ticker, :date_achat, :prix_achat, :quantite,
-                        :decision_id, :source, :commentaire)
+                        :source, :commentaire)
                 RETURNING id, montant_investi
             """), {
                 "ticker":      payload.ticker.upper(),
                 "date_achat":  payload.date_achat,
                 "prix_achat":  payload.prix_achat,
                 "quantite":    payload.quantite,
-                "decision_id": payload.decision_id,
                 "source":      payload.source,
                 "commentaire": payload.commentaire,
             })
@@ -915,7 +817,7 @@ def list_positions(status: Optional[str] = None):
                        p.montant_investi, p.statut,
                        p.date_vente, p.prix_vente, p.raison_vente,
                        p.resultat_eur, p.resultat_pct,
-                       p.decision_id, p.source, p.commentaire,
+                       p.source, p.commentaire,
                        p.created_at, p.updated_at
                 FROM positions p
                 {where_clause}
@@ -937,11 +839,10 @@ def list_positions(status: Optional[str] = None):
                 "raison_vente":    r[9],
                 "resultat_eur":    float(r[10]) if r[10] else None,
                 "resultat_pct":    float(r[11]) if r[11] else None,
-                "decision_id":     r[12],
-                "source":          r[13],
-                "commentaire":     r[14],
-                "created_at":      str(r[15]),
-                "updated_at":      str(r[16]),
+                "source":          r[12],
+                "commentaire":     r[13],
+                "created_at":      str(r[14]),
+                "updated_at":      str(r[15]),
             })
 
         ouvertes = [p for p in positions if p["statut"] == "OUVERT"]
@@ -981,9 +882,6 @@ def edit_position(position_id: int, payload: PositionEditPayload):
     if payload.commentaire is not None:
         updates.append("commentaire = :commentaire")
         params["commentaire"] = payload.commentaire
-    if payload.decision_id is not None:
-        updates.append("decision_id = :decision_id")
-        params["decision_id"] = payload.decision_id
 
     if not updates:
         return {"error": "Aucun champ à modifier"}
@@ -1102,7 +1000,7 @@ def evaluate_open_positions():
         with engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT id, ticker, date_achat, prix_achat, quantite,
-                       montant_investi, decision_id, source, commentaire
+                       montant_investi, source, commentaire
                 FROM positions
                 WHERE statut = 'OUVERT'
                 ORDER BY date_achat ASC
@@ -1121,9 +1019,8 @@ def evaluate_open_positions():
                 "prix_achat":      float(r[3]),
                 "quantite":        float(r[4]),
                 "montant_investi": float(r[5]) if r[5] else None,
-                "decision_id":     r[6],
-                "source":          r[7],
-                "commentaire":     r[8],
+                "source":          r[6],
+                "commentaire":     r[7],
             })
             tickers_needed.add(r[1])
 
@@ -1303,7 +1200,6 @@ def evaluate_open_positions():
                 "warnings":        warnings,
                 "alerte_globale":  alerte,
                 "data_date":       str(latest_date.date()),
-                "decision_id":     pos["decision_id"],
                 "source":          pos["source"],
                 "commentaire":     pos["commentaire"],
             })

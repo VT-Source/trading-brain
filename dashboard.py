@@ -219,7 +219,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["📊 Ranking", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Perf IA", "📋 Décisions", "⚙️ Système"],
+        ["📊 Ranking", "🌍 Macro & Secteurs", "💼 Portefeuille", "📈 Backtest & Perf IA", "⚙️ Système"],
         label_visibility="collapsed",
     )
 
@@ -364,17 +364,6 @@ if page == "📊 Ranking":
                 if a["ticker"] not in avis_existants:
                     avis_existants[a["ticker"]] = a
                     semaines_affichees.add(str(a.get("semaine", "")))
-
-        # Semaine de référence pour les décisions humaines : lundi de la semaine en cours
-        semaine_courante = str(today - pd.Timedelta(days=today.weekday()))
-
-        # Chargement des décisions humaines pour CETTE même semaine
-        # (cohérence garantie avec les avis IA affichés)
-        decisions_existantes = {}
-        dec_data = api_get("/decisions", params={"semaine": semaine_courante})
-        if dec_data and "decisions" in dec_data:
-            for d in dec_data["decisions"]:
-                decisions_existantes[d["ticker"]] = d
  
         # Résumé semaine en haut
         nb_fort   = sum(1 for a in avis_existants.values() if a.get("conviction") == "FORT")
@@ -415,15 +404,13 @@ if page == "📊 Ranking":
         for ticker_row in ranking:
             ticker = ticker_row["ticker"]
             rang   = ticker_row["rank"]
-            dec_ex = decisions_existantes.get(ticker, {})
             avis   = avis_existants.get(ticker, {})
  
             # Construire le label de l'expander
             conviction = avis.get("conviction", "")
             conv_emoji = {"FORT": "🟢", "MODÉRÉ": "🟡", "FAIBLE": "🔴"}.get(conviction, "⚪")
-            dec_emoji  = {"suivi": "✅", "ignore": "❌", "modifie": "🔄"}.get(dec_ex.get("decision", ""), "")
  
-            label = f"#{rang} — {ticker}  {conv_emoji} {conviction}  {dec_emoji}"
+            label = f"#{rang} — {ticker}  {conv_emoji} {conviction}"
  
             with st.expander(label):
  
@@ -462,59 +449,6 @@ if page == "📊 Ranking":
                             st.success(f"Analyse de {ticker} lancée en arrière-plan. Rafraîchis dans ~30s.")
                         else:
                             st.error("Erreur lors du lancement")
- 
-                # --- Décision humaine ---
-                st.markdown("---")
-                st.markdown("**🧑‍💼 Décision**")
- 
-                col_dec, col_com, col_btn = st.columns([2, 4, 1])
- 
-                options    = ["—", "suivi", "ignore", "modifie"]
-                labels_dec = ["— (non décidé)", "✅ Suivi", "❌ Ignoré", "🔄 Modifié"]
-                current    = dec_ex.get("decision", "—")
-                current_idx = options.index(current) if current in options else 0
- 
-                with col_dec:
-                    choix = st.selectbox(
-                        "Décision",
-                        options=labels_dec,
-                        index=current_idx,
-                        key=f"dec_{ticker}",
-                        label_visibility="collapsed",
-                    )
- 
-                with col_com:
-                    commentaire = st.text_input(
-                        "Commentaire",
-                        value=dec_ex.get("commentaire", ""),
-                        placeholder="Commentaire libre (optionnel)...",
-                        key=f"com_{ticker}",
-                        label_visibility="collapsed",
-                    )
- 
-                with col_btn:
-                    if st.button("💾", key=f"save_{ticker}", help="Sauvegarder"):
-                        decision_val = options[labels_dec.index(choix)]
-                        if decision_val == "—":
-                            st.warning("Sélectionne une décision avant de sauvegarder.")
-                        else:
-                            payload = {
-                                "semaine":     semaine_courante,
-                                "ticker":      ticker,
-                                "rang":        rang,
-                                "decision":    decision_val,
-                                "commentaire": commentaire or None,
-                            }
-                            try:
-                                r = requests.post(f"{API_BASE}/decisions", json=payload, timeout=10)
-                                if r.status_code == 200:
-                                    st.success(f"Décision sauvegardée pour {ticker}")
-                                    st.cache_data.clear()
-                                    st.rerun()
-                                else:
-                                    st.error(f"Erreur API : {r.text}")
-                            except Exception as e:
-                                st.error(f"Erreur : {e}")
  
     elif data and "error" in data:
         st.error(f"Erreur API: {data['error']}")
@@ -858,7 +792,6 @@ elif page == "💼 Portefeuille":
                                 "date_achat":  str(date_achat),
                                 "source":      source,
                                 "commentaire": commentaire or None,
-                                "decision_id": None,
                             },
                             timeout=15,
                         )
@@ -919,7 +852,7 @@ elif page == "💼 Portefeuille":
             st.error("Impossible de charger les positions fermées.")
 
 # ============================================================
-# PAGE 4 — BACKTEST
+# PAGE 4 — BACKTEST & PERF IA
 # ============================================================
 
 elif page == "📈 Backtest & Perf IA":
@@ -1231,66 +1164,7 @@ elif page == "📈 Backtest & Perf IA":
                     st.error("Erreur lors de la mise à jour")
 
 # ============================================================
-# PAGE 5 — DÉCISIONS HUMAINES
-# ============================================================
-
-elif page == "📋 Décisions":
-
-    st.markdown("# 📋 Historique des Décisions")
-    st.caption("Toutes tes décisions hebdomadaires, semaine par semaine")
-
-    # Chargement de toutes les décisions
-    all_dec = api_get("/decisions")
-
-    if all_dec and "decisions" in all_dec:
-        semaines_dispo = sorted(all_dec["semaines"].keys(), reverse=True)
-
-        if not semaines_dispo:
-            st.info("Aucune décision enregistrée pour l'instant.")
-        else:
-            # Sélecteur de semaine
-            semaine_sel = st.selectbox(
-                "Semaine",
-                semaines_dispo,
-                format_func=lambda s: f"Semaine du {s}",
-            )
-
-            stats = all_dec["semaines"].get(semaine_sel, {})
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total décisions", stats.get("total", 0))
-            c2.metric("✅ Suivis",        stats.get("suivi", 0))
-            c3.metric("❌ Ignorés",       stats.get("ignore", 0))
-            c4.metric("🔄 Modifiés",      stats.get("modifie", 0))
-
-            st.divider()
-
-            # Tableau des décisions de la semaine sélectionnée
-            dec_semaine = [d for d in all_dec["decisions"] if d["semaine"] == semaine_sel]
-
-            if dec_semaine:
-                df_dec = pd.DataFrame(dec_semaine)
-                df_dec = df_dec.rename(columns={
-                    "rang":        "#",
-                    "ticker":      "Ticker",
-                    "decision":    "Décision",
-                    "commentaire": "Commentaire",
-                    "updated_at":  "Modifié le",
-                })
-                df_dec["Décision"] = df_dec["Décision"].map({
-                    "suivi":   "✅ Suivi",
-                    "ignore":  "❌ Ignoré",
-                    "modifie": "🔄 Modifié",
-                })
-                cols_show = ["#", "Ticker", "Décision", "Commentaire", "Modifié le"]
-                cols_show = [c for c in cols_show if c in df_dec.columns]
-                st.dataframe(df_dec[cols_show], use_container_width=True, hide_index=True)
-            else:
-                st.info("Aucune décision pour cette semaine.")
-    else:
-        st.info("Aucune décision enregistrée pour l'instant.")
-
-# ============================================================
-# PAGE 6 — SYSTÈME
+# PAGE 5 — SYSTÈME
 # ============================================================
 
 elif page == "⚙️ Système":
