@@ -708,10 +708,14 @@ elif page == "💼 Portefeuille":
                         with st.expander("🔒 Fermer cette position"):
                             with st.form(key=f"close_{pos['id']}"):
                                 fc1, fc2 = st.columns(2)
+                                # Fallback : prix_actuel peut être None ou 0 si yfinance
+                                # n'a pas remonté le dernier cours → on retombe sur prix_achat
+                                _prix_default = pos.get("prix_actuel") or pos.get("prix_achat") or 0.01
+                                _prix_default = max(float(_prix_default), 0.01)
                                 prix_vente = fc1.number_input(
                                     "Prix de vente",
                                     min_value=0.01,
-                                    value=float(pos.get("prix_actuel", 0)),
+                                    value=_prix_default,
                                     step=0.01,
                                     key=f"pv_{pos['id']}",
                                 )
