@@ -429,8 +429,6 @@ if page == "📊 Ranking":
  
                     resume = avis.get("resume", "")
                     if resume:
-                        # Échappe les $ pour empêcher Streamlit d'interpréter
-                        # les montants en dollars comme du LaTeX (texte en italique mathématique).
                         st.info(resume.replace("$", r"\$"))
 
                     analyse = avis.get("analyse", "")
@@ -439,9 +437,42 @@ if page == "📊 Ranking":
                             st.markdown(analyse.replace("$", r"\$"))
  
                     st.caption(f"Modèle : {avis.get('model_used', '?')} — {avis.get('tokens_used', '?')} tokens — {avis.get('generated_at', '?')[:16]}")
+
+                    # --- Bouton régénérer (avis existant) ---
+                    btn_col, _ = st.columns([1, 3])
+                    with btn_col:
+                        if st.button(f"🔄 Régénérer l'avis", key=f"regen_ai_{ticker}",
+                                     use_container_width=True,
+                                     help="Remplace l'avis ci-dessus par une nouvelle analyse "
+                                          "incluant les actualités les plus récentes (~30-60s). "
+                                          "L'ancien avis est écrasé."):
+                            with st.spinner(f"Régénération de l'avis IA pour {ticker} (~30-60s)..."):
+                                result = api_get("/generate-ai-opinion", params={"ticker": ticker})
+                            if result and result.get("status") == "processing":
+                                st.success(f"🤖 {result.get('message', 'Analyse lancée')}")
+                                st.caption("Rafraîchis la page dans ~1 min pour voir le nouvel avis.")
+                            elif result and "error" in result:
+                                st.error(result["error"])
+                            else:
+                                st.error("Erreur lors du lancement")
                 else:
                     st.markdown("---")
                     st.caption("Pas d'avis IA pour cette semaine.")
+
+                    # --- Bouton analyser (pas d'avis) ---
+                    btn_col, _ = st.columns([1, 3])
+                    with btn_col:
+                        if st.button(f"🤖 Analyser {ticker}", key=f"gen_ai_{ticker}",
+                                     use_container_width=True):
+                            with st.spinner(f"Analyse IA de {ticker} en cours (~30-60s)..."):
+                                result = api_get("/generate-ai-opinion", params={"ticker": ticker})
+                            if result and result.get("status") == "processing":
+                                st.success(f"🤖 {result.get('message', 'Analyse lancée')}")
+                                st.caption("Rafraîchis la page dans ~1 min pour voir le résultat.")
+                            elif result and "error" in result:
+                                st.error(result["error"])
+                            else:
+                                st.error("Erreur lors du lancement")
                     if st.button(f"🤖 Analyser {ticker}", key=f"ai_{ticker}"):
                         with st.spinner(f"Analyse IA de {ticker} en cours..."):
                             result = api_get("/generate-ai-opinion", params={"ticker": ticker})
