@@ -612,41 +612,51 @@ elif page == "💼 Portefeuille":
                         i2.caption(f"Prix actuel : {pos.get('prix_actuel', '?')}€")
                         i3.caption(f"Data : {pos.get('data_date', '?')}")
 
-                        # --- Feux conditions ---
-                        conditions = pos.get("conditions", {})
+                        # --- Erreur backend : pas de données pour ce ticker ---
+                        if pos.get("error"):
+                            st.error(
+                                f"⚠️ **Évaluation indisponible** : {pos['error']}\n\n"
+                                f"Causes possibles : ticker mal orthographié à l'ouverture, "
+                                f"ticker absent de l'univers `tickers_info`, ou prix pas encore "
+                                f"synchronisé. Tu peux corriger le ticker en base ou fermer "
+                                f"la position via l'expander ci-dessous."
+                            )
+                        else:
+                            # --- Feux conditions ---
+                            conditions = pos.get("conditions", {})
 
-                        cols = st.columns(5)
+                            cols = st.columns(5)
 
-                        # 1. Trailing stop
-                        ts = conditions.get("trailing_stop", {})
-                        cols[0].markdown(f"**{ts.get('feu', '⚪')} Trailing Stop**")
-                        cols[0].caption(
-                            f"Stop: {ts.get('stop_level', '?')}€ "
-                            f"(k={ts.get('k', '?')}, dist: {ts.get('distance_pct', '?')}%)"
-                        )
+                            # 1. Trailing stop
+                            ts = conditions.get("trailing_stop", {})
+                            cols[0].markdown(f"**{ts.get('feu', '⚪')} Trailing Stop**")
+                            cols[0].caption(
+                                f"Stop: {ts.get('stop_level', '?')}€ "
+                                f"(k={ts.get('k', '?')}, dist: {ts.get('distance_pct', '?')}%)"
+                            )
 
-                        # 2. Trend SMA 200
-                        tr = conditions.get("trend_sma200", {})
-                        cols[1].markdown(f"**{tr.get('feu', '⚪')} SMA 200**")
-                        cols[1].caption(
-                            f"SMA: {tr.get('sma_200', '?')}€ "
-                            f"(dist: {tr.get('distance_pct', '?')}%)"
-                        )
+                            # 2. Trend SMA 200
+                            tr = conditions.get("trend_sma200", {})
+                            cols[1].markdown(f"**{tr.get('feu', '⚪')} SMA 200**")
+                            cols[1].caption(
+                                f"SMA: {tr.get('sma_200', '?')}€ "
+                                f"(dist: {tr.get('distance_pct', '?')}%)"
+                            )
 
-                        # 3. Momentum R²
-                        mr = conditions.get("momentum_r2", {})
-                        cols[2].markdown(f"**{mr.get('feu', '⚪')} Mom R²**")
-                        cols[2].caption(f"Valeur: {mr.get('value', '?')}")
+                            # 3. Momentum R²
+                            mr = conditions.get("momentum_r2", {})
+                            cols[2].markdown(f"**{mr.get('feu', '⚪')} Mom R²**")
+                            cols[2].caption(f"Valeur: {mr.get('value', '?')}")
 
-                        # 4. Secteur
-                        sc = conditions.get("secteur", {})
-                        cols[3].markdown(f"**{sc.get('feu', '⚪')} Secteur**")
-                        cols[3].caption(f"{sc.get('secteur_name', '?')}")
+                            # 4. Secteur
+                            sc = conditions.get("secteur", {})
+                            cols[3].markdown(f"**{sc.get('feu', '⚪')} Secteur**")
+                            cols[3].caption(f"{sc.get('secteur_name', '?')}")
 
-                        # 5. Macro
-                        mc = conditions.get("macro", {})
-                        cols[4].markdown(f"**{mc.get('feu', '⚪')} Macro**")
-                        cols[4].caption(f"Zone: {mc.get('zone', '?')}")
+                            # 5. Macro
+                            mc = conditions.get("macro", {})
+                            cols[4].markdown(f"**{mc.get('feu', '⚪')} Macro**")
+                            cols[4].caption(f"Zone: {mc.get('zone', '?')}")
 
                         # --- Violated / warnings summary ---
                         violated = pos.get("violated", [])
@@ -708,8 +718,9 @@ elif page == "💼 Portefeuille":
                         with st.expander("🔒 Fermer cette position"):
                             with st.form(key=f"close_{pos['id']}"):
                                 fc1, fc2 = st.columns(2)
-                                # Fallback : prix_actuel peut être None ou 0 si yfinance
-                                # n'a pas remonté le dernier cours → on retombe sur prix_achat
+                                # Fallback : prix_actuel peut être None ou 0 si
+                                # l'évaluation a échoué (ex: ticker mal saisi).
+                                # On retombe sur prix_achat pour garantir value >= min_value.
                                 _prix_default = pos.get("prix_actuel") or pos.get("prix_achat") or 0.01
                                 _prix_default = max(float(_prix_default), 0.01)
                                 prix_vente = fc1.number_input(
@@ -765,10 +776,58 @@ elif page == "💼 Portefeuille":
         st.markdown("### ➕ Ouvrir une nouvelle position")
         st.caption("Saisie manuelle après exécution sur ton broker")
 
+        # Charger la liste des tickers (cache 1h, évite de spammer l'API
+        # à chaque rerun du formulaire)
+        @st.cache_data(ttl=3600)
+        def _load_tickers_list():
+            r = api_get("/tickers-search", params={"q": "", "limit": 1000})
+            if r and "results" in r:
+                return r["results"]
+            return []
+
+        tickers_list = _load_tickers_list()
+
+        # Construire les options affichables : "MU — Micron Technology Inc."
+        if tickers_list:
+            options_map = {
+                (f"{t['ticker']} — {t['name']}" if t.get('name') else t['ticker']): t['ticker']
+                for t in tickers_list
+            }
+            options_labels = [""] + sorted(options_map.keys())
+        else:
+            options_map = {}
+            options_labels = [""]
+            st.warning(
+                "⚠️ Liste des tickers indisponible — saisie libre activée. "
+                "Vérifie que l'endpoint /tickers-search est accessible."
+            )
+
         with st.form("open_position_form"):
             o1, o2 = st.columns(2)
-            ticker = o1.text_input("Ticker", placeholder="ex: NVDA").strip().upper()
-            prix_achat = o2.number_input("Prix d'achat", min_value=0.01, step=0.01)
+
+            if tickers_list:
+                ticker_label = o1.selectbox(
+                    "Ticker",
+                    options=options_labels,
+                    index=0,
+                    help="Tape le symbole (ex: MU) ou le nom de la société "
+                         "(ex: Micron) — la liste se filtre automatiquement.",
+                )
+                ticker = options_map.get(ticker_label, "")
+            else:
+                # Fallback : champ libre si /tickers-search indispo
+                ticker = o1.text_input(
+                    "Ticker",
+                    placeholder="ex: MU",
+                    help="Symbole Yahoo Finance, PAS le nom de la société.",
+                ).strip().upper()
+
+            prix_achat = o2.number_input(
+                "Prix d'achat (unitaire)",
+                min_value=0.01,
+                step=0.01,
+                help="Prix payé par action, PAS le montant total investi.",
+            )
 
             o3, o4 = st.columns(2)
             quantite = o3.number_input("Quantité", min_value=0.01, step=0.01, value=1.0)
@@ -776,13 +835,19 @@ elif page == "💼 Portefeuille":
 
             o5, o6 = st.columns(2)
             source = o5.selectbox("Source", ["ranking", "manuel"])
-            commentaire = o6.text_input("Commentaire (optionnel)", placeholder="ex: top 1 semaine 14")
+            commentaire = o6.text_input(
+                "Commentaire (optionnel)",
+                placeholder="ex: top 1 semaine 14",
+            )
 
-            submitted = st.form_submit_button("Ouvrir la position", use_container_width=True)
+            submitted = st.form_submit_button(
+                "Ouvrir la position",
+                use_container_width=True,
+            )
 
             if submitted:
                 if not ticker:
-                    st.error("Le ticker est obligatoire.")
+                    st.error("Sélectionne un ticker dans la liste.")
                 elif prix_achat <= 0:
                     st.error("Le prix d'achat doit être > 0.")
                 else:
@@ -802,6 +867,8 @@ elif page == "💼 Portefeuille":
                         result = resp.json()
                         if result.get("status") == "ok":
                             st.success(f"✅ {result.get('message', 'Position ouverte.')}")
+                            if result.get("warning"):
+                                st.warning(result["warning"])
                             st.cache_data.clear()
                         else:
                             st.error(result.get("error", "Erreur inconnue"))
