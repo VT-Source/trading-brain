@@ -1,6 +1,7 @@
 import io
 import gc
 import os
+import re
 import json
 import traceback
 import time
@@ -752,10 +753,71 @@ async def trigger_suivi_rendements(background_tasks: BackgroundTasks):
 # ENDPOINTS — POSITIONS (v4.1)
 # ============================================================
 
+@app.get("/tickers-search")
+def search_tickers(q: str = "", limit: int = 500):
+    """
+    Recherche de tickers par symbole OU nom de société.
+    Utilisé par le formulaire d'ouverture de position (autocomplete dashboard).
+
+    - q vide → retourne les `limit` premiers tickers (alphabétique)
+    - q rempli → match sur ticker ou name (case-insensitive)
+
+    Retourne : [{"ticker": "MU", "name": "Micron Technology Inc.", "secteur": "Technology"}, ...]
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    q_clean = (q or "").strip()
+
+    try:
+        with engine.connect() as conn:
+            if not q_clean:
+                # Liste complète (cache côté dashboard)
+                rows = conn.execute(text("""
+                    SELECT ticker, name, secteur
+                    FROM tickers_info
+                    ORDER BY ticker
+                    LIMIT :limit
+                """), {"limit": limit}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT ticker, name, secteur
+                    FROM tickers_info
+                    WHERE UPPER(ticker) LIKE UPPER(:pattern)
+                       OR UPPER(name)   LIKE UPPER(:pattern)
+                    ORDER BY
+                        CASE WHEN UPPER(ticker) = UPPER(:exact)   THEN 0
+                             WHEN UPPER(ticker) LIKE UPPER(:prefix) THEN 1
+                             WHEN UPPER(name)   LIKE UPPER(:prefix) THEN 2
+                             ELSE 3
+                        END,
+                        ticker
+                    LIMIT :limit
+                """), {
+                    "pattern": f"%{q_clean}%",
+                    "prefix":  f"{q_clean}%",
+                    "exact":   q_clean,
+                    "limit":   limit,
+                }).fetchall()
+
+        results = [
+            {"ticker": r[0], "name": r[1] or "", "secteur": r[2] or "—"}
+            for r in rows
+        ]
+        return {"results": results, "count": len(results)}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/positions")
 def open_position(payload: PositionOpenPayload):
     """
     Ouvre une nouvelle position (saisie manuelle après exécution broker).
+
+    Garde-fous :
+      - source ∈ {ranking, manuel}
+      - ticker syntaxiquement valide (pas d'espaces, accents, etc.)
+      - ticker présent dans tickers_info OU dans actions_prix_historique
+        (rejette les libellés type "MICRON TECHNOLOGIE")
     """
     if engine is None:
         return {"error": "engine non connecté"}
@@ -764,8 +826,39 @@ def open_position(payload: PositionOpenPayload):
     if payload.source not in sources_valides:
         return {"error": f"Source invalide. Valeurs acceptées : {sources_valides}"}
 
+    ticker = (payload.ticker or "").strip().upper()
+    if not ticker:
+        return {"error": "Ticker manquant"}
+
+    # Sanity check syntaxique : un ticker Yahoo Finance contient
+    # lettres, chiffres, point, tiret, caret. Pas d'espaces ni d'accents.
+    if not re.fullmatch(r"[A-Z0-9\.\-\^]{1,15}", ticker):
+        return {
+            "error": f"Format de ticker invalide : '{ticker}'. "
+                     f"Attendu : symbole Yahoo Finance (ex: NVDA, MU, ASML.AS), "
+                     f"sans espaces ni accents."
+        }
+
     try:
         with engine.begin() as conn:
+            exists_meta = conn.execute(text("""
+                SELECT 1 FROM tickers_info WHERE ticker = :t LIMIT 1
+            """), {"t": ticker}).fetchone()
+
+            exists_price = conn.execute(text("""
+                SELECT 1 FROM actions_prix_historique WHERE ticker = :t LIMIT 1
+            """), {"t": ticker}).fetchone()
+
+            if not exists_meta and not exists_price:
+                return {
+                    "error": f"Ticker '{ticker}' inconnu du système "
+                             f"(absent de tickers_info ET de actions_prix_historique). "
+                             f"Vérifie l'orthographe Yahoo Finance "
+                             f"(ex: 'MU' pour Micron, pas 'MICRON TECHNOLOGIE'). "
+                             f"Si le ticker est correct mais nouveau, ajoute-le d'abord "
+                             f"à l'univers via /sync-prix puis /sync-metadata."
+                }
+
             result = conn.execute(text("""
                 INSERT INTO positions (ticker, date_achat, prix_achat, quantite,
                                        source, commentaire)
@@ -773,7 +866,7 @@ def open_position(payload: PositionOpenPayload):
                         :source, :commentaire)
                 RETURNING id, montant_investi
             """), {
-                "ticker":      payload.ticker.upper(),
+                "ticker":      ticker,
                 "date_achat":  payload.date_achat,
                 "prix_achat":  payload.prix_achat,
                 "quantite":    payload.quantite,
@@ -782,16 +875,21 @@ def open_position(payload: PositionOpenPayload):
             })
             row = result.fetchone()
 
+        warning = None
+        if not exists_price:
+            warning = (f"Ticker reconnu dans tickers_info mais aucun prix synchronisé. "
+                       f"Lance /sync-prix pour activer l'évaluation des conditions.")
+
         return {
             "status":          "ok",
             "id":              row[0],
-            "ticker":          payload.ticker.upper(),
+            "ticker":          ticker,
             "montant_investi": float(row[1]),
-            "message":         f"Position ouverte : {payload.quantite} × {payload.ticker.upper()} à {payload.prix_achat}",
+            "warning":         warning,
+            "message":         f"Position ouverte : {payload.quantite} × {ticker} à {payload.prix_achat}",
         }
     except Exception as e:
         return {"error": str(e)}
-
 
 @app.get("/positions")
 def list_positions(status: Optional[str] = None):
