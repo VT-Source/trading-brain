@@ -473,13 +473,6 @@ if page == "📊 Ranking":
                                 st.error(result["error"])
                             else:
                                 st.error("Erreur lors du lancement")
-                    if st.button(f"🤖 Analyser {ticker}", key=f"ai_{ticker}"):
-                        with st.spinner(f"Analyse IA de {ticker} en cours..."):
-                            result = api_get("/generate-ai-opinion", params={"ticker": ticker})
-                        if result:
-                            st.success(f"Analyse de {ticker} lancée en arrière-plan. Rafraîchis dans ~30s.")
-                        else:
-                            st.error("Erreur lors du lancement")
  
     elif data and "error" in data:
         st.error(f"Erreur API: {data['error']}")
