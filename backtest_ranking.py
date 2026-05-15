@@ -129,7 +129,15 @@ def load_secteur_mapping() -> dict[str, dict]:
     mapping = {}
     for ticker, secteur, pays in rows:
         pays = pays or ''
-        if pays == 'Belgium' or pays in PAYS_EU:
+        # Règle : un ticker sans suffixe Yahoo est coté au NYSE/NASDAQ → zone US,
+        # peu importe le pays du siège retourné par Yahoo Finance.
+        # Corrige les ADR comme NXPI (NL), ACN/AON/ETN/JCI/MDT/TEL/TT (IE),
+        # APTV/CB/MTD (CH), LIN/WTW (UK) — sociétés US-listed malgré leur
+        # incorporation européenne pour raisons fiscales.
+        is_us_listed = '.' not in ticker
+        if is_us_listed:
+            zone_priority = ['US', 'EU']
+        elif pays == 'Belgium' or pays in PAYS_EU:
             zone_priority = ['EU', 'US']
         else:
             zone_priority = ['US', 'EU']
@@ -142,6 +150,10 @@ def load_all_secteur_force() -> dict[str, pd.DataFrame]:
     """
     Charge toutes les données de force relative sectorielle.
     Retourne {(secteur, zone): DataFrame indexé par date avec en_force_relative}.
+
+    Exclut les lignes avec prix_ajuste = NaN (jours fériés Xetra typiquement) :
+    ces lignes ont en_force_relative=false par défaut (NaN > 1.0 = false),
+    ce qui ferait filtrer indûment toute la zone EU le jour férié.
     """
     with engine.connect() as conn:
         df = pd.read_sql(text("""
@@ -149,6 +161,10 @@ def load_all_secteur_force() -> dict[str, pd.DataFrame]:
             FROM secteurs_etf_prix sep
             JOIN secteurs_etf se ON se.ticker_etf = sep.ticker_etf
             WHERE se.actif = TRUE
+              AND sep.prix_ajuste IS NOT NULL
+              AND sep.prix_ajuste <> 'NaN'::numeric
+              AND sep.ratio_vs_mm50 IS NOT NULL
+              AND sep.ratio_vs_mm50 <> 'NaN'::numeric
             ORDER BY se.secteur_yahoo, se.zone, sep.date ASC
         """), conn)
 

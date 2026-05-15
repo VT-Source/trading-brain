@@ -412,6 +412,22 @@ def sync_secteurs_etf_logic(engine, full: bool = False):
                 df_etf["date"]       = pd.to_datetime(df_etf["date"]).dt.date
                 df_etf["ticker_etf"] = etf_ticker
 
+                # Filtre défensif : ignorer les jours où yfinance retourne NaN
+                # (typiquement jours fériés Xetra sur les EX*.DE). Sans ce filtre,
+                # les NaN se propagent dans ratio_force_relative / ratio_vs_mm50
+                # et tous les tickers de la zone EU sont filtrés du ranking.
+                nb_before = len(df_etf)
+                df_etf = df_etf.dropna(subset=["prix_ajuste"])
+                df_etf = df_etf[df_etf["prix_ajuste"] > 0]
+                nb_dropped = nb_before - len(df_etf)
+                if nb_dropped > 0:
+                    print(f"   ℹ️ {etf_ticker} — {nb_dropped} jour(s) NaN ignoré(s) "
+                          f"(yfinance/Xetra fermé)")
+
+                if df_etf.empty:
+                    print(f"   ⚠️ {etf_ticker} — toutes les lignes sont NaN, skip.")
+                    continue
+
                 # Charger l'indice de référence depuis la base
                 with engine.connect() as conn:
                     df_indice = pd.read_sql(text("""
