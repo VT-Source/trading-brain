@@ -5,6 +5,10 @@
 # Fonctions extraites de main.py v6.4.0 pour lisibilité.
 # Toutes reçoivent `engine` en paramètre (injection de dépendance).
 # ============================================================
+# v1.2 (2026-05-17) — sync_prix_logic : retry 3× avec backoff sur
+#                     réponses vides yfinance + audit post-sync des
+#                     tickers en retard de plus de 3 jours.
+# ============================================================
 
 import time
 import pandas as pd
@@ -56,6 +60,7 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None):
         total_chunks   = (len(all_tickers) - 1) // chunk_size + 1
         total_upserted = 0
         total_errors   = 0
+        skipped_empty  = []  # tickers laissés vides après 3 tentatives
 
         for i in range(0, len(all_tickers), chunk_size):
             chunk = all_tickers[i:i + chunk_size]
@@ -64,16 +69,39 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None):
             for ticker_symbol in chunk:
                 try:
                     print(f"   ⏳ {ticker_symbol}...")
-                    df_yf = yf.download(
-                        ticker_symbol,
-                        period=period,
-                        interval="1d",
-                        auto_adjust=True,
-                        progress=False,
-                        timeout=30
-                    )
+
+                    # --- Retry 3× avec backoff exponentiel ---
+                    # yfinance peut retourner df_yf.empty sur rate limit silencieux
+                    # ou timeout sans lever d'exception. Sans retry, le ticker est
+                    # perdu pour la journée et son absence du ranking n'est détectable
+                    # qu'a posteriori (cf. incident 2026-05-16 : 59 EU non synchronisés).
+                    df_yf = pd.DataFrame()
+                    for attempt in range(3):
+                        try:
+                            df_yf = yf.download(
+                                ticker_symbol,
+                                period=period,
+                                interval="1d",
+                                auto_adjust=True,
+                                progress=False,
+                                timeout=30
+                            )
+                            if not df_yf.empty:
+                                break
+                            wait = 2 ** attempt   # 1, 2, 4 secondes
+                            print(f"   ⚠️ {ticker_symbol} : réponse vide tentative "
+                                  f"{attempt+1}/3, retry dans {wait}s...")
+                            time.sleep(wait)
+                        except Exception as e_dl:
+                            wait = 2 ** attempt
+                            print(f"   ⚠️ {ticker_symbol} : exception {e_dl} tentative "
+                                  f"{attempt+1}/3, retry dans {wait}s...")
+                            time.sleep(wait)
 
                     if df_yf.empty:
+                        print(f"   ❌ {ticker_symbol} : aucune donnée après 3 tentatives — SKIP")
+                        skipped_empty.append(ticker_symbol)
+                        total_errors += 1
                         continue
 
                     df_yf = df_yf.reset_index()
@@ -133,6 +161,38 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None):
             total_upserted += chunk_upserted
             print(f"   🟢 Chunk {i // chunk_size + 1}/{total_chunks} — "
                   f"{chunk_upserted} lignes upsertées.")
+
+        # --- Audit post-sync : tickers en retard ---
+        # Détecte les tickers dont la dernière date en base est antérieure à J-3
+        # (week-end inclus). Permet de repérer immédiatement les angles morts comme
+        # l'incident du 2026-05-16 (59 tickers EU au 14/05 au lieu du 15/05).
+        try:
+            today_d = pd.Timestamp.today().date()
+            ref_d   = today_d - pd.Timedelta(days=3)
+            with engine.connect() as conn:
+                stale = conn.execute(text("""
+                    SELECT ticker, MAX(date) AS last_date
+                    FROM actions_prix_historique
+                    GROUP BY ticker
+                    HAVING MAX(date) < :ref
+                    ORDER BY MAX(date) ASC, ticker ASC
+                """), {"ref": ref_d}).fetchall()
+            if stale:
+                print(f"⚠️ Audit post-sync : {len(stale)} ticker(s) en retard "
+                      f"(dernière date < {ref_d}) :")
+                for t, d in stale[:30]:
+                    print(f"      {t} → {d}")
+                if len(stale) > 30:
+                    print(f"      ... et {len(stale) - 30} autre(s)")
+            else:
+                print(f"✅ Audit post-sync : tous les tickers à jour (≥ {ref_d}).")
+        except Exception as e_audit:
+            print(f"⚠️ Audit post-sync échoué : {e_audit}")
+
+        if skipped_empty:
+            print(f"📋 Tickers skippés (3 tentatives vides) : {len(skipped_empty)} → "
+                  f"{', '.join(skipped_empty[:30])}"
+                  f"{'...' if len(skipped_empty) > 30 else ''}")
 
         print(f"🏁 Sync prix terminée — {total_upserted} lignes upsertées, "
               f"{total_errors} erreurs.")
