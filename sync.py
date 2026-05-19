@@ -8,6 +8,11 @@
 # v1.2 (2026-05-17) — sync_prix_logic : retry 3× avec backoff sur
 #                     réponses vides yfinance + audit post-sync des
 #                     tickers en retard de plus de 3 jours.
+# v1.3 (2026-05-19) — sync_secteurs_etf_logic : MM50 calculée sur
+#                     l'historique complet (concat base + yfinance)
+#                     au lieu de la fenêtre téléchargée seule.
+#                     min_periods=50 strict (NULL si fenêtre < 50).
+#                     Correction du biais "ratio_vs_mm50 aplati vers 1".
 # ============================================================
 
 import time
@@ -502,18 +507,73 @@ def sync_secteurs_etf_logic(engine, full: bool = False):
                     continue
 
                 df_indice["date"] = pd.to_datetime(df_indice["date"]).dt.date
-                df_merged         = df_etf.merge(df_indice, on="date", how="inner")
 
-                # Calcul ratio de force relative
+                # ============================================================
+                # FIX v1.3 (2026-05-19) — MM50 sur historique complet
+                # ============================================================
+                # En mode incrémental, df_etf ne contient que ~22 jours. Calculer
+                # la MM50 dessus produit en réalité une MM<50 avec min_periods=1,
+                # ce qui aplatit le ratio vers 1.0 et bascule des ETF borderline
+                # côté en_force=true à tort (cf. diagnostic 2026-05-19 : 6% de
+                # classifications erronées, biaisées vers en_force=true).
+                #
+                # Solution : charger l'historique complet ETF en base, le merger
+                # avec les nouvelles données yfinance, calculer la MM50 sur
+                # l'ensemble, puis ne ré-écrire que les lignes correspondant à
+                # la fenêtre téléchargée.
+                # ============================================================
+                with engine.connect() as conn:
+                    df_etf_hist = pd.read_sql(text("""
+                        SELECT date, prix_cloture, prix_ajuste, volume
+                        FROM secteurs_etf_prix
+                        WHERE ticker_etf = :etf
+                        ORDER BY date ASC
+                    """), conn, params={"etf": etf_ticker})
+
+                if not df_etf_hist.empty:
+                    df_etf_hist["date"] = pd.to_datetime(df_etf_hist["date"]).dt.date
+                    # Concat hist + yfinance, dédupliquer (yfinance écrase l'historique
+                    # sur les dates communes — données plus fraîches/corrigées)
+                    df_etf_full = pd.concat([df_etf_hist, df_etf], ignore_index=True)
+                    df_etf_full = df_etf_full.drop_duplicates(
+                        subset=["date"], keep="last"
+                    ).sort_values("date").reset_index(drop=True)
+                else:
+                    # Premier sync de cet ETF (ne devrait arriver qu'à l'init)
+                    df_etf_full = df_etf.copy()
+
+                # Dates effectivement présentes dans la fenêtre téléchargée
+                # (= dates à ré-upserter dans secteurs_etf_prix)
+                dates_to_write = set(df_etf["date"].tolist())
+
+                # Merge avec indice sur l'historique complet
+                df_merged = df_etf_full.merge(df_indice, on="date", how="inner")
+
+                if df_merged.empty:
+                    print(f"   ⚠️ {etf_ticker} — merge ETF+indice vide, skip.")
+                    continue
+
+                # Calcul ratio de force relative (base = première date commune)
                 first_etf = df_merged["prix_ajuste"].iloc[0]
                 first_idx = df_merged["prix_indice"].iloc[0]
                 df_merged["ratio_force_relative"] = (
                     (df_merged["prix_ajuste"] / first_etf) /
                     (df_merged["prix_indice"] / first_idx)
                 )
-                df_merged["mm50_ratio"]        = df_merged["ratio_force_relative"].rolling(50, min_periods=1).mean()
+                # min_periods=50 strict : NULL avant 50 points (au lieu de fenêtre tronquée
+                # biaisée vers la valeur courante).
+                df_merged["mm50_ratio"]        = df_merged["ratio_force_relative"].rolling(50, min_periods=50).mean()
                 df_merged["ratio_vs_mm50"]     = df_merged["ratio_force_relative"] / df_merged["mm50_ratio"]
                 df_merged["en_force_relative"] = df_merged["ratio_vs_mm50"] > 1.0
+
+                # Restreindre l'upsert aux seules dates téléchargées
+                df_merged = df_merged[df_merged["date"].isin(dates_to_write)]
+                # Exclure les lignes où la MM50 n'est pas encore définie
+                # (cas init : 49 premières dates de l'historique)
+                df_merged = df_merged.dropna(subset=["mm50_ratio"])
+
+                # ticker_etf manquant pour les lignes venues de l'historique base
+                df_merged["ticker_etf"] = etf_ticker
 
                 # Upsert
                 cols_to_save = [
@@ -546,9 +606,15 @@ def sync_secteurs_etf_logic(engine, full: bool = False):
                             updated_at           = CURRENT_TIMESTAMP
                     """), records)
 
-                statut_fr = "OUI ✅" if df_merged["en_force_relative"].iloc[-1] else "NON ❌"
-                ratio_val = df_merged["ratio_vs_mm50"].iloc[-1]
-                print(f"   ✅ {etf_ticker} — {len(records)} jours | Force relative : {statut_fr} | ratio_vs_mm50 = {ratio_val:.3f}")
+                if df_merged.empty:
+                    print(f"   ⚠️ {etf_ticker} — aucune ligne ré-upsertée "
+                          f"(historique < 50 points ?).")
+                else:
+                    statut_fr = "OUI ✅" if df_merged["en_force_relative"].iloc[-1] else "NON ❌"
+                    ratio_val = df_merged["ratio_vs_mm50"].iloc[-1]
+                    print(f"   ✅ {etf_ticker} — {len(records)} jours | "
+                          f"Force relative : {statut_fr} | "
+                          f"ratio_vs_mm50 = {ratio_val:.3f}")
                 time.sleep(1)
 
             except Exception as e:
