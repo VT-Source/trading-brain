@@ -5,7 +5,7 @@
 # Streamlit dashboard pour visualiser :
 #   - Ranking momentum journalier live (signaux v4.1)
 #   - Régime macro & force sectorielle
-#   - Résultats backtest historiques
+#   - Résultats backtest historiques.
 #
 # Lancement local  : streamlit run dashboard.py
 # Lancement Railway: voir Procfile / commande de déploiement
