@@ -29,7 +29,7 @@ from sqlalchemy import text
 # SYNC PRIX QUOTIDIEN (remplace n8n)
 # ============================================================
 
-def sync_prix_logic(engine, full: bool = False, period_override: str = None):
+def sync_prix_logic(engine, full: bool = False, period_override: str = None, tickers_filter: list = None):
     """
     Télécharge les prix OHLCV depuis yfinance et upsert dans actions_prix_historique.
     Remplace le workflow n8n désactivé le 2026-04-11.
@@ -52,20 +52,25 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None):
     print(f"🔄 Sync prix quotidien — mode {mode}...")
 
     try:
-        # 1. Liste des tickers — UNION de tickers_info (univers déclaré) et
-        #    actions_prix_historique (univers déjà collecté).
-        #    L'union garantit qu'un ticker fraîchement ajouté à tickers_info,
-        #    encore sans historique de prix, est bien collecté — tout en gardant
-        #    les tickers historiques même s'ils manquaient dans tickers_info.
-        #    (v1.4 — corrige le besoin d'amorçage manuel des nouveaux tickers)
-        with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT ticker FROM tickers_info
-                UNION
-                SELECT DISTINCT ticker FROM actions_prix_historique
-                ORDER BY ticker
-            """))
-            all_tickers = [row[0] for row in result]
+        # 1. Liste des tickers
+        if tickers_filter:
+            # Ciblage explicite : ne synchronise que les tickers demandés
+            # (ex. amorçage de nouveaux tickers sans relancer tout l'univers).
+            all_tickers = sorted(set(tickers_filter))
+            print(f"   🎯 Ciblage explicite : {len(all_tickers)} ticker(s).")
+        else:
+            # UNION de tickers_info (univers déclaré) et actions_prix_historique
+            # (univers déjà collecté) — garantit la collecte des nouveaux tickers
+            # tout en gardant les tickers historiques absents de tickers_info.
+            # (v1.4)
+            with engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT ticker FROM tickers_info
+                    UNION
+                    SELECT DISTINCT ticker FROM actions_prix_historique
+                    ORDER BY ticker
+                """))
+                all_tickers = [row[0] for row in result]
 
         if not all_tickers:
             print("⚠️ Aucun ticker en base.")
