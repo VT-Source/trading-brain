@@ -381,14 +381,25 @@ async def trigger_training(background_tasks: BackgroundTasks):
 
 # --- Endpoint sync prix quotidien (remplace n8n) ---
 @app.get("/sync-prix")
-async def trigger_sync_prix(background_tasks: BackgroundTasks, full: bool = False, period: str = None):
+async def trigger_sync_prix(background_tasks: BackgroundTasks, full: bool = False, period: str = None, tickers: str = None):
     """
     Synchronise les prix OHLCV depuis yfinance → actions_prix_historique.
     - full=False (défaut) : 30 derniers jours — appel quotidien scheduler
     - full=True           : 5 ans d'historique — rattrapage manuel
+    - tickers             : liste optionnelle séparée par des virgules pour
+                            cibler uniquement certains tickers (amorçage,
+                            re-sync ponctuel).
+                            Ex: /sync-prix?full=true&tickers=DELL,NOW,GS
     """
-    background_tasks.add_task(sync_prix_logic, engine, full=full, period_override=period)
-    mode = f"custom ({period})" if period else ("COMPLÈTE (5 ans)" if full else "incrémentale (30j)")
+    tickers_filter = [t.strip() for t in tickers.split(",") if t.strip()] if tickers else None
+    background_tasks.add_task(
+        sync_prix_logic, engine,
+        full=full, period_override=period, tickers_filter=tickers_filter
+    )
+    if tickers_filter:
+        mode = f"ciblé ({len(tickers_filter)} tickers, {'5 ans' if full else '30j'})"
+    else:
+        mode = f"custom ({period})" if period else ("COMPLÈTE (5 ans)" if full else "incrémentale (30j)")
     return {
         "status" : "processing",
         "message": f"Sync prix lancée en arrière-plan — mode {mode}."
