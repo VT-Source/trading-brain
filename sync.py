@@ -13,6 +13,10 @@
 #                     au lieu de la fenêtre téléchargée seule.
 #                     min_periods=50 strict (NULL si fenêtre < 50).
 #                     Correction du biais "ratio_vs_mm50 aplati vers 1".
+# v1.4 (2026-05-31) — sync_prix_logic : liste des tickers = UNION
+#                     tickers_info ∪ actions_prix_historique. Un nouveau
+#                     ticker ajouté à tickers_info est désormais collecté
+#                     automatiquement (plus d'amorçage manuel requis).
 # ============================================================
 
 import time
@@ -48,11 +52,19 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None):
     print(f"🔄 Sync prix quotidien — mode {mode}...")
 
     try:
-        # 1. Liste des tickers depuis la base
+        # 1. Liste des tickers — UNION de tickers_info (univers déclaré) et
+        #    actions_prix_historique (univers déjà collecté).
+        #    L'union garantit qu'un ticker fraîchement ajouté à tickers_info,
+        #    encore sans historique de prix, est bien collecté — tout en gardant
+        #    les tickers historiques même s'ils manquaient dans tickers_info.
+        #    (v1.4 — corrige le besoin d'amorçage manuel des nouveaux tickers)
         with engine.connect() as conn:
-            result = conn.execute(text(
-                "SELECT DISTINCT ticker FROM actions_prix_historique ORDER BY ticker"
-            ))
+            result = conn.execute(text("""
+                SELECT ticker FROM tickers_info
+                UNION
+                SELECT DISTINCT ticker FROM actions_prix_historique
+                ORDER BY ticker
+            """))
             all_tickers = [row[0] for row in result]
 
         if not all_tickers:
