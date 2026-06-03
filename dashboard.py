@@ -603,7 +603,14 @@ elif page == "💼 Portefeuille":
                             st.error(ai_all.get("error", "Erreur"))
                 
                 st.divider()
-                
+
+                # Données complètes des positions ouvertes (pré-remplissage édition)
+                _open_full = api_get("/positions", params={"status": "open"})
+                _pos_by_id = {
+                    p["id"]: p
+                    for p in (_open_full.get("positions", []) if _open_full else [])
+                }
+
                 # --- Détail par position ---
                 for pos in eval_data["positions"]:
                     alerte = pos.get("alerte_globale", "INCONNU")
@@ -737,6 +744,66 @@ elif page == "💼 Portefeuille":
                                     f"{pos_avis.get('tokens_used', '?')} tokens — "
                                     f"{pos_avis.get('generated_at', '?')[:16]}"
                                 )
+                        # --- Bouton modifier ---
+                        with st.expander("✏️ Modifier cette position"):
+                            _full = _pos_by_id.get(pos["id"], {})
+                            try:
+                                _da_default = datetime.strptime(
+                                    _full.get("date_achat", ""), "%Y-%m-%d"
+                                ).date()
+                            except Exception:
+                                _da_default = date.today()
+                            _prix_ed = max(float(_full.get("prix_achat")
+                                                 or pos.get("prix_achat") or 0.01), 0.01)
+                            _qte_ed = float(_full.get("quantite")
+                                            or pos.get("quantite") or 1.0)
+
+                            with st.form(key=f"edit_{pos['id']}"):
+                                ec1, ec2 = st.columns(2)
+                                e_prix = ec1.number_input(
+                                    "Prix d'achat (unitaire)",
+                                    min_value=0.01, step=0.01,
+                                    value=_prix_ed, key=f"ep_{pos['id']}",
+                                )
+                                e_qte = ec2.number_input(
+                                    "Quantité",
+                                    min_value=0.01, step=0.01,
+                                    value=_qte_ed, key=f"eq_{pos['id']}",
+                                )
+                                e_date = st.date_input(
+                                    "Date d'achat",
+                                    value=_da_default, key=f"ed_{pos['id']}",
+                                )
+                                e_comm = st.text_input(
+                                    "Commentaire",
+                                    value=_full.get("commentaire") or "",
+                                    key=f"ec_{pos['id']}",
+                                )
+
+                                if st.form_submit_button(
+                                    "Enregistrer les corrections",
+                                    use_container_width=True,
+                                ):
+                                    try:
+                                        resp = requests.patch(
+                                            f"{API_BASE}/positions/{pos['id']}",
+                                            json={
+                                                "prix_achat":  e_prix,
+                                                "quantite":    e_qte,
+                                                "date_achat":  str(e_date),
+                                                "commentaire": e_comm or None,
+                                            },
+                                            timeout=15,
+                                        )
+                                        result = resp.json()
+                                        if result.get("status") == "ok":
+                                            st.success("✅ Position modifiée.")
+                                            st.cache_data.clear()
+                                            st.rerun()
+                                        else:
+                                            st.error(result.get("error", "Erreur inconnue"))
+                                    except Exception as e:
+                                        st.error(f"Erreur : {e}")
                         
                         # --- Bouton fermer ---
                         with st.expander("🔒 Fermer cette position"):
