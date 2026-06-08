@@ -532,7 +532,7 @@ def macro_status():
             df_indices = pd.read_sql(text("""
                 SELECT ticker_indice, date, prix_ajuste
                 FROM indices_prix
-                WHERE ticker_indice IN ('^GSPC', '^STOXX')
+                WHERE ticker_indice IN ('^GSPC', '^STOXX', '^KS11')
                 ORDER BY ticker_indice, date ASC
             """), conn)
  
@@ -545,6 +545,7 @@ def macro_status():
         zone_map = {
             "^GSPC":  {"zone": "US", "nom": "S&P 500"},
             "^STOXX": {"zone": "EU", "nom": "STOXX Europe 600"},
+            "^KS11":  {"zone": "KR", "nom": "KOSPI Composite"},
         }
  
         for ticker_indice, info in zone_map.items():

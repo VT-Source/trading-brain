@@ -135,7 +135,9 @@ def load_secteur_mapping() -> dict[str, dict]:
         # APTV/CB/MTD (CH), LIN/WTW (UK) — sociétés US-listed malgré leur
         # incorporation européenne pour raisons fiscales.
         is_us_listed = '.' not in ticker
-        if is_us_listed:
+        if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+            zone_priority = ['KR']          # Corée : pas de fallback US/EU
+        elif is_us_listed:
             zone_priority = ['US', 'EU']
         elif pays == 'Belgium' or pays in PAYS_EU:
             zone_priority = ['EU', 'US']
@@ -190,7 +192,7 @@ def load_macro_data() -> dict[str, pd.DataFrame]:
         US → ^GSPC (S&P 500)
         EU → ^STOXX (STOXX Europe 600)
     """
-    ZONE_INDEX = {"US": "^GSPC", "EU": "^STOXX"}
+    ZONE_INDEX = {"US": "^GSPC", "EU": "^STOXX", "KR": "^KS11"}
 
     result = {}
     for zone, idx_ticker in ZONE_INDEX.items():
@@ -234,7 +236,7 @@ def get_macro_regime(
 
 
 def get_ticker_zone(ticker: str, secteur_mapping: dict) -> str:
-    """Retourne la zone principale d'un ticker (US ou EU)."""
+    """Retourne la zone principale d'un ticker (US ou EU ou KR)."""
     info = secteur_mapping.get(ticker)
     if not info:
         return "US"
