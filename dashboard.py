@@ -534,7 +534,7 @@ elif page == "🌍 Macro & Secteurs":
             )
 
             # Split by zone
-            for zone in ["US", "EU"]:
+            for zone in ["US", "EU", "KR"]:
                 zone_df = df_sect[df_sect["zone"] == zone]
                 if not zone_df.empty:
                     st.markdown(f"**{zone}** — {len(zone_df)} secteurs en force")
