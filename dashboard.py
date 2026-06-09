@@ -561,6 +561,93 @@ elif page == "💼 Portefeuille":
 
     st.markdown("# 💼 Portefeuille")
 
+# --- Sélecteur de portefeuille ---
+    pf_data = api_get("/portefeuilles")
+    portefeuilles = pf_data.get("portefeuilles", []) if pf_data else []
+
+    if not portefeuilles:
+        st.error("Impossible de charger les portefeuilles — vérifie l'API (/portefeuilles).")
+        st.stop()
+
+    pf_labels = {
+        f"💼 {p['nom']} — {p['nb_ouvertes']} ouverte(s)": p["id"]
+        for p in portefeuilles
+    }
+    pf_label = st.selectbox("Portefeuille", list(pf_labels.keys()), label_visibility="collapsed")
+    pf_id  = pf_labels[pf_label]
+    pf_nom = next(p["nom"] for p in portefeuilles if p["id"] == pf_id)
+
+    # --- Gestion des portefeuilles ---
+    with st.expander("⚙️ Gérer les portefeuilles"):
+        g1, g2 = st.columns(2)
+
+        # Créer
+        with g1:
+            st.markdown("**➕ Créer**")
+            new_nom = st.text_input("Nom du nouveau portefeuille", key="pf_new_nom")
+            if st.button("Créer", use_container_width=True, key="pf_create_btn"):
+                if not new_nom.strip():
+                    st.error("Nom vide.")
+                else:
+                    try:
+                        r = requests.post(f"{API_BASE}/portefeuilles",
+                                          json={"nom": new_nom.strip()}, timeout=15)
+                        res = r.json()
+                        if res.get("status") == "ok":
+                            st.success(res["message"])
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(res.get("error", "Erreur inconnue"))
+                    except Exception as e:
+                        st.error(f"Erreur : {e}")
+
+        # Renommer / activer-désactiver
+        with g2:
+            st.markdown("**✏️ Modifier**")
+            pf_all_data = api_get("/portefeuilles", params={"actifs_only": False})
+            pf_all = pf_all_data.get("portefeuilles", []) if pf_all_data else []
+            edit_map = {
+                f"{p['nom']} ({'actif' if p['actif'] else 'désactivé'})": p
+                for p in pf_all
+            }
+            edit_label = st.selectbox("Portefeuille à modifier",
+                                      list(edit_map.keys()), key="pf_edit_sel")
+            pf_edit = edit_map[edit_label]
+
+            rename_nom = st.text_input("Nouveau nom", value=pf_edit["nom"], key="pf_edit_nom")
+            b1, b2 = st.columns(2)
+            if b1.button("Renommer", use_container_width=True, key="pf_rename_btn"):
+                try:
+                    r = requests.patch(f"{API_BASE}/portefeuilles/{pf_edit['id']}",
+                                       json={"nom": rename_nom.strip()}, timeout=15)
+                    res = r.json()
+                    if res.get("status") == "ok":
+                        st.success("Renommé.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(res.get("error", "Erreur inconnue"))
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+
+            toggle_lbl = "Désactiver" if pf_edit["actif"] else "Réactiver"
+            if b2.button(toggle_lbl, use_container_width=True, key="pf_toggle_btn"):
+                try:
+                    r = requests.patch(f"{API_BASE}/portefeuilles/{pf_edit['id']}",
+                                       json={"actif": not pf_edit["actif"]}, timeout=15)
+                    res = r.json()
+                    if res.get("status") == "ok":
+                        st.success(f"{toggle_lbl} : OK.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(res.get("error", "Erreur inconnue"))
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+
+    st.divider()
+
     tab_ouvertes, tab_ouvrir, tab_historique = st.tabs([
         "📊 Positions ouvertes", "➕ Ouvrir une position", "📜 Historique fermées"
     ])
@@ -572,7 +659,7 @@ elif page == "💼 Portefeuille":
         st.markdown("### 📊 Positions ouvertes — Conditions de sortie v4.1")
 
         with st.spinner("Évaluation des conditions de sortie..."):
-            eval_data = api_get("/positions-ouvertes-eval")
+            eval_data = api_get("/positions-ouvertes-eval", params={"portefeuille_id": pf_id})
 
         if eval_data and "positions" in eval_data:
             nb_pos = eval_data.get("nb_positions", 0)
@@ -605,7 +692,7 @@ elif page == "💼 Portefeuille":
                 st.divider()
 
                 # Données complètes des positions ouvertes (pré-remplissage édition)
-                _open_full = api_get("/positions", params={"status": "open"})
+                _open_full = api_get("/positions", params={"status": "open", "portefeuille_id": pf_id})
                 _pos_by_id = {
                     p["id"]: p
                     for p in (_open_full.get("positions", []) if _open_full else [])
@@ -865,7 +952,7 @@ elif page == "💼 Portefeuille":
     # ----------------------------------------------------------
     with tab_ouvrir:
         st.markdown("### ➕ Ouvrir une nouvelle position")
-        st.caption("Saisie manuelle après exécution sur ton broker")
+        st.caption(f"Saisie manuelle après exécution sur ton broker — portefeuille : **{pf_nom}**")
 
         # Charger la liste des tickers (cache 1h, évite de spammer l'API
         # à chaque rerun du formulaire)
@@ -952,6 +1039,7 @@ elif page == "💼 Portefeuille":
                                 "date_achat":  str(date_achat),
                                 "source":      source,
                                 "commentaire": commentaire or None,
+                                "portefeuille_id": pf_id,
                             },
                             timeout=15,
                         )
@@ -972,7 +1060,7 @@ elif page == "💼 Portefeuille":
     with tab_historique:
         st.markdown("### 📜 Positions fermées")
 
-        closed_data = api_get("/positions", params={"status": "closed"})
+        closed_data = api_get("/positions", params={"status": "closed", "portefeuille_id": pf_id})
 
         if closed_data and "positions" in closed_data:
             fermees = closed_data["positions"]
