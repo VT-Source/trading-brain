@@ -8,7 +8,7 @@
 #   - Résultats backtest historiques.
 #
 # Lancement local  : streamlit run dashboard.py
-# Lancement Railway: voir Procfile / commande de déploiement
+# Lancement Railway: voir Procfile / commande de déploiement.
 # ============================================================
 
 import os
