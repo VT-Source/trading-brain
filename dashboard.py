@@ -263,7 +263,7 @@ if page == "📊 Ranking":
         with col3:
             zones = []
             for zone, bull in macro_regime.items():
-                zones.append(f"{zone}{'🟢' if bull else '🔴'}"
+                zones.append(f"{zone}{'🟢' if bull else '🔴'}")
             st.metric("Macro", " ".join(zones) if zones else "—")
         with col4:
             calcul_date = meta.get("date_calcul", "—")
