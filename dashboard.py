@@ -255,7 +255,7 @@ if page == "📊 Ranking":
         macro_regime = data.get("macro_regime", {})
 
         # --- Metrics row ---
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4 = st.columns([1, 1, 1.5, 1.2])
         with col1:
             st.metric("Tickers éligibles", meta.get("nb_eligible", "—"))
         with col2:
@@ -263,8 +263,8 @@ if page == "📊 Ranking":
         with col3:
             zones = []
             for zone, bull in macro_regime.items():
-                zones.append(f"{zone} {'🟢' if bull else '🔴'}")
-            st.metric("Macro", " / ".join(zones) if zones else "—")
+                zones.append(f"{zone}{'🟢' if bull else '🔴'}"
+            st.metric("Macro", " ".join(zones) if zones else "—")
         with col4:
             calcul_date = meta.get("date_calcul", "—")
             st.metric("Données du", meta.get("data_date", "—"),
