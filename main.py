@@ -17,6 +17,8 @@ from models_api import (
     PositionOpenPayload,
     PositionClosePayload,
     PositionEditPayload,
+    PortefeuilleCreatePayload,
+    PortefeuilleEditPayload,
 )
 from sync import (
     sync_prix_logic,
@@ -76,7 +78,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.6.0"
+APP_VERSION = "6.10.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -820,6 +822,143 @@ def search_tickers(q: str = "", limit: int = 500):
     except Exception as e:
         return {"error": str(e)}
 
+# ============================================================
+# ENDPOINTS — PORTEFEUILLES (multi-portefeuille, 2026-06-09)
+# ============================================================
+
+@app.get("/portefeuilles")
+def list_portefeuilles(actifs_only: bool = True):
+    """
+    Liste les portefeuilles avec compteur de positions ouvertes.
+    - ?actifs_only=true (défaut) → uniquement les actifs (selectbox dashboard)
+    - ?actifs_only=false         → tous (écran de gestion)
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    where = "WHERE pf.actif = TRUE" if actifs_only else ""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT pf.id, pf.nom, pf.actif,
+                       COUNT(p.id) FILTER (WHERE p.statut = 'OUVERT') AS nb_ouvertes,
+                       COUNT(p.id) FILTER (WHERE p.statut = 'FERMÉ')  AS nb_fermees
+                FROM portefeuilles pf
+                LEFT JOIN positions p ON p.portefeuille_id = pf.id
+                {where}
+                GROUP BY pf.id, pf.nom, pf.actif
+                ORDER BY pf.id
+            """)).fetchall()
+
+        return {
+            "nb_portefeuilles": len(rows),
+            "portefeuilles": [
+                {
+                    "id":          r[0],
+                    "nom":         r[1],
+                    "actif":       bool(r[2]),
+                    "nb_ouvertes": int(r[3]),
+                    "nb_fermees":  int(r[4]),
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/portefeuilles")
+def create_portefeuille(payload: PortefeuilleCreatePayload):
+    """Crée un nouveau portefeuille (nom unique, max 50 caractères)."""
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    nom = (payload.nom or "").strip()
+    if not nom:
+        return {"error": "Nom de portefeuille manquant"}
+    if len(nom) > 50:
+        return {"error": "Nom trop long (max 50 caractères)"}
+
+    try:
+        with engine.begin() as conn:
+            doublon = conn.execute(text("""
+                SELECT id, actif FROM portefeuilles WHERE LOWER(nom) = LOWER(:nom)
+            """), {"nom": nom}).fetchone()
+            if doublon:
+                etat = "actif" if doublon[1] else "désactivé"
+                return {"error": f"Un portefeuille '{nom}' existe déjà (id={doublon[0]}, {etat})"}
+
+            row = conn.execute(text("""
+                INSERT INTO portefeuilles (nom) VALUES (:nom)
+                RETURNING id
+            """), {"nom": nom}).fetchone()
+
+        return {"status": "ok", "id": row[0], "nom": nom,
+                "message": f"Portefeuille '{nom}' créé (id={row[0]})"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.patch("/portefeuilles/{portefeuille_id}")
+def edit_portefeuille(portefeuille_id: int, payload: PortefeuilleEditPayload):
+    """
+    Renomme et/ou (dés)active un portefeuille.
+    Garde-fou : désactivation refusée s'il reste des positions OUVERTES.
+    Jamais de DELETE — l'historique des positions fermées reste rattaché.
+    """
+    if engine is None:
+        return {"error": "engine non connecté"}
+
+    if payload.nom is None and payload.actif is None:
+        return {"error": "Aucun champ à modifier (nom et/ou actif)"}
+
+    try:
+        with engine.begin() as conn:
+            check = conn.execute(text("""
+                SELECT nom, actif FROM portefeuilles WHERE id = :pid
+            """), {"pid": portefeuille_id}).fetchone()
+            if not check:
+                return {"error": f"Portefeuille {portefeuille_id} introuvable"}
+
+            updates, params = [], {"pid": portefeuille_id}
+
+            if payload.nom is not None:
+                nom = payload.nom.strip()
+                if not nom:
+                    return {"error": "Nom vide"}
+                if len(nom) > 50:
+                    return {"error": "Nom trop long (max 50 caractères)"}
+                doublon = conn.execute(text("""
+                    SELECT id FROM portefeuilles
+                    WHERE LOWER(nom) = LOWER(:nom) AND id != :pid
+                """), {"nom": nom, "pid": portefeuille_id}).fetchone()
+                if doublon:
+                    return {"error": f"Un autre portefeuille s'appelle déjà '{nom}'"}
+                updates.append("nom = :nom")
+                params["nom"] = nom
+
+            if payload.actif is not None:
+                if payload.actif is False:
+                    nb_ouvertes = conn.execute(text("""
+                        SELECT COUNT(*) FROM positions
+                        WHERE portefeuille_id = :pid AND statut = 'OUVERT'
+                    """), {"pid": portefeuille_id}).scalar()
+                    if nb_ouvertes > 0:
+                        return {"error": f"Portefeuille '{check[0]}' a {nb_ouvertes} "
+                                         f"position(s) ouverte(s) — ferme-les avant de le désactiver"}
+                updates.append("actif = :actif")
+                params["actif"] = payload.actif
+
+            updates.append("updated_at = NOW()")
+            conn.execute(text(f"""
+                UPDATE portefeuilles SET {', '.join(updates)} WHERE id = :pid
+            """), params)
+
+        return {"status": "ok", "id": portefeuille_id,
+                "updated": [u.split(" = ")[0] for u in updates if u != "updated_at = NOW()"]}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/positions")
 def open_position(payload: PositionOpenPayload):
     """
@@ -871,19 +1010,28 @@ def open_position(payload: PositionOpenPayload):
                              f"à l'univers via /sync-prix puis /sync-metadata."
                 }
 
+            pf = conn.execute(text("""
+                SELECT nom, actif FROM portefeuilles WHERE id = :pid
+            """), {"pid": payload.portefeuille_id}).fetchone()
+            if not pf:
+                return {"error": f"Portefeuille {payload.portefeuille_id} introuvable"}
+            if not pf[1]:
+                return {"error": f"Portefeuille '{pf[0]}' désactivé — impossible d'y ouvrir une position"}
+            
             result = conn.execute(text("""
                 INSERT INTO positions (ticker, date_achat, prix_achat, quantite,
-                                       source, commentaire)
+                                       source, commentaire, portefeuille_id)
                 VALUES (:ticker, :date_achat, :prix_achat, :quantite,
-                        :source, :commentaire)
+                        :source, :commentaire, :portefeuille_id)
                 RETURNING id, montant_investi
             """), {
-                "ticker":      ticker,
-                "date_achat":  payload.date_achat,
-                "prix_achat":  payload.prix_achat,
-                "quantite":    payload.quantite,
-                "source":      payload.source,
-                "commentaire": payload.commentaire,
+                "ticker":          ticker,
+                "date_achat":      payload.date_achat,
+                "prix_achat":      payload.prix_achat,
+                "quantite":        payload.quantite,
+                "source":          payload.source,
+                "commentaire":     payload.commentaire,
+                "portefeuille_id": payload.portefeuille_id,
             })
             row = result.fetchone()
 
@@ -898,13 +1046,13 @@ def open_position(payload: PositionOpenPayload):
             "ticker":          ticker,
             "montant_investi": float(row[1]),
             "warning":         warning,
-            "message":         f"Position ouverte : {payload.quantite} × {ticker} à {payload.prix_achat}",
+            "message":         f"Position ouverte ({pf[0]}) : {payload.quantite} × {ticker} à {payload.prix_achat}",
         }
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/positions")
-def list_positions(status: Optional[str] = None):
+def list_positions(status: Optional[str] = None, portefeuille_id: Optional[int] = None):
     """
     Liste les positions.
     - ?status=open   → positions ouvertes uniquement
@@ -915,11 +1063,16 @@ def list_positions(status: Optional[str] = None):
         return {"error": "engine non connecté"}
 
     try:
-        where_clause = ""
+        clauses = []
+        sql_params = {}
         if status == "open":
-            where_clause = "WHERE p.statut = 'OUVERT'"
+            clauses.append("p.statut = 'OUVERT'")
         elif status == "closed":
-            where_clause = "WHERE p.statut = 'FERMÉ'"
+            clauses.append("p.statut = 'FERMÉ'")
+        if portefeuille_id is not None:
+            clauses.append("p.portefeuille_id = :pid")
+            sql_params["pid"] = portefeuille_id
+        where_clause = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         with engine.connect() as conn:
             rows = conn.execute(text(f"""
@@ -928,11 +1081,12 @@ def list_positions(status: Optional[str] = None):
                        p.date_vente, p.prix_vente, p.raison_vente,
                        p.resultat_eur, p.resultat_pct,
                        p.source, p.commentaire,
-                       p.created_at, p.updated_at
+                       p.created_at, p.updated_at,
+                       p.portefeuille_id
                 FROM positions p
                 {where_clause}
                 ORDER BY p.date_achat DESC, p.id DESC
-            """)).fetchall()
+            """), sql_params).fetchall()
 
         positions = []
         for r in rows:
@@ -953,6 +1107,7 @@ def list_positions(status: Optional[str] = None):
                 "commentaire":     r[13],
                 "created_at":      str(r[14]),
                 "updated_at":      str(r[15]),
+                "portefeuille_id": r[16],
             })
 
         ouvertes = [p for p in positions if p["statut"] == "OUVERT"]
@@ -1086,7 +1241,7 @@ def close_position(position_id: int, payload: PositionClosePayload):
 # ============================================================
 
 @app.get("/positions-ouvertes-eval")
-def evaluate_open_positions():
+def evaluate_open_positions(portefeuille_id: Optional[int] = None):
     """
     Retourne toutes les positions ouvertes avec évaluation temps réel
     des 5 conditions de sortie v4.1.
@@ -1107,14 +1262,16 @@ def evaluate_open_positions():
 
     try:
         # 1. Charger les positions ouvertes
+        pf_clause = "AND portefeuille_id = :pid" if portefeuille_id is not None else ""
         with engine.connect() as conn:
-            rows = conn.execute(text("""
+            rows = conn.execute(text(f"""
                 SELECT id, ticker, date_achat, prix_achat, quantite,
-                       montant_investi, source, commentaire
+                       montant_investi, source, commentaire, portefeuille_id
                 FROM positions
                 WHERE statut = 'OUVERT'
+                {pf_clause}
                 ORDER BY date_achat ASC
-            """)).fetchall()
+            """), {"pid": portefeuille_id} if portefeuille_id is not None else {}).fetchall()
 
         if not rows:
             return {"nb_positions": 0, "positions": [], "date_evaluation": str(date.today())}
@@ -1131,6 +1288,7 @@ def evaluate_open_positions():
                 "montant_investi": float(r[5]) if r[5] else None,
                 "source":          r[6],
                 "commentaire":     r[7],
+                "portefeuille_id": r[8],
             })
             tickers_needed.add(r[1])
 
@@ -1312,6 +1470,7 @@ def evaluate_open_positions():
                 "data_date":       str(latest_date.date()),
                 "source":          pos["source"],
                 "commentaire":     pos["commentaire"],
+                "portefeuille_id": pos["portefeuille_id"],
             })
 
         # Stats globales
