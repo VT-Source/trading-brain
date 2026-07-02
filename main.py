@@ -25,6 +25,7 @@ from sync import (
     sync_metadata_logic,
     fill_high_low_logic,
     sync_secteurs_etf_logic,
+    sync_taux_change_logic,
 )
 from ai_opinion import generate_opinion, generate_opinions_batch, get_opinions, update_suivi_rendements, _migrate_avis_ia_columns
 from typing import Optional
@@ -78,7 +79,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.10.0"
+APP_VERSION = "6.11.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -252,6 +253,11 @@ def start_scheduler():
     if engine:
         _migrate_avis_ia_columns(engine)
 
+    # --- Taux de change (00h55, avant le pipeline data) — v6.11.0 ---
+    scheduler.add_job(lambda: _run_job("sync_fx", sync_taux_change_logic, engine, full=False),
+                      CronTrigger(day_of_week="mon-sat", hour=0, minute=55),
+                      id="sync_fx", replace_existing=True, misfire_grace_time=600)
+
     # --- Pipeline data nocturne (lun-sam) ---
     scheduler.add_job(lambda: _run_job("sync_prix", sync_prix_logic, engine, full=False),
                       CronTrigger(day_of_week="mon-sat", hour=1, minute=0),
@@ -284,7 +290,7 @@ def start_scheduler():
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
 
     scheduler.start()
-    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 7 jobs planifiés (Europe/Brussels)")
+    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 8 jobs planifiés (Europe/Brussels)")
 
 # ============================================================
 # ENDPOINTS API
@@ -425,6 +431,17 @@ async def trigger_sync_etf(background_tasks: BackgroundTasks, full: bool = False
         "status" : "processing",
         "message": f"Sync ETF sectoriels lancée en arrière-plan — mode {mode}."
     }
+
+@app.get("/sync-taux-change")
+async def trigger_sync_taux_change(background_tasks: BackgroundTasks, full: bool = False):
+    """
+    Synchronise les taux de change EUR -> devises de l'univers (taux_change).
+    - full=False (défaut) : 10 derniers jours — appel quotidien scheduler 00h55
+    - full=True           : 5 ans d'historique — amorçage / rattrapage
+    """
+    background_tasks.add_task(sync_taux_change_logic, engine, full)
+    return {"status": "processing",
+            "message": f"Sync taux de change lancée en arrière-plan (full={full})"}
 
 @app.get("/secteurs-actifs")
 def get_secteurs_actifs_endpoint():
@@ -959,6 +976,46 @@ def edit_portefeuille(portefeuille_id: int, payload: PortefeuilleEditPayload):
     except Exception as e:
         return {"error": str(e)}
 
+# ============================================================
+# HELPERS DEVISES (v6.11.0)
+# ============================================================
+
+def _get_taux_eur(conn, devise: str, date_ref=None) -> float:
+    """
+    taux_pour_1_eur le plus récent <= date_ref (ou le dernier connu).
+    Retourne 1.0 pour EUR. Lève ValueError si aucun taux en base.
+    """
+    if devise is None or devise == "EUR":
+        return 1.0
+    if date_ref is not None:
+        row = conn.execute(text("""
+            SELECT taux_pour_1_eur FROM taux_change
+            WHERE devise = :d AND date <= :dt
+            ORDER BY date DESC LIMIT 1
+        """), {"d": devise, "dt": date_ref}).fetchone()
+    else:
+        row = conn.execute(text("""
+            SELECT taux_pour_1_eur FROM taux_change
+            WHERE devise = :d ORDER BY date DESC LIMIT 1
+        """), {"d": devise}).fetchone()
+    if not row:
+        raise ValueError(f"Aucun taux en base pour {devise} — lance /sync-taux-change?full=true")
+    return float(row[0])
+
+
+def _get_devise_cotation(conn, ticker: str) -> str:
+    """Devise de cotation yfinance du ticker (tickers_info.monnaie + fallback suffixe)."""
+    row = conn.execute(text(
+        "SELECT monnaie FROM tickers_info WHERE ticker = :t"
+    ), {"t": ticker}).fetchone()
+    if row and row[0]:
+        return row[0]
+    for suf, dev in ((".KS", "KRW"), (".KQ", "KRW"), (".SW", "CHF"), (".ST", "SEK")):
+        if ticker.endswith(suf):
+            return dev
+    return "EUR" if "." in ticker else "USD"   # suffixe EU / sans suffixe = US (règle ADR)
+
+
 @app.post("/positions")
 def open_position(payload: PositionOpenPayload):
     """
@@ -1017,21 +1074,44 @@ def open_position(payload: PositionOpenPayload):
                 return {"error": f"Portefeuille {payload.portefeuille_id} introuvable"}
             if not pf[1]:
                 return {"error": f"Portefeuille '{pf[0]}' désactivé — impossible d'y ouvrir une position"}
-            
+
+            # --- Résolution devise de cotation + conversion (v6.11.0) ---
+            devise_cotation    = _get_devise_cotation(conn, ticker)
+            prix_cotation      = payload.prix_achat
+            prix_transaction   = None
+            devise_transaction = None
+            conv_msg = ""
+            if payload.devise_saisie and payload.devise_saisie != devise_cotation:
+                taux_saisie   = _get_taux_eur(conn, payload.devise_saisie, payload.date_achat)
+                taux_cotation = _get_taux_eur(conn, devise_cotation, payload.date_achat)
+                prix_cotation      = round(payload.prix_achat * taux_cotation / taux_saisie, 4)
+                prix_transaction   = payload.prix_achat
+                devise_transaction = payload.devise_saisie
+                conv_msg = (f" [converti : {payload.prix_achat} {payload.devise_saisie} "
+                            f"→ {prix_cotation} {devise_cotation}, taux du {payload.date_achat}]")
+
             result = conn.execute(text("""
                 INSERT INTO positions (ticker, date_achat, prix_achat, quantite,
-                                       source, commentaire, portefeuille_id)
+                                       source, commentaire, portefeuille_id,
+                                       devise_cotation, prix_transaction,
+                                       devise_transaction, montant_investi_eur)
                 VALUES (:ticker, :date_achat, :prix_achat, :quantite,
-                        :source, :commentaire, :portefeuille_id)
+                        :source, :commentaire, :portefeuille_id,
+                        :devise_cotation, :prix_transaction,
+                        :devise_transaction, :montant_investi_eur)
                 RETURNING id, montant_investi
             """), {
-                "ticker":          ticker,
-                "date_achat":      payload.date_achat,
-                "prix_achat":      payload.prix_achat,
-                "quantite":        payload.quantite,
-                "source":          payload.source,
-                "commentaire":     payload.commentaire,
-                "portefeuille_id": payload.portefeuille_id,
+                "ticker":              ticker,
+                "date_achat":          payload.date_achat,
+                "prix_achat":          prix_cotation,
+                "quantite":            payload.quantite,
+                "source":              payload.source,
+                "commentaire":         payload.commentaire,
+                "portefeuille_id":     payload.portefeuille_id,
+                "devise_cotation":     devise_cotation,
+                "prix_transaction":    prix_transaction,
+                "devise_transaction":  devise_transaction,
+                "montant_investi_eur": payload.montant_investi_eur,
             })
             row = result.fetchone()
 
@@ -1046,7 +1126,8 @@ def open_position(payload: PositionOpenPayload):
             "ticker":          ticker,
             "montant_investi": float(row[1]),
             "warning":         warning,
-            "message":         f"Position ouverte ({pf[0]}) : {payload.quantite} × {ticker} à {payload.prix_achat}",
+            "message":         f"Position ouverte ({pf[0]}) : {payload.quantite} × {ticker} "
+                               f"à {prix_cotation} {devise_cotation}{conv_msg}",
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1082,7 +1163,9 @@ def list_positions(status: Optional[str] = None, portefeuille_id: Optional[int] 
                        p.resultat_eur, p.resultat_pct,
                        p.source, p.commentaire,
                        p.created_at, p.updated_at,
-                       p.portefeuille_id
+                       p.portefeuille_id,
+                       p.devise_cotation, p.prix_transaction,
+                       p.devise_transaction, p.montant_investi_eur
                 FROM positions p
                 {where_clause}
                 ORDER BY p.date_achat DESC, p.id DESC
@@ -1108,6 +1191,10 @@ def list_positions(status: Optional[str] = None, portefeuille_id: Optional[int] 
                 "created_at":      str(r[14]),
                 "updated_at":      str(r[15]),
                 "portefeuille_id": r[16],
+                "devise_cotation":     r[17],
+                "prix_transaction":    float(r[18]) if r[18] is not None else None,
+                "devise_transaction":  r[19],
+                "montant_investi_eur": float(r[20]) if r[20] is not None else None,
             })
 
         ouvertes = [p for p in positions if p["statut"] == "OUVERT"]
@@ -1197,7 +1284,7 @@ def close_position(position_id: int, payload: PositionClosePayload):
     try:
         with engine.begin() as conn:
             check = conn.execute(text("""
-                SELECT statut, ticker, prix_achat, quantite
+                SELECT statut, ticker, prix_achat, quantite, devise_cotation
                 FROM positions WHERE id = :position_id
             """), {"position_id": position_id}).fetchone()
 
@@ -1205,6 +1292,17 @@ def close_position(position_id: int, payload: PositionClosePayload):
                 return {"error": f"Position {position_id} introuvable"}
             if check[0] != "OUVERT":
                 return {"error": f"Position {position_id} déjà fermée"}
+
+            # --- Conversion devise éventuelle (v6.11.0) ---
+            devise_cotation = check[4] or "EUR"
+            prix_vente_cot  = payload.prix_vente
+            conv_msg = ""
+            if payload.devise_saisie and payload.devise_saisie != devise_cotation:
+                taux_saisie   = _get_taux_eur(conn, payload.devise_saisie, payload.date_vente)
+                taux_cotation = _get_taux_eur(conn, devise_cotation, payload.date_vente)
+                prix_vente_cot = round(payload.prix_vente * taux_cotation / taux_saisie, 4)
+                conv_msg = (f" [converti : {payload.prix_vente} {payload.devise_saisie} "
+                            f"→ {prix_vente_cot} {devise_cotation}]")
 
             conn.execute(text("""
                 UPDATE positions
@@ -1217,21 +1315,23 @@ def close_position(position_id: int, payload: PositionClosePayload):
             """), {
                 "position_id":  position_id,
                 "date_vente":   payload.date_vente,
-                "prix_vente":   payload.prix_vente,
+                "prix_vente":   prix_vente_cot,
                 "raison_vente": payload.raison_vente,
             })
 
-        pnl_pct = round(100.0 * (payload.prix_vente - float(check[2])) / float(check[2]), 2)
-        pnl_eur = round((payload.prix_vente - float(check[2])) * float(check[3]), 2)
+        pnl_pct    = round(100.0 * (prix_vente_cot - float(check[2])) / float(check[2]), 2)
+        pnl_devise = round((prix_vente_cot - float(check[2])) * float(check[3]), 2)
 
         return {
-            "status":       "ok",
-            "id":           position_id,
-            "ticker":       check[1],
-            "resultat_pct": pnl_pct,
-            "resultat_eur": pnl_eur,
-            "raison_vente": payload.raison_vente,
-            "message":      f"Position {check[1]} fermée — {'+' if pnl_pct >= 0 else ''}{pnl_pct}% ({'+' if pnl_eur >= 0 else ''}{pnl_eur}€)",
+            "status":          "ok",
+            "id":              position_id,
+            "ticker":          check[1],
+            "resultat_pct":    pnl_pct,
+            "resultat_devise": pnl_devise,
+            "devise_cotation": devise_cotation,
+            "raison_vente":    payload.raison_vente,
+            "message":         f"Position {check[1]} fermée — {'+' if pnl_pct >= 0 else ''}{pnl_pct}% "
+                               f"({'+' if pnl_devise >= 0 else ''}{pnl_devise} {devise_cotation}){conv_msg}",
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1266,7 +1366,8 @@ def evaluate_open_positions(portefeuille_id: Optional[int] = None):
         with engine.connect() as conn:
             rows = conn.execute(text(f"""
                 SELECT id, ticker, date_achat, prix_achat, quantite,
-                       montant_investi, source, commentaire, portefeuille_id
+                       montant_investi, source, commentaire, portefeuille_id,
+                       devise_cotation, montant_investi_eur
                 FROM positions
                 WHERE statut = 'OUVERT'
                 {pf_clause}
@@ -1289,6 +1390,8 @@ def evaluate_open_positions(portefeuille_id: Optional[int] = None):
                 "source":          r[6],
                 "commentaire":     r[7],
                 "portefeuille_id": r[8],
+                "devise_cotation":     r[9],
+                "montant_investi_eur": float(r[10]) if r[10] is not None else None,
             })
             tickers_needed.add(r[1])
 
@@ -1310,6 +1413,22 @@ def evaluate_open_positions(portefeuille_id: Optional[int] = None):
             if latest_macro_dates:
                 macro_eval_date = min(latest_macro_dates)
                 macro_regime = get_macro_regime(macro_data, macro_eval_date)
+
+        # 4b. Taux de change (v6.11.0) — dernier taux + taux à date d'achat
+        fx_last, fx_achat = {}, {}
+        devises_needed = {p["devise_cotation"] for p in positions_db
+                          if p.get("devise_cotation") and p["devise_cotation"] != "EUR"}
+        if devises_needed:
+            try:
+                with engine.connect() as conn:
+                    for dev in devises_needed:
+                        fx_last[dev] = _get_taux_eur(conn, dev)
+                    for p in positions_db:
+                        d = p.get("devise_cotation")
+                        if d and d != "EUR":
+                            fx_achat[p["id"]] = _get_taux_eur(conn, d, p["date_achat"])
+            except ValueError as e_fx:
+                print(f"⚠️ Taux de change indisponibles : {e_fx}")
 
         # 5. Évaluer chaque position
         results = []
@@ -1342,9 +1461,22 @@ def evaluate_open_positions(portefeuille_id: Optional[int] = None):
             current_price = float(df_t.loc[latest_date, "prix_ajuste"])
             current_atr   = float(df_t.loc[latest_date, "atr_14"]) if not pd.isna(df_t.loc[latest_date, "atr_14"]) else 0
 
-            # --- P&L latent ---
-            pnl_pct = round(100.0 * (current_price - pos["prix_achat"]) / pos["prix_achat"], 2)
-            pnl_eur = round((current_price - pos["prix_achat"]) * pos["quantite"], 2)
+            # --- P&L latent (v6.11.0 : devise de cotation + EUR réel) ---
+            devise     = pos.get("devise_cotation") or "EUR"
+            pnl_pct    = round(100.0 * (current_price - pos["prix_achat"]) / pos["prix_achat"], 2)
+            pnl_devise = round((current_price - pos["prix_achat"]) * pos["quantite"], 2)
+
+            taux_now   = 1.0 if devise == "EUR" else fx_last.get(devise)
+            taux_achat = 1.0 if devise == "EUR" else fx_achat.get(pos["id"])
+            if taux_now:
+                valeur_actuelle_eur = round(current_price * pos["quantite"] / taux_now, 2)
+                cout_eur = pos["montant_investi_eur"]
+                if cout_eur is None and pos["montant_investi"] and taux_achat:
+                    cout_eur = round(pos["montant_investi"] / taux_achat, 2)
+                pnl_eur = round(valeur_actuelle_eur - cout_eur, 2) if cout_eur is not None else None
+            else:
+                valeur_actuelle_eur = None   # taux_change vide → /sync-taux-change?full=true
+                pnl_eur = None
             jours   = (latest_date.date() - pos["date_achat"]).days
 
             # --- Trailing stop : simulation itérative depuis date_achat ---
@@ -1457,9 +1589,12 @@ def evaluate_open_positions(portefeuille_id: Optional[int] = None):
                 "prix_achat":      pos["prix_achat"],
                 "quantite":        pos["quantite"],
                 "montant_investi": pos["montant_investi"],
+                "devise_cotation": devise,
                 "prix_actuel":     round(current_price, 2),
                 "pnl_pct":         pnl_pct,
+                "pnl_devise":      pnl_devise,
                 "pnl_eur":         pnl_eur,
+                "valeur_actuelle_eur": valeur_actuelle_eur,
                 "jours_detention": jours,
                 "conditions":      conditions,
                 "nb_violated":     len(violated),

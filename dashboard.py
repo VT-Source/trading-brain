@@ -711,8 +711,10 @@ elif page == "💼 Portefeuille":
                         feu_global = "🟢"
                         border_color = "#34d399"
 
-                    pnl_pct = pos.get("pnl_pct", 0)
-                    pnl_eur = pos.get("pnl_eur", 0)
+                    pnl_pct    = pos.get("pnl_pct", 0)
+                    pnl_eur    = pos.get("pnl_eur")          # peut être None (taux manquant)
+                    pnl_devise = pos.get("pnl_devise")
+                    dev        = pos.get("devise_cotation") or "EUR"
                     pnl_color = "#34d399" if pnl_pct >= 0 else "#e94560"
                     pnl_sign = "+" if pnl_pct >= 0 else ""
 
@@ -722,12 +724,15 @@ elif page == "💼 Portefeuille":
                         h1.markdown(f"### {feu_global} {pos['ticker']}")
                         h2.metric("Jours", pos.get("jours_detention", "?"))
                         h3.metric("P&L %", f"{pnl_sign}{pnl_pct}%")
-                        h4.metric("P&L €", f"{pnl_sign}{pnl_eur:.2f}€")
+                        h4.metric("P&L € réel",
+                                  f"{'+' if pnl_eur >= 0 else ''}{pnl_eur:.2f}€" if pnl_eur is not None else "n/d",
+                                  help="Valeur actuelle en EUR − coût EUR (effet change inclus)")
 
                         # Info position
                         i1, i2, i3 = st.columns(3)
-                        i1.caption(f"Achat : {pos.get('prix_achat', '?')}€ × {pos.get('quantite', '?')}")
-                        i2.caption(f"Prix actuel : {pos.get('prix_actuel', '?')}€")
+                        i1.caption(f"Achat : {pos.get('prix_achat', '?')} {dev} × {pos.get('quantite', '?')}")
+                        i2.caption(f"Prix actuel : {pos.get('prix_actuel', '?')} {dev}"
+                                   + (f" | P&L : {pnl_devise:+.2f} {dev}" if pnl_devise is not None and dev != "EUR" else ""))
                         i3.caption(f"Data : {pos.get('data_date', '?')}")
 
                         # --- Erreur backend : pas de données pour ce ticker ---
@@ -749,7 +754,7 @@ elif page == "💼 Portefeuille":
                             ts = conditions.get("trailing_stop", {})
                             cols[0].markdown(f"**{ts.get('feu', '⚪')} Trailing Stop**")
                             cols[0].caption(
-                                f"Stop: {ts.get('stop_level', '?')}€ "
+                                f"Stop: {ts.get('stop_level', '?')} {dev} "
                                 f"(k={ts.get('k', '?')}, dist: {ts.get('distance_pct', '?')}%)"
                             )
 
@@ -913,6 +918,11 @@ elif page == "💼 Portefeuille":
                                     value=date.today(),
                                     key=f"dv_{pos['id']}",
                                 )
+                                devise_saisie_close = st.selectbox(
+                                    "Devise du prix de vente",
+                                    ["Devise de cotation", "USD", "EUR", "CHF", "SEK", "KRW"],
+                                    key=f"dvs_{pos['id']}",
+                                )
                                 raison_vente = st.selectbox(
                                     "Raison",
                                     ["TRAILING_STOP", "TREND_BROKEN", "MOMENTUM_LOST",
@@ -929,6 +939,8 @@ elif page == "💼 Portefeuille":
                                                 "prix_vente":   prix_vente,
                                                 "date_vente":   str(date_vente),
                                                 "raison_vente": raison_vente,
+                                                "devise_saisie": (None if devise_saisie_close ==
+                                                                  "Devise de cotation" else devise_saisie_close),
                                             },
                                             timeout=15,
                                         )
@@ -1011,6 +1023,22 @@ elif page == "💼 Portefeuille":
             quantite = o3.number_input("Quantité", min_value=0.01, step=0.01, value=1.0)
             date_achat = o4.date_input("Date d'achat", value=date.today())
 
+            o7, o8 = st.columns(2)
+            devise_saisie = o7.selectbox(
+                "Devise du prix saisi",
+                ["Devise de cotation du ticker", "USD", "EUR", "CHF", "SEK", "KRW"],
+                help="Si Saxo affiche le prix dans une autre devise que la place de "
+                     "cotation (ex: ligne USD/GDR d'une action coréenne), choisis-la : "
+                     "l'API convertit vers la devise de cotation au taux de la date "
+                     "d'achat. ⚠️ GDR : quantité = nb GDR × ratio, prix = prix GDR / ratio.",
+            )
+            montant_investi_eur = o8.number_input(
+                "Montant débité EUR (optionnel)",
+                min_value=0.0, step=0.01, value=0.0,
+                help="Montant EUR exact prélevé par Saxo (avis d'opéré, change inclus). "
+                     "0 = non renseigné → approximation par le taux de change.",
+            )
+
             o5, o6 = st.columns(2)
             source = o5.selectbox("Source", ["ranking", "manuel"])
             commentaire = o6.text_input(
@@ -1040,6 +1068,9 @@ elif page == "💼 Portefeuille":
                                 "source":      source,
                                 "commentaire": commentaire or None,
                                 "portefeuille_id": pf_id,
+                                "devise_saisie": (None if devise_saisie ==
+                                                  "Devise de cotation du ticker" else devise_saisie),
+                                "montant_investi_eur": montant_investi_eur or None,
                             },
                             timeout=15,
                         )

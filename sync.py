@@ -17,6 +17,10 @@
 #                     tickers_info ∪ actions_prix_historique. Un nouveau
 #                     ticker ajouté à tickers_info est désormais collecté
 #                     automatiquement (plus d'amorçage manuel requis).
+# v1.5 (2026-07-02) — sync_taux_change_logic : sync des paires EURXXX=X
+#                     (univers dérivé de tickers_info.monnaie) vers la
+#                     table taux_change. ON CONFLICT metadata : COALESCE
+#                     monnaie (gotcha tickers pré-insérés).
 # ============================================================
 
 import time
@@ -266,6 +270,7 @@ def sync_metadata_logic(engine):
                             ON CONFLICT (ticker) DO UPDATE SET
                                 pe_ratio     = EXCLUDED.pe_ratio,
                                 market_cap   = EXCLUDED.market_cap,
+                                monnaie      = COALESCE(tickers_info.monnaie, EXCLUDED.monnaie),
                                 derniere_maj = CURRENT_DATE;
                         """), metadata)
                 time.sleep(1)
@@ -642,3 +647,102 @@ def sync_secteurs_etf_logic(engine, full: bool = False):
 
     except Exception as e:
         print(f"❌ Erreur sync_secteurs_etf_logic : {e}")
+
+# ============================================================
+# SYNC TAUX DE CHANGE (v1.5)
+# ============================================================
+
+def sync_taux_change_logic(engine, full: bool = False):
+    """
+    Synchronise les taux EUR -> devises étrangères de l'univers
+    (tickers_info.monnaie) via yfinance (paires EURXXX=X).
+
+    Convention : taux_pour_1_eur = cotation yfinance brute (1 EUR = X devise).
+    Conversion en lecture : montant_eur = montant_devise / taux_pour_1_eur.
+
+    full=False -> 10 derniers jours (scheduler quotidien 00h55)
+    full=True  -> 5 ans (amorçage / rattrapage)
+    """
+    if engine is None:
+        print("❌ sync_taux_change_logic : engine non connecté.")
+        return
+
+    period = "5y" if full else "10d"
+    print(f"🔄 Sync taux de change — période {period}...")
+
+    try:
+        # Univers FX dérivé dynamiquement : tout ajout de zone est couvert d'office
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT DISTINCT monnaie FROM tickers_info
+                WHERE monnaie IS NOT NULL AND monnaie <> 'EUR'
+                ORDER BY monnaie
+            """))
+            devises = [row[0] for row in result]
+
+        if not devises:
+            print("   ⚠️ Aucune devise étrangère dans tickers_info.")
+            return
+
+        print(f"   {len(devises)} devise(s) : {', '.join(devises)}")
+        total_upserted = 0
+
+        for devise in devises:
+            fx_ticker = f"EUR{devise}=X"
+            try:
+                # Retry 3× backoff exponentiel (pattern sync_prix_logic v1.2)
+                df_fx = pd.DataFrame()
+                for attempt in range(3):
+                    try:
+                        df_fx = yf.download(fx_ticker, period=period, interval="1d",
+                                            auto_adjust=True, progress=False, timeout=30)
+                        if not df_fx.empty:
+                            break
+                        wait = 2 ** attempt
+                        print(f"   ⚠️ {fx_ticker} : réponse vide tentative "
+                              f"{attempt+1}/3, retry dans {wait}s...")
+                        time.sleep(wait)
+                    except Exception as e_dl:
+                        wait = 2 ** attempt
+                        print(f"   ⚠️ {fx_ticker} : exception {e_dl} tentative "
+                              f"{attempt+1}/3, retry dans {wait}s...")
+                        time.sleep(wait)
+
+                if df_fx.empty:
+                    print(f"   ❌ {fx_ticker} : aucune donnée après 3 tentatives.")
+                    continue
+
+                if isinstance(df_fx.columns, pd.MultiIndex):
+                    df_fx.columns = df_fx.columns.get_level_values(0)
+
+                df_fx = df_fx.reset_index()[["Date", "Close"]].rename(
+                    columns={"Date": "date", "Close": "taux_pour_1_eur"})
+                # dropna AVANT insertion ('NaN'::numeric != NULL en PostgreSQL)
+                df_fx = df_fx.dropna(subset=["taux_pour_1_eur"])
+                df_fx["date"]   = pd.to_datetime(df_fx["date"]).dt.date
+                df_fx["devise"] = devise
+
+                records = df_fx[["devise", "date", "taux_pour_1_eur"]].to_dict("records")
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO taux_change (devise, date, taux_pour_1_eur)
+                        VALUES (:devise, :date, :taux_pour_1_eur)
+                        ON CONFLICT (devise, date) DO UPDATE SET
+                            taux_pour_1_eur = EXCLUDED.taux_pour_1_eur
+                    """), records)
+
+                total_upserted += len(records)
+                dernier = df_fx.iloc[-1]
+                print(f"   ✅ {fx_ticker} — {len(records)} jours | dernier : "
+                      f"1 EUR = {float(dernier['taux_pour_1_eur']):.4f} {devise} "
+                      f"({dernier['date']})")
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"   ❌ Erreur {fx_ticker} : {e}")
+                continue
+
+        print(f"🏁 Sync taux de change terminée — {total_upserted} lignes upsertées.")
+
+    except Exception as e:
+        print(f"❌ Erreur sync_taux_change_logic : {e}")
