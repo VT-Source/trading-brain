@@ -872,6 +872,27 @@ elif page == "💼 Portefeuille":
                                     key=f"ec_{pos['id']}",
                                 )
 
+                                # --- Devises (v4.8) ---
+                                _dev_cot = _full.get("devise_cotation") or "EUR"
+                                ed1, ed2 = st.columns(2)
+                                e_devise = ed1.selectbox(
+                                    f"Devise du prix saisi (cotation : {_dev_cot})",
+                                    ["Devise de cotation", "USD", "EUR", "CHF", "SEK", "KRW"],
+                                    key=f"edev_{pos['id']}",
+                                    help="Si le prix ci-dessus est dans une autre devise que "
+                                         f"la cotation ({_dev_cot}) — ex : ligne USD/GDR d'une "
+                                         "action coréenne — choisis-la : l'API convertit au "
+                                         "taux de la date d'achat.",
+                                )
+                                e_meur = ed2.number_input(
+                                    "Montant débité EUR (optionnel)",
+                                    min_value=0.0, step=0.01,
+                                    value=float(_full.get("montant_investi_eur") or 0.0),
+                                    key=f"emeur_{pos['id']}",
+                                    help="Montant EUR exact prélevé par Saxo (avis d'opéré). "
+                                         "0 = inchangé/non renseigné.",
+                                )
+
                                 if st.form_submit_button(
                                     "Enregistrer les corrections",
                                     use_container_width=True,
@@ -884,6 +905,9 @@ elif page == "💼 Portefeuille":
                                                 "quantite":    e_qte,
                                                 "date_achat":  str(e_date),
                                                 "commentaire": e_comm or None,
+                                                "devise_saisie": (None if e_devise ==
+                                                                  "Devise de cotation" else e_devise),
+                                                "montant_investi_eur": e_meur or None,
                                             },
                                             timeout=15,
                                         )

@@ -1213,43 +1213,68 @@ def list_positions(status: Optional[str] = None, portefeuille_id: Optional[int] 
 @app.patch("/positions/{position_id}")
 def edit_position(position_id: int, payload: PositionEditPayload):
     """
-    Modifie une position ouverte (correction prix, quantité, commentaire...).
+    Modifie une position ouverte (correction prix, quantité, commentaire, devise...).
     Seules les positions OUVERTES peuvent être éditées.
+
+    Devises (v6.11.0) : si devise_saisie est fournie et diffère de la devise de
+    cotation, prix_achat est converti au taux de la date d'achat effective avant
+    stockage (le prix d'origine est conservé dans prix_transaction/devise_transaction).
+    montant_investi_eur est modifiable directement.
     """
     if engine is None:
         return {"error": "engine non connecté"}
 
-    updates = []
-    params = {"position_id": position_id}
-
-    if payload.prix_achat is not None:
-        updates.append("prix_achat = :prix_achat")
-        params["prix_achat"] = payload.prix_achat
-    if payload.quantite is not None:
-        updates.append("quantite = :quantite")
-        params["quantite"] = payload.quantite
-    if payload.date_achat is not None:
-        updates.append("date_achat = :date_achat")
-        params["date_achat"] = payload.date_achat
-    if payload.commentaire is not None:
-        updates.append("commentaire = :commentaire")
-        params["commentaire"] = payload.commentaire
-
-    if not updates:
-        return {"error": "Aucun champ à modifier"}
-
-    updates.append("updated_at = NOW()")
-
     try:
         with engine.begin() as conn:
             check = conn.execute(text("""
-                SELECT statut FROM positions WHERE id = :position_id
+                SELECT statut, date_achat, devise_cotation
+                FROM positions WHERE id = :position_id
             """), {"position_id": position_id}).fetchone()
 
             if not check:
                 return {"error": f"Position {position_id} introuvable"}
             if check[0] != "OUVERT":
                 return {"error": f"Position {position_id} déjà fermée — modification impossible"}
+
+            devise_cotation = check[2] or "EUR"
+            date_effective  = payload.date_achat or str(check[1])
+
+            updates = []
+            params  = {"position_id": position_id}
+            conv_msg = ""
+
+            if payload.prix_achat is not None:
+                prix_cotation = payload.prix_achat
+                # Conversion éventuelle vers la devise de cotation
+                if payload.devise_saisie and payload.devise_saisie != devise_cotation:
+                    taux_saisie   = _get_taux_eur(conn, payload.devise_saisie, date_effective)
+                    taux_cotation = _get_taux_eur(conn, devise_cotation, date_effective)
+                    prix_cotation = round(payload.prix_achat * taux_cotation / taux_saisie, 4)
+                    updates.append("prix_transaction = :prix_transaction")
+                    params["prix_transaction"] = payload.prix_achat
+                    updates.append("devise_transaction = :devise_transaction")
+                    params["devise_transaction"] = payload.devise_saisie
+                    conv_msg = (f" [converti : {payload.prix_achat} {payload.devise_saisie} "
+                                f"→ {prix_cotation} {devise_cotation}, taux du {date_effective}]")
+                updates.append("prix_achat = :prix_achat")
+                params["prix_achat"] = prix_cotation
+            if payload.quantite is not None:
+                updates.append("quantite = :quantite")
+                params["quantite"] = payload.quantite
+            if payload.date_achat is not None:
+                updates.append("date_achat = :date_achat")
+                params["date_achat"] = payload.date_achat
+            if payload.commentaire is not None:
+                updates.append("commentaire = :commentaire")
+                params["commentaire"] = payload.commentaire
+            if payload.montant_investi_eur is not None:
+                updates.append("montant_investi_eur = :montant_investi_eur")
+                params["montant_investi_eur"] = payload.montant_investi_eur
+
+            if not updates:
+                return {"error": "Aucun champ à modifier"}
+
+            updates.append("updated_at = NOW()")
 
             conn.execute(text(f"""
                 UPDATE positions
@@ -1261,7 +1286,11 @@ def edit_position(position_id: int, payload: PositionEditPayload):
             "status":  "ok",
             "id":      position_id,
             "updated": [u.split(" = ")[0] for u in updates if u != "updated_at = NOW()"],
+            "message": f"Position {position_id} modifiée{conv_msg}",
         }
+    except ValueError as e_fx:
+        # Taux de change manquant (_get_taux_eur)
+        return {"error": str(e_fx)}
     except Exception as e:
         return {"error": str(e)}
 

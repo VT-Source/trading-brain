@@ -2,7 +2,8 @@
 # models_api.py — Pydantic models pour l'API Trading Brain
 # v1.2 — ajout multi-portefeuille (PositionOpenPayload.portefeuille_id,
 #        PortefeuilleCreatePayload, PortefeuilleEditPayload)
-# v1.3 - devises
+# v1.3 - devises (PositionOpen/Close : devise_saisie, montant_investi_eur)
+# v1.4 - devises édition (PositionEditPayload : devise_saisie, montant_investi_eur)
 # ============================================================
 
 from pydantic import BaseModel
@@ -29,10 +30,12 @@ class PositionClosePayload(BaseModel):
 
 
 class PositionEditPayload(BaseModel):
-    prix_achat:  Optional[float] = None
-    quantite:    Optional[float] = None
-    date_achat:  Optional[str]   = None
-    commentaire: Optional[str]   = None
+    prix_achat:          Optional[float] = None
+    quantite:            Optional[float] = None
+    date_achat:          Optional[str]   = None
+    commentaire:         Optional[str]   = None
+    devise_saisie:       Optional[str]   = None   # ex 'USD' — convertit prix_achat vers la devise de cotation
+    montant_investi_eur: Optional[float] = None   # EUR réellement débité (avis d'opéré Saxo)
 
 
 class PortefeuilleCreatePayload(BaseModel):
