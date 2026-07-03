@@ -547,18 +547,20 @@ def get_opinions(engine, semaine: str = None, ticker: str = None, all: bool = Fa
 
 def update_suivi_rendements(engine) -> dict:
     """
-    Complète les rendements à +1s, +2s, +4s pour les avis passés.
+    Complète/révise les rendements +1s/+2s/+4s des avis 'ranking'.
 
-    Logique :
-    - Cherche les avis qui ont un prix_emission mais des rendements manquants
-    - Filtre uniquement type_avis='ranking' (les avis 'position' se mesurent
-      via la P&L réelle des positions, pas via un rendement théorique)
-    - Pour chaque horizon (1s, 2s, 4s), vérifie si la date cible est atteinte
-    - Récupère le prix de clôture le plus proche (≤ target_date) depuis
-      actions_prix_historique (gère week-ends et jours fériés)
-    - Calcule et stocke le rendement
-
-    Appelé par le scheduler chaque jour ouvré à 23h45 (ou samedi selon config).
+    v1.5 — Corrige deux bugs (cf. REFONTE_AVIS_IA) :
+      A. Les deux extrémités du rendement sont lues dans la MÊME série
+         `prix_ajuste` (avant : émission=prix_ajuste, cible=prix_cloture →
+         0,00 % exact sur les US sans dividende récent).
+      B. La barre cible doit être STRICTEMENT postérieure à la barre
+         d'émission ; sinon on ne calcule pas (avant : +1s mesuré le lundi
+         W2 quand la dernière barre dispo était encore le vendredi W1 →
+         horizon effectif nul, puis figé par un skip-si-non-NULL).
+      + Le snapshot figé `prix_emission` n'est plus dénominateur (immunise
+        contre les splits, cf. cas KLAC).
+      + Révisable : tant qu'une barre postérieure à la cible n'existe pas,
+        la valeur reste recalculable (plus de write-once définitif).
     """
     if engine is None:
         return {"error": "engine non connecté"}
@@ -566,92 +568,78 @@ def update_suivi_rendements(engine) -> dict:
     _ensure_avis_ia_table(engine)
 
     today = date.today()
-    updated = {"1s": 0, "2s": 0, "4s": 0, "errors": 0}
+    updated = {"1s": 0, "2s": 0, "4s": 0, "skipped": 0, "errors": 0}
+
+    def _prix_ajuste_le(conn, ticker, d):
+        """Dernière clôture ajustée à une date <= d (barre + sa date)."""
+        r = conn.execute(text("""
+            SELECT date, prix_ajuste FROM actions_prix_historique
+            WHERE ticker = :t AND date <= :d AND prix_ajuste IS NOT NULL
+              AND prix_ajuste <> 'NaN'::numeric
+            ORDER BY date DESC LIMIT 1
+        """), {"t": ticker, "d": d}).fetchone()
+        return (r[0], float(r[1])) if r else (None, None)
 
     try:
         with engine.connect() as conn:
-            # v1.3 : ne traiter que les avis 'ranking'
-            # (les avis 'position' = NULL hérité historique sont aussi inclus
-            #  pour ne rien casser sur les avis pré-migration)
-            # v1.4 : fallback prix_emission via actions_prix_historique pour
-            # rattraper les avis générés sans snapshot indicateurs.
             rows = conn.execute(text("""
-                SELECT a.id, a.ticker, a.semaine,
-                       COALESCE(a.prix_emission, (
-                           SELECT prix_cloture FROM actions_prix_historique
-                           WHERE ticker = a.ticker AND date <= a.semaine::date
-                           ORDER BY date DESC LIMIT 1
-                       )) AS prix_emission
+                SELECT a.id, a.ticker, a.semaine, a.generated_at,
+                       a.rendement_1s, a.rendement_2s, a.rendement_4s
                 FROM avis_ia a
                 WHERE (a.type_avis = 'ranking' OR a.type_avis IS NULL)
-                  AND (a.rendement_1s IS NULL OR a.rendement_2s IS NULL OR a.rendement_4s IS NULL)
+                  AND (a.rendement_1s IS NULL OR a.rendement_2s IS NULL
+                       OR a.rendement_4s IS NULL)
                 ORDER BY a.semaine ASC
             """)).fetchall()
 
-        print(f"📊 Suivi rendements : {len(rows)} avis ranking à vérifier")
+        print(f"📊 Suivi rendements : {len(rows)} avis ranking à (re)vérifier")
 
         for row in rows:
-            avis_id = row[0]
-            ticker = row[1]
-            semaine_str = str(row[2])
-            prix_emission = row[3]
-
+            avis_id, ticker, semaine_raw, generated_at = row[0], row[1], row[2], row[3]
             try:
-                semaine_date = date.fromisoformat(semaine_str)
+                semaine_date = date.fromisoformat(str(semaine_raw))
             except ValueError:
-                print(f"  ⚠️ ID {avis_id} : semaine invalide '{semaine_str}'")
+                print(f"  ⚠️ ID {avis_id} : semaine invalide '{semaine_raw}'")
                 updated["errors"] += 1
                 continue
 
-            # Pour chaque horizon, vérifier et compléter
+            # Ancre d'émission = dernière barre <= date de génération réelle
+            # (le prix d'émission = clôture du vendredi précédant le samedi 06h00).
+            # Fallback : semaine + 6 jours si generated_at absent (avis anciens).
+            gen_date = generated_at.date() if generated_at else (semaine_date + timedelta(days=6))
+            with engine.connect() as conn:
+                emission_date, prix_emission = _prix_ajuste_le(conn, ticker, gen_date)
+            if emission_date is None or not prix_emission or prix_emission <= 0:
+                updated["skipped"] += 1
+                continue
+
             horizons = [
                 ("1s", 7,  "prix_1s", "rendement_1s"),
                 ("2s", 14, "prix_2s", "rendement_2s"),
                 ("4s", 28, "prix_4s", "rendement_4s"),
             ]
-
             for label, days_offset, col_prix, col_rdt in horizons:
-                target_date = semaine_date + timedelta(days=days_offset)
-
-                # Pas encore atteint ? On skip
+                target_date = emission_date + timedelta(days=days_offset)
                 if target_date > today:
                     continue
 
-                # Déjà rempli ? On skip
                 with engine.connect() as conn:
-                    existing = conn.execute(text(f"""
-                        SELECT {col_rdt} FROM avis_ia WHERE id = :id
-                    """), {"id": avis_id}).fetchone()
-                    if existing and existing[0] is not None:
-                        continue
+                    cible_date, prix_cible = _prix_ajuste_le(conn, ticker, target_date)
 
-                # Chercher le prix de clôture le plus proche de target_date
-                # (on prend le dernier jour de bourse <= target_date)
-                with engine.connect() as conn:
-                    prix_row = conn.execute(text("""
-                        SELECT prix_cloture FROM actions_prix_historique
-                        WHERE ticker = :ticker
-                          AND date <= :target_date
-                        ORDER BY date DESC
-                        LIMIT 1
-                    """), {"ticker": ticker, "target_date": target_date}).fetchone()
+                # Bug B : la cible doit être STRICTEMENT après l'émission.
+                # Sinon horizon effectif nul → on laisse NULL, révisé au prochain run.
+                if cible_date is None or cible_date <= emission_date:
+                    updated["skipped"] += 1
+                    continue
 
-                if prix_row and prix_row[0] and prix_emission > 0:
-                    prix_cible = float(prix_row[0])
-                    rendement = (prix_cible - prix_emission) / prix_emission
-
-                    with engine.begin() as conn:
-                        conn.execute(text(f"""
-                            UPDATE avis_ia
-                            SET {col_prix} = :prix, {col_rdt} = :rdt
-                            WHERE id = :id
-                        """), {"prix": prix_cible, "rdt": rendement, "id": avis_id})
-
-                    print(f"  ✅ {ticker} ({semaine_str}) +{label} : {rendement:+.2%}")
-                    updated[label] += 1
-                else:
-                    # Pas de donnée prix — peut arriver si sync pas encore fait
-                    pass
+                rendement = (prix_cible - prix_emission) / prix_emission
+                with engine.begin() as conn:
+                    conn.execute(text(f"""
+                        UPDATE avis_ia SET {col_prix} = :prix, {col_rdt} = :rdt
+                        WHERE id = :id
+                    """), {"prix": prix_cible, "rdt": rendement, "id": avis_id})
+                print(f"  ✅ {ticker} ({semaine_date}) +{label} : {rendement:+.2%}")
+                updated[label] += 1
 
         print(f"📊 Suivi rendements terminé : {updated}")
         return {"status": "ok", "updated": updated, "total_checked": len(rows)}
