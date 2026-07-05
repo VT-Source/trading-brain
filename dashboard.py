@@ -1,5 +1,5 @@
 # ============================================================
-# dashboard.py — Trading Brain Dashboard v4.0
+# dashboard.py — Trading Brain Dashboard v4.9
 # VT-Source/trading-brain
 # ============================================================
 # Streamlit dashboard pour visualiser :
@@ -1255,6 +1255,24 @@ elif page == "📈 Backtest & Perf IA":
                 df_ia["type_avis"] = "ranking"
             df_ia["type_avis"] = df_ia["type_avis"].fillna("ranking")
 
+            # --- Phase 2.5c : dimensions version pour étudier l'évolution ---
+            for _col in ("prompt_version", "model_used"):
+                if _col not in df_ia.columns:
+                    df_ia[_col] = "—"
+                df_ia[_col] = df_ia[_col].fillna("—")
+            with st.expander("🔬 Filtrer par version de prompt / modèle", expanded=False):
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    pv_opts = sorted(df_ia["prompt_version"].unique().tolist())
+                    pv_sel = st.multiselect("Version de prompt", pv_opts,
+                                            default=pv_opts, key="ai_perf_pv")
+                with fc2:
+                    mdl_opts = sorted(df_ia["model_used"].unique().tolist())
+                    mdl_sel = st.multiselect("Modèle", mdl_opts,
+                                             default=mdl_opts, key="ai_perf_mdl")
+            df_ia = df_ia[df_ia["prompt_version"].isin(pv_sel)
+                          & df_ia["model_used"].isin(mdl_sel)]
+
             # Séparer en 2 dataframes
             df_ranking  = df_ia[df_ia["type_avis"] == "ranking"].copy()
             df_position = df_ia[df_ia["type_avis"] == "position"].copy()
@@ -1273,6 +1291,18 @@ elif page == "📈 Backtest & Perf IA":
             c1.metric("Avis générés", len(df_ranking))
             c2.metric("Avec rendement", len(df_rank_rend))
             c3.metric("Semaines couvertes", df_ranking["semaine"].nunique() if len(df_ranking) > 0 else 0)
+
+            # Phase 2.5c : évolution par version de prompt × modèle
+                st.markdown("**📈 Par version (évolution)**")
+                rows_ver = []
+                for (pv, mdl), g in df_rank_rend.groupby(["prompt_version", "model_used"]):
+                    row = {"Prompt": pv, "Modèle": mdl, "Nb": len(g)}
+                    for col, lbl in horizons:
+                        vals = g[col].dropna()
+                        row[f"Rend {lbl}"] = f"{vals.mean():.2%}" if len(vals) else "—"
+                        row[f"Hit {lbl}"]  = f"{(vals > 0).mean():.0%}" if len(vals) else "—"
+                    rows_ver.append(row)
+                st.dataframe(pd.DataFrame(rows_ver), use_container_width=True, hide_index=True)
 
             if len(df_rank_rend) == 0:
                 st.info("Aucun rendement encore disponible pour les avis d'achat.")

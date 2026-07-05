@@ -27,7 +27,7 @@ from sync import (
     sync_secteurs_etf_logic,
     sync_taux_change_logic,
 )
-from ai_opinion import generate_opinion, generate_opinions_batch, get_opinions, update_suivi_rendements, _migrate_avis_ia_columns
+from ai_opinion import generate_opinion, submit_batch_opinion, poll_batch_opinions, get_opinions, update_suivi_rendements, _migrate_avis_ia_columns
 from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -79,7 +79,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.11.0"
+APP_VERSION = "6.12.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -194,7 +194,9 @@ def _auto_generate_opinions():
         {**r, "rang": r["rank"]}
         for r in ranking_data.get("ranking", [])[:5]
     ]
-    generate_opinions_batch(engine, tickers_data, semaine, source="auto")
+    macro_regime = ranking_data.get("macro_regime")
+    submit_batch_opinion(engine, tickers_data, semaine,
+                         source="auto", macro_regime=macro_regime)
     
 # ============================================================
 # SCHEDULER INTÉGRÉ (BackgroundScheduler)
@@ -284,13 +286,19 @@ def start_scheduler():
                       CronTrigger(day_of_week="mon-sat", hour=2, minute=30),
                       id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
 
-    # --- Avis IA auto top 5 (1×/semaine, samedi sur ranking du vendredi soir) ---
+    # --- Avis IA auto top 5 : SOUMISSION du batch (samedi 06h00) ---
     scheduler.add_job(lambda: _run_job("ai_opinions", _auto_generate_opinions),
                       CronTrigger(day_of_week="sat", hour=6, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
 
+    # --- Avis IA : POLLING du batch (toutes les 30 min, sam+dim) ---
+    #     No-op (1 SELECT) quand rien n'est SOUMIS. Couvre le SLA 24h.
+    scheduler.add_job(lambda: _run_job("poll_ai_opinions", poll_batch_opinions, engine),
+                      CronTrigger(day_of_week="sat,sun", minute="*/30"),
+                      id="poll_ai_opinions", replace_existing=True, misfire_grace_time=300)
+
     scheduler.start()
-    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 8 jobs planifiés (Europe/Brussels)")
+    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 9 jobs planifiés (Europe/Brussels)")
 
 # ============================================================
 # ENDPOINTS API
@@ -746,12 +754,14 @@ async def trigger_ai_opinion(background_tasks: BackgroundTasks,
             for r in ranking_data.get("ranking", [])[:top_n]
         ]
 
-        background_tasks.add_task(generate_opinions_batch, engine,
-                                  tickers_data, semaine, "auto")
+        macro_regime = ranking_data.get("macro_regime")
+        background_tasks.add_task(submit_batch_opinion, engine,
+                                  tickers_data, semaine, "auto", macro_regime)
         tickers_list = [t["ticker"] for t in tickers_data]
         return {
-            "status": "processing",
-            "message": f"Génération avis IA pour {len(tickers_data)} tickers : {tickers_list}",
+            "status": "submitted",
+            "message": f"Batch avis IA soumis pour {len(tickers_data)} tickers : "
+                       f"{tickers_list}. Récupération auto (polling) sous 24h.",
         }
 
 
@@ -779,6 +789,11 @@ async def trigger_suivi_rendements(background_tasks: BackgroundTasks):
         "status": "processing",
         "message": "Mise à jour des rendements de suivi IA lancée en arrière-plan.",
     }
+@app.get("/poll-ai-opinions")
+async def trigger_poll_ai_opinions(background_tasks: BackgroundTasks):
+    """Force la récupération des batchs avis IA en attente (sinon auto toutes les 30 min)."""
+    background_tasks.add_task(poll_batch_opinions, engine)
+    return {"status": "processing", "message": "Polling des batchs avis IA lancé."}
 
 # ============================================================
 # ENDPOINTS — POSITIONS (v4.1)
