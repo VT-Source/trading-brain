@@ -1292,18 +1292,6 @@ elif page == "📈 Backtest & Perf IA":
             c2.metric("Avec rendement", len(df_rank_rend))
             c3.metric("Semaines couvertes", df_ranking["semaine"].nunique() if len(df_ranking) > 0 else 0)
 
-            # Phase 2.5c : évolution par version de prompt × modèle
-                st.markdown("**📈 Par version (évolution)**")
-                rows_ver = []
-                for (pv, mdl), g in df_rank_rend.groupby(["prompt_version", "model_used"]):
-                    row = {"Prompt": pv, "Modèle": mdl, "Nb": len(g)}
-                    for col, lbl in horizons:
-                        vals = g[col].dropna()
-                        row[f"Rend {lbl}"] = f"{vals.mean():.2%}" if len(vals) else "—"
-                        row[f"Hit {lbl}"]  = f"{(vals > 0).mean():.0%}" if len(vals) else "—"
-                    rows_ver.append(row)
-                st.dataframe(pd.DataFrame(rows_ver), use_container_width=True, hide_index=True)
-
             if len(df_rank_rend) == 0:
                 st.info("Aucun rendement encore disponible pour les avis d'achat.")
             else:
@@ -1322,6 +1310,18 @@ elif page == "📈 Backtest & Perf IA":
                             row[f"Hit {lbl}"]  = "—"
                     rows_conv.append(row)
                 st.dataframe(pd.DataFrame(rows_conv), use_container_width=True, hide_index=True)
+
+                # Phase 2.5c : évolution par version de prompt × modèle
+                st.markdown("**📈 Par version (évolution)**")
+                rows_ver = []
+                for (pv, mdl), g in df_rank_rend.groupby(["prompt_version", "model_used"]):
+                    row = {"Prompt": pv, "Modèle": mdl, "Nb": len(g)}
+                    for col, lbl in horizons:
+                        vals = g[col].dropna()
+                        row[f"Rend {lbl}"] = f"{vals.mean():.2%}" if len(vals) else "—"
+                        row[f"Hit {lbl}"]  = f"{(vals > 0).mean():.0%}" if len(vals) else "—"
+                    rows_ver.append(row)
+                st.dataframe(pd.DataFrame(rows_ver), use_container_width=True, hide_index=True)
 
                 # Détail
                 with st.expander("📋 Détail avis d'achat"):
