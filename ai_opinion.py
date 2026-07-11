@@ -619,13 +619,40 @@ def _extract_batch_opinions(analyse_full: str, expected_tickers: list) -> dict:
                 rang_ia += 1
                 classement[tk] = rang_ia
 
+    expected_up = [t.upper() for t in expected_tickers]
+
+    def _norm_krx(s: str) -> str:
+        # normalise pour matcher les variantes KRX renvoyées par le modèle
+        # (non-alphanum retirés, suffixe .KS/.KQ et zéros de tête abandonnés)
+        s = re.sub(r"[^A-Z0-9.]", "", s.upper())
+        s = re.sub(r"\.(KS|KQ)", "", s)
+        return s.lstrip("0") or s
+
+    norm_expected = {_norm_krx(t): t for t in expected_up}
+
     sections = re.split(r"===\s*TICKER\s*:\s*", analyse_full)
     for sec in sections[1:]:
-        m = re.match(r"([A-Z0-9.\-]+)\s*===", sec.strip())
-        if not m:
+        if "===" in sec:
+            header, _, body = sec.partition("===")
+        else:
+            header, _, body = sec.partition("\n")
+        header_up = header.strip().upper()
+        body = body.strip()
+
+        # 1) token de tête exact (« MU », « 105560.KS »)
+        m = re.match(r"([A-Z0-9.\-]+)", header_up)
+        tk = m.group(1) if (m and m.group(1) in expected_up) else None
+        # 2) un ticker attendu apparaît tel quel dans l'entête (nom société ajouté…)
+        if tk is None:
+            tk = next((t for t in expected_up if t in header_up), None)
+        # 3) match normalisé KRX (zéros de tête / suffixe .KS abandonnés par le modèle)
+        if tk is None:
+            h = _norm_krx(header_up)
+            tk = next((orig for nrm, orig in norm_expected.items()
+                       if nrm and nrm in h), None)
+        if tk is None:
+            print(f"  ⚠️ Entête ticker non reconnue : {header.strip()!r}")
             continue
-        tk = m.group(1).upper()
-        body = sec.strip()[m.end():].strip()
         out["tickers"][tk] = {
             "conviction":          _extract_conviction(body),
             "resume":              _extract_resume(body),
