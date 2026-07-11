@@ -220,7 +220,7 @@ def generate_opinion(engine, ticker: str, semaine: str, rang: int = None,
 
         response = client.messages.create(
             model=MODEL,
-            max_tokens=2000,
+            max_tokens=4000,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[
                 {
@@ -299,7 +299,7 @@ def submit_batch_opinion(engine, tickers_data: list, semaine: str,
                 "custom_id": f"ranking-{semaine}",
                 "params": {
                     "model": MODEL,
-                    "max_tokens": 6000,
+                    "max_tokens": 16000,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": [{"role": "user", "content": prompt}],
                 },
@@ -389,6 +389,8 @@ def poll_batch_opinions(engine) -> dict:
                         if block.type == "text":
                             analyse_full += block.text
                     tokens_total = msg.usage.input_tokens + msg.usage.output_tokens
+                    if msg.stop_reason == "max_tokens":            # AJOUT
+                        print(f"  ⚠️ Batch {batch_id} : réponse TRONQUÉE (max_tokens)")  # AJOUT
         except Exception as e:
             _mark_batch_job(engine, job_id, "ERREUR", erreur=str(e))
             continue
@@ -431,7 +433,8 @@ def poll_batch_opinions(engine) -> dict:
             print(f"  ✅ {tk} → {p['conviction']}"
                   f"{f' (classé IA #{cls})' if cls else ''}")
 
-        _mark_batch_job(engine, job_id, "TERMINÉ",
+        statut_final = "TERMINÉ" if nb_saved == len(tickers_data) else "ERREUR"
+        _mark_batch_job(engine, job_id, statut_final,
                         lecture_lot=parsed.get("lecture_lot"),
                         classement=parsed.get("classement_brut"),
                         tokens_total=tokens_total)
