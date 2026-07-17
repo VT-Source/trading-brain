@@ -1,6 +1,6 @@
 # ============================================================
 # ai_opinion.py — Avis IA par ticker (Claude Sonnet + web search)
-# Trading Brain | VT-Source | v1.3
+# Trading Brain | VT-Source | v2.3
 # ============================================================
 # Reçoit `engine` en paramètre (injection de dépendance).
 # Appelé par main.py (endpoints + scheduler).
@@ -15,6 +15,38 @@
 #   - update_suivi_rendements reconstitue prix_emission via
 #     actions_prix_historique si NULL en base (avis générés sans
 #     snapshot indicateurs, ex: avant migration v1.2).
+#
+# v2.0 (2026-07-05) — Refonte batch hebdo asynchrone (Message Batches API) :
+#   submit_batch_opinion / poll_batch_opinions / _build_batch_prompt /
+#   _extract_batch_opinions ; table avis_ia_batch_jobs ; colonnes
+#   classement_ia / risque_evenementiel ; MODEL = claude-sonnet-5,
+#   PROMPT_VERSION = v2.1. (Entête resté v1.3 par oubli — corrigé en v2.2.)
+#
+# v2.1 (2026-07-11) — Hotfix batch : max_tokens 6000→16000 (les citations
+#   web search consomment des tokens avant tout texte) ; matching entêtes
+#   KRX en 3 passes (exact → substring → normalisé sans suffixe .KS/.KQ ni
+#   zéros de tête) ; détection réponse tronquée (stop_reason=max_tokens).
+#
+# v2.2 (2026-07-17) — Durcissements R1/R2/R3/R7 :
+#   R1 : UPSERT sur (semaine, ticker, type_avis) — fin de la collision où
+#        un avis 'position' écrasait l'avis 'ranking' de la même semaine.
+#        ⚠️ PRÉREQUIS : index uq_avis_ia_semaine_ticker_type créé en base
+#        AVANT déploiement, puis drop de l'ancienne contrainte APRÈS
+#        (migration 3 temps, voir PROJECT_STATUS 2026-07-17).
+#   R2 : 0 avis parsé → ERREUR + re-soumission auto (max 3 tentatives) ;
+#        parsing partiel → TERMINÉ avec note 'partiel x/y' + liste des
+#        tickers manquants (à régénérer via l'endpoint synchrone).
+#   R3 : regex CLASSEMENT ancrée ^ + MULTILINE (une mention en prose dans
+#        LECTURE DU LOT pouvait polluer classement_ia).
+#   R7 : filet tracking — batch soumis chez Anthropic mais INSERT DB
+#        échoué → batch_id loggué en clair pour réinsertion manuelle.
+#   PROMPT_VERSION inchangé (v2.1) : aucun prompt modifié.
+#
+# v2.3 (2026-07-17) — get_opinions(type_avis=) : filtre 'ranking'|'position'
+#   injecté dans les 5 branches + tri secondaire generated_at DESC sur la
+#   branche ticker (LIMIT 1 non déterministe depuis R1). Couplé à
+#   main.py ≥ 6.12.1 (/ai-opinions?type_avis=) et dashboard ≥ v4.10
+#   (widget avis position). PROMPT_VERSION toujours inchangé (v2.1).
 # ============================================================
 
 import os
@@ -72,7 +104,10 @@ def _ensure_avis_ia_table(engine):
                 rendement_1s    DOUBLE PRECISION,
                 rendement_2s    DOUBLE PRECISION,
                 rendement_4s    DOUBLE PRECISION,
-                UNIQUE (semaine, ticker)
+                -- v2.2 (R1) : un ticker peut avoir un avis 'ranking' ET un
+                -- avis 'position' la même semaine. En prod : index
+                -- uq_avis_ia_semaine_ticker_type (migration 2026-07-17).
+                UNIQUE (semaine, ticker, type_avis)
             )
         """))
     _TABLE_CREATED = True
@@ -309,24 +344,37 @@ def submit_batch_opinion(engine, tickers_data: list, semaine: str,
         print(f"❌ Soumission batch avis IA : {e}")
         return {"error": f"Erreur API Anthropic : {e}"}
 
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO avis_ia_batch_jobs
-                (batch_id, semaine, statut, source, tickers_data,
-                 macro_regime, prompt_version, model_used)
-            VALUES
-                (:batch_id, :semaine, 'SOUMIS', :source,
-                 CAST(:tickers_data AS jsonb), CAST(:macro AS jsonb),
-                 :pv, :model)
-        """), {
-            "batch_id":     batch.id,
-            "semaine":      semaine,
-            "source":       source,
-            "tickers_data": json.dumps(tickers_data),
-            "macro":        json.dumps(macro_regime or {}),
-            "pv":           PROMPT_VERSION,
-            "model":        MODEL,
-        })
+    # --- R7 (v2.2) : filet tracking ---
+    # À ce stade le batch EXISTE côté Anthropic. Si l'INSERT ci-dessous
+    # échoue (DB transitoire), poll_batch_opinions ne le verra jamais :
+    # tokens payés, avis perdus. On logge donc le batch_id en clair pour
+    # permettre une réinsertion manuelle (statut 'SOUMIS') via pgweb.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO avis_ia_batch_jobs
+                    (batch_id, semaine, statut, source, tickers_data,
+                     macro_regime, prompt_version, model_used)
+                VALUES
+                    (:batch_id, :semaine, 'SOUMIS', :source,
+                     CAST(:tickers_data AS jsonb), CAST(:macro AS jsonb),
+                     :pv, :model)
+            """), {
+                "batch_id":     batch.id,
+                "semaine":      semaine,
+                "source":       source,
+                "tickers_data": json.dumps(tickers_data),
+                "macro":        json.dumps(macro_regime or {}),
+                "pv":           PROMPT_VERSION,
+                "model":        MODEL,
+            })
+    except Exception as e_track:
+        msg = (f"⚠️ Batch {batch.id} SOUMIS chez Anthropic mais tracking DB "
+               f"échoué : {e_track} — réinsérer à la main dans "
+               f"avis_ia_batch_jobs (batch_id={batch.id}, semaine={semaine}, "
+               f"statut='SOUMIS') sinon les avis seront perdus.")
+        print(msg)
+        return {"error": msg, "batch_id": batch.id}
 
     print(f"📤 Batch avis IA soumis : {batch.id} "
           f"({len(tickers_data)} tickers, semaine {semaine})")
@@ -433,11 +481,49 @@ def poll_batch_opinions(engine) -> dict:
             print(f"  ✅ {tk} → {p['conviction']}"
                   f"{f' (classé IA #{cls})' if cls else ''}")
 
-        statut_final = "TERMINÉ" if nb_saved == len(tickers_data) else "ERREUR"
-        _mark_batch_job(engine, job_id, statut_final,
+        # --- R2 (v2.2) : issue du parsing ---
+        # 0 avis parsé → rien n'a été persisté : ERREUR + re-soumission
+        # automatique (max 3 tentatives), même circuit qu'un batch
+        # expired/errored. Plus de semaine perdue en silence.
+        if nb_saved == 0:
+            print(f"❌ Batch {batch_id} : 0/{len(tickers_data)} avis parsé — "
+                  f"format non respecté")
+            _mark_batch_job(engine, job_id, "ERREUR",
+                            lecture_lot=parsed.get("lecture_lot"),
+                            classement=parsed.get("classement_brut"),
+                            tokens_total=tokens_total,
+                            erreur=f"parse: 0/{len(tickers_data)} section exploitable")
+            if tentatives < 3:
+                retry = submit_batch_opinion(engine, tickers_data, semaine,
+                                             source=source, macro_regime=macro_regime)
+                if retry.get("batch_id"):
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            UPDATE avis_ia_batch_jobs
+                            SET tentatives = :t WHERE batch_id = :b
+                        """), {"t": tentatives + 1, "b": retry["batch_id"]})
+            else:
+                print(f"  🛑 Abandon après {tentatives} tentatives "
+                      f"(semaine {semaine})")
+            continue
+
+        # Parsing partiel (x/y) : les avis obtenus SONT persistés → TERMINÉ
+        # avec note explicite. Pas de re-soumission complète (coût tokens +
+        # ré-écraserait les avis valides) : régénérer les manquants via
+        # l'endpoint synchrone /generate-ai-opinion?ticker=XXX.
+        manquants = [td["ticker"].upper() for td in tickers_data
+                     if td["ticker"].upper() not in parsed["tickers"]]
+        if manquants:
+            print(f"  ⚠️ Batch {batch_id} : sections manquantes → "
+                  f"{', '.join(manquants)} — régénérer via "
+                  f"/generate-ai-opinion?ticker=...")
+        _mark_batch_job(engine, job_id, "TERMINÉ",
                         lecture_lot=parsed.get("lecture_lot"),
                         classement=parsed.get("classement_brut"),
-                        tokens_total=tokens_total)
+                        tokens_total=tokens_total,
+                        erreur=(None if not manquants
+                                else f"partiel : {nb_saved}/{len(tickers_data)}"
+                                     f" — manquants : {', '.join(manquants)}"))
         print(f"📥 Batch {batch_id} récupéré : {nb_saved}/{len(tickers_data)} "
               f"avis, {tokens_total} tokens")
         done += 1
@@ -608,7 +694,12 @@ def _extract_batch_opinions(analyse_full: str, expected_tickers: list) -> dict:
         out["lecture_lot"] = m.group(1).strip()[:2000]
 
     classement = {}
-    m = re.search(r"CLASSEMENT[\W_]{0,10}([^\n]+)", analyse_full, re.IGNORECASE)
+    # R3 (v2.2) : ancre ^ + MULTILINE — sans elle, re.search capture la
+    # PREMIÈRE occurrence du mot, y compris en prose dans la LECTURE DU LOT
+    # (« …le classement reflète NVDA et MU… ») → classement_ia pollué et
+    # fallback jamais déclenché (classement non vide). Vérifié par test.
+    m = re.search(r"^[\W_]{0,5}CLASSEMENT[\W_]{0,10}([^\n]+)",
+                  analyse_full, re.IGNORECASE | re.MULTILINE)
     if m:
         out["classement_brut"] = m.group(1).strip()[:200]
         ordre = re.findall(r"[A-Z0-9][A-Z0-9.\-]{0,14}", m.group(1).upper())
@@ -845,14 +936,19 @@ ANALYSE :
 # LECTURE AVIS
 # ============================================================
 
-def get_opinions(engine, semaine: str = None, ticker: str = None, all: bool = False) -> dict:
+def get_opinions(engine, semaine: str = None, ticker: str = None,
+                 all: bool = False, type_avis: str = None) -> dict:
     """
     Lit les avis IA depuis la base.
-    - all=True               → tous les avis (toutes semaines)
+    - all=True                → tous les avis (toutes semaines)
     - semaine seule           → tous les avis de la semaine
     - ticker seul             → dernier avis pour ce ticker
     - les deux                → avis spécifique
     - aucun                   → dernière semaine disponible
+    - type_avis ('ranking'|'position') → filtre combinable avec tous
+      les modes. v2.3 : indispensable depuis R1 (les deux types
+      coexistent pour un même (semaine, ticker)) — sans lui, la branche
+      ticker (LIMIT 1) peut renvoyer l'avis ranking au lieu du position.
     """
     if engine is None:
         return {"error": "engine non connecté"}
@@ -869,37 +965,46 @@ def get_opinions(engine, semaine: str = None, ticker: str = None, all: bool = Fa
               rendement_1s, rendement_2s, rendement_4s,
               type_avis, classement_ia, risque_evenementiel"""
 
+    # v2.3 : filtre optionnel injecté dans les 5 branches
+    type_filter = "AND type_avis = :ta" if type_avis else ""
+    ta_param    = {"ta": type_avis} if type_avis else {}
+
     try:
         with engine.connect() as conn:
             if all:
                 rows = conn.execute(text(f"""
                     SELECT {cols} FROM avis_ia
+                    WHERE 1=1 {type_filter}
                     ORDER BY semaine DESC, rang ASC NULLS LAST
-                """)).fetchall()
+                """), ta_param).fetchall()
             elif semaine and ticker:
                 rows = conn.execute(text(f"""
                     SELECT {cols} FROM avis_ia
-                    WHERE semaine = :semaine AND ticker = :ticker
-                """), {"semaine": semaine, "ticker": ticker.upper()}).fetchall()
+                    WHERE semaine = :semaine AND ticker = :ticker {type_filter}
+                """), {"semaine": semaine, "ticker": ticker.upper(),
+                       **ta_param}).fetchall()
             elif semaine:
                 rows = conn.execute(text(f"""
                     SELECT {cols} FROM avis_ia
-                    WHERE semaine = :semaine
+                    WHERE semaine = :semaine {type_filter}
                     ORDER BY rang ASC NULLS LAST
-                """), {"semaine": semaine}).fetchall()
+                """), {"semaine": semaine, **ta_param}).fetchall()
             elif ticker:
+                # generated_at DESC en tri secondaire : depuis R1, deux avis
+                # (ranking + position) peuvent coexister sur la même semaine
+                # → sans lui, LIMIT 1 serait non déterministe.
                 rows = conn.execute(text(f"""
                     SELECT {cols} FROM avis_ia
-                    WHERE ticker = :ticker
-                    ORDER BY semaine DESC
+                    WHERE ticker = :ticker {type_filter}
+                    ORDER BY semaine DESC, generated_at DESC NULLS LAST
                     LIMIT 1
-                """), {"ticker": ticker.upper()}).fetchall()
+                """), {"ticker": ticker.upper(), **ta_param}).fetchall()
             else:
                 rows = conn.execute(text(f"""
                     SELECT {cols} FROM avis_ia
-                    WHERE semaine = (SELECT MAX(semaine) FROM avis_ia)
+                    WHERE semaine = (SELECT MAX(semaine) FROM avis_ia) {type_filter}
                     ORDER BY rang ASC NULLS LAST
-                """)).fetchall()
+                """), ta_param).fetchall()
 
         avis = []
         for r in rows:
@@ -1247,7 +1352,11 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
                   quant_data=None, type_avis="ranking",
                   classement_ia=None, risque_evenementiel=None,
                   generated_at=None):
-    """Persiste l'avis en base (UPSERT sur semaine+ticker) avec snapshot indicateurs."""
+    """Persiste l'avis en base avec snapshot indicateurs.
+    v2.2 (R1) : UPSERT sur (semaine, ticker, type_avis) — un avis 'position'
+    ne peut plus écraser l'avis 'ranking' de la même semaine (qui sortait
+    alors silencieusement du suivi de rendements H1-H4).
+    ⚠️ Nécessite l'index unique uq_avis_ia_semaine_ticker_type en prod."""
     _ensure_avis_ia_table(engine)
     # Nettoyage caractères nuls (incompatibles PostgreSQL)
     if analyse:
@@ -1274,7 +1383,7 @@ def _save_opinion(engine, ticker, semaine, rang, conviction,
                  :prix_emission, :sma_200, :atr_14, :k_adaptatif,
                  :secteur_force, :macro_bullish, :prompt_version, :type_avis,
                  :classement_ia, :risque_evenementiel)
-            ON CONFLICT (semaine, ticker)
+            ON CONFLICT (semaine, ticker, type_avis)
             DO UPDATE SET
                 rang             = EXCLUDED.rang,
                 conviction       = EXCLUDED.conviction,

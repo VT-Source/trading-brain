@@ -1,5 +1,5 @@
 # ============================================================
-# dashboard.py — Trading Brain Dashboard v4.9
+# dashboard.py — Trading Brain Dashboard v4.10
 # VT-Source/trading-brain
 # ============================================================
 # Streamlit dashboard pour visualiser :
@@ -808,9 +808,14 @@ elif page == "💼 Portefeuille":
                             elif ai_result and "error" in ai_result:
                                 st.error(ai_result["error"])
 
-                        # Afficher le dernier avis IA position si existant
+                        # Afficher le dernier avis IA position si existant.
+                        # v4.10 : type_avis=position obligatoire depuis R1 —
+                        # sans lui, LIMIT 1 peut renvoyer l'avis RANKING de la
+                        # même semaine et le widget n'affiche plus rien.
                         pos_opinion = api_get(
-                            f"/ai-opinions?ticker={pos['ticker']}"
+                            "/ai-opinions",
+                            params={"ticker": pos["ticker"],
+                                    "type_avis": "position"},
                         )
                         if pos_opinion and isinstance(pos_opinion, dict):
                             opinions = pos_opinion.get("opinions", []) or pos_opinion.get("avis", [])

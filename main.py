@@ -79,7 +79,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.12.0"
+APP_VERSION = "6.12.1"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -766,16 +766,21 @@ async def trigger_ai_opinion(background_tasks: BackgroundTasks,
 
 
 @app.get("/ai-opinions")
-def get_ai_opinions(semaine: str = None, ticker: str = None, all: bool = False):
+def get_ai_opinions(semaine: str = None, ticker: str = None, all: bool = False,
+                    type_avis: str = None):
     """
     Lecture des avis IA.
     - ?all=true                     → tous les avis (toutes semaines)
     - ?semaine=2026-04-21           → avis de la semaine
     - ?ticker=NVDA                  → dernier avis pour ce ticker
     - ?semaine=2026-04-21&ticker=NVDA → avis spécifique
+    - ?type_avis=ranking|position   → filtre sur le type, combinable
+      (v6.12.1 : indispensable depuis R1 — ranking et position coexistent
+      pour un même (semaine, ticker), LIMIT 1 seul ne suffit plus)
     - sans paramètre                → dernière semaine disponible
     """
-    return get_opinions(engine, semaine=semaine, ticker=ticker, all=all)
+    return get_opinions(engine, semaine=semaine, ticker=ticker, all=all,
+                        type_avis=type_avis)
 
 @app.get("/update-suivi-rendements")
 async def trigger_suivi_rendements(background_tasks: BackgroundTasks):
