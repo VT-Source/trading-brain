@@ -20,6 +20,7 @@ requests
 # --- Analyse Technique & Backtest ---
 pandas_ta
 vectorbt
+plotly<6.0.0
 
 # --- Machine Learning ---
 scikit-learn
