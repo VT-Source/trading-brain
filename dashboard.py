@@ -386,17 +386,35 @@ if page == "📊 Ranking":
         else:
             st.info("Aucun avis IA généré pour cette semaine. Utilise le bouton ci-dessous ou lance `/generate-ai-opinion` via l'API.")
  
-        # Bouton pour générer les avis du top 5
-        col_gen, col_space = st.columns([1, 3])
+        # Boutons avis IA top 5 — soumission batch + récupération manuelle
+        # v6.12.2 : le flux top 5 passe par la Batch API (asynchrone). Le
+        # message « ~2 min » datait du flux synchrone et était trompeur : la
+        # soumission rend la main immédiatement, les avis arrivent via le
+        # polling (toutes les 30 min, 7j/7), typiquement en <1h, 24h max.
+        col_gen, col_poll, col_space = st.columns([1, 1, 2])
         with col_gen:
             if st.button("🤖 Générer avis IA (top 5)", use_container_width=True):
-                with st.spinner("Génération en cours... (~2 min pour 5 tickers)"):
+                with st.spinner("Soumission du batch..."):
                     result = api_get("/generate-ai-opinion")
                 if result:
-                    st.success(result.get("message", "Avis IA lancé en arrière-plan"))
-                    st.caption("Rafraîchis la page dans ~2 min pour voir les résultats.")
+                    st.success(result.get("message", "Batch avis IA soumis"))
+                    st.caption("Traitement asynchrone : généralement <1h, 24h max. "
+                               "Les avis apparaissent automatiquement (polling toutes "
+                               "les 30 min) — inutile de rester sur la page.")
                 else:
                     st.error("Erreur lors du lancement")
+        with col_poll:
+            if st.button("📥 Récupérer les avis en attente", use_container_width=True,
+                         help="Force la récupération des batchs déjà soumis, sans "
+                              "attendre le prochain polling. Aucun coût : les tokens "
+                              "sont déjà payés à la soumission."):
+                with st.spinner("Polling des batchs..."):
+                    result = api_get("/poll-ai-opinions")
+                if result:
+                    st.success(result.get("message", "Polling lancé"))
+                    st.caption("Rafraîchis la page dans ~30s.")
+                else:
+                    st.error("Erreur lors du polling")
  
         st.divider()
  
@@ -1536,6 +1554,34 @@ elif page == "⚙️ Système":
         else:
             st.warning("Aucun job exécuté depuis le dernier redémarrage")
 
+        # --- Batchs avis IA en attente / bloqués (v6.12.2) ---
+        batch_h = jobs_health.get("batch_avis_ia", {})
+        if batch_h.get("status") == "ok":
+            nb_pending = batch_h.get("pending", 0)
+            nb_stale   = batch_h.get("stale", 0)
+            seuil      = batch_h.get("seuil_h", 26)
+            if nb_stale:
+                st.error(
+                    f"🚨 {nb_stale} batch(s) avis IA bloqué(s) depuis plus de {seuil}h "
+                    f"— tokens payés, avis non récupérés. Lance « 📥 Récupérer les avis "
+                    f"en attente » sur l'onglet Ranking (ou GET /poll-ai-opinions)."
+                )
+            elif nb_pending:
+                st.info(f"⏳ {nb_pending} batch(s) avis IA en cours de traitement.")
+
+            if batch_h.get("jobs"):
+                rows_batch = [{
+                    "Batch":   b["batch_id"],
+                    "Semaine": b["semaine"],
+                    "Source":  b["source"],
+                    "Âge":     f"{b['age_h']}h",
+                    "État":    "🚨 BLOQUÉ" if b["stale"] else "⏳ En cours",
+                } for b in batch_h["jobs"]]
+                st.dataframe(pd.DataFrame(rows_batch), use_container_width=True,
+                             hide_index=True)
+        elif batch_h.get("status") == "error":
+            st.warning(f"Suivi batchs avis IA indisponible : {batch_h.get('error')}")
+
         jobs = jobs_health.get("jobs", {})
         if jobs:
             job_labels = {
@@ -1544,8 +1590,10 @@ elif page == "⚙️ Système":
                 "sync_etf":         "📊 Sync ETF",
                 "sync_metadata":    "🔄 Metadata",
                 "compute_ranking":  "🏆 Ranking",
-                "ai_opinions":      "🤖 Avis IA",
+                "ai_opinions":      "🤖 Avis IA (soumission)",
+                "poll_ai_opinions": "📥 Avis IA (polling)",
                 "suivi_rendements": "📈 Rendements",
+                "sync_fx":          "💱 Taux de change",
             }
             rows_jobs = []
             for job_id, info in jobs.items():

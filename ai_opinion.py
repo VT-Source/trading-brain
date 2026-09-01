@@ -531,6 +531,61 @@ def poll_batch_opinions(engine) -> dict:
     return {"status": "ok", "completed": done, "pending": still_pending}
 
 
+def get_batch_jobs_health(engine, seuil_h: int = 26) -> dict:
+    """
+    v6.12.2 — Santé des soumissions batch avis IA.
+
+    Un batch resté en statut 'SOUMIS' au-delà de `seuil_h` heures est anormal :
+    le SLA Anthropic est de 24h max, donc au-delà de 26h soit le polling ne
+    tourne pas, soit la récupération échoue silencieusement. C'est exactement
+    le scénario du 31/08/2026 (batch soumis un lundi, polling programmé
+    samedi/dimanche uniquement → avis jamais récupérés).
+
+    Retour :
+      {"status": "ok", "pending": 1, "stale": 1, "alerte": True, "jobs": [...]}
+    """
+    if engine is None:
+        return {"status": "error", "error": "engine non connecté"}
+
+    try:
+        _ensure_batch_jobs_table(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT batch_id, semaine, source, tentatives, submitted_at,
+                       EXTRACT(EPOCH FROM (NOW() - submitted_at)) / 3600.0 AS age_h
+                FROM avis_ia_batch_jobs
+                WHERE statut = 'SOUMIS'
+                ORDER BY submitted_at ASC
+            """)).fetchall()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+    jobs, stale = [], 0
+    for batch_id, semaine, source, tentatives, submitted_at, age_h in rows:
+        age_h = round(float(age_h or 0), 1)
+        is_stale = age_h > seuil_h
+        if is_stale:
+            stale += 1
+        jobs.append({
+            "batch_id":     batch_id,
+            "semaine":      semaine,
+            "source":       source,
+            "tentatives":   tentatives,
+            "submitted_at": str(submitted_at),
+            "age_h":        age_h,
+            "stale":        is_stale,
+        })
+
+    return {
+        "status":   "ok",
+        "pending":  len(jobs),
+        "stale":    stale,
+        "seuil_h":  seuil_h,
+        "alerte":   stale > 0,
+        "jobs":     jobs,
+    }
+
+
 def _mark_batch_job(engine, job_id, statut, lecture_lot=None,
                     classement=None, tokens_total=None, erreur=None):
     with engine.begin() as conn:

@@ -27,7 +27,7 @@ from sync import (
     sync_secteurs_etf_logic,
     sync_taux_change_logic,
 )
-from ai_opinion import generate_opinion, submit_batch_opinion, poll_batch_opinions, get_opinions, update_suivi_rendements, _migrate_avis_ia_columns
+from ai_opinion import generate_opinion, submit_batch_opinion, poll_batch_opinions, get_opinions, update_suivi_rendements, _migrate_avis_ia_columns, get_batch_jobs_health
 from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -79,7 +79,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.12.1"
+APP_VERSION = "6.12.2"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -291,10 +291,13 @@ def start_scheduler():
                       CronTrigger(day_of_week="sat", hour=6, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
 
-    # --- Avis IA : POLLING du batch (toutes les 30 min, sam+dim) ---
+    # --- Avis IA : POLLING du batch (toutes les 30 min, 7j/7) — v6.12.2 ---
     #     No-op (1 SELECT) quand rien n'est SOUMIS. Couvre le SLA 24h.
+    #     ⚠️ Était limité à sam+dim jusqu'en v6.12.1 : tout batch soumis
+    #     manuellement en semaine (bouton dashboard / GET /generate-ai-opinion)
+    #     restait en 'SOUMIS' indéfiniment — tokens payés, avis jamais récupérés.
     scheduler.add_job(lambda: _run_job("poll_ai_opinions", poll_batch_opinions, engine),
-                      CronTrigger(day_of_week="sat,sun", minute="*/30"),
+                      CronTrigger(minute="*/30"),
                       id="poll_ai_opinions", replace_existing=True, misfire_grace_time=300)
 
     scheduler.start()
@@ -344,10 +347,20 @@ def health_jobs():
     État de santé des jobs scheduler.
     Retourne le dernier statut de chaque job (ok/error/running),
     timestamp, durée, et résumé du résultat.
+
+    v6.12.2 : ajoute `batch_avis_ia` — surveillance des soumissions batch
+    restées en 'SOUMIS'. Un batch de plus de 26h (SLA Anthropic = 24h)
+    bascule le statut global en DEGRADED.
     """
     # Déterminer l'alerte globale
     errors = [jid for jid, info in job_status.items() if info.get("status") == "error"]
     running = [jid for jid, info in job_status.items() if info.get("status") == "running"]
+
+    # Batchs avis IA en attente / bloqués (v6.12.2)
+    batch_health = get_batch_jobs_health(engine)
+    batch_alerte = bool(batch_health.get("alerte"))
+    if batch_alerte:
+        errors = errors + ["batch_avis_ia"]
 
     if errors:
         global_status = "DEGRADED"
@@ -361,6 +374,7 @@ def health_jobs():
         "errors": errors,
         "running": running,
         "jobs": job_status,
+        "batch_avis_ia": batch_health,
     }
 
 @app.get("/check-model")
