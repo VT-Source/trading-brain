@@ -1,6 +1,6 @@
 # ============================================================
 # ai_opinion.py — Avis IA par ticker (Claude Sonnet + web search)
-# Trading Brain | VT-Source | v2.3
+# Trading Brain | VT-Source | v2.4
 # ============================================================
 # Reçoit `engine` en paramètre (injection de dépendance).
 # Appelé par main.py (endpoints + scheduler).

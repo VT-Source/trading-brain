@@ -1,5 +1,5 @@
 # ============================================================
-# dashboard.py — Trading Brain Dashboard v4.10
+# dashboard.py — Trading Brain Dashboard v4.11
 # VT-Source/trading-brain
 # ============================================================
 # Streamlit dashboard pour visualiser :
