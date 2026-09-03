@@ -32,6 +32,23 @@ from typing import Optional
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
+# --- Alerting Telegram (roadmap #19) ---
+# Import volontairement tolérant : un alerting.py absent ou cassé ne doit
+# jamais empêcher l'API de démarrer (cf. gotcha « déploiement couplé »).
+# Sans les variables TELEGRAM_*, le module est déjà un no-op silencieux.
+try:
+    from alerting import (alert_job_failure, alert_batch_avis_bloque,
+                          alert_ranking_composition, alerting_status,
+                          send_test_alert)
+except Exception as _e_alert:
+    print(f"⚠️ alerting.py indisponible ({_e_alert}) — alertes désactivées")
+    _NOOP_ALERT = {"sent": False, "reason": "module_absent"}
+    def alert_job_failure(*a, **k):         return _NOOP_ALERT
+    def alert_batch_avis_bloque(*a, **k):   return _NOOP_ALERT
+    def alert_ranking_composition(*a, **k): return _NOOP_ALERT
+    def send_test_alert(*a, **k):           return _NOOP_ALERT
+    def alerting_status():                  return {"enabled": False, "configured": False}
+
 try:
     from train_model import train_brain
 except ImportError:
@@ -79,7 +96,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.12.2"
+APP_VERSION = "6.13.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -233,6 +250,9 @@ def _run_job(job_id: str, func, *args, **kwargs):
             "error": str(e),
         }
         print(f"❌ Job '{job_id}' échoué après {elapsed}s : {e}")
+        # (a) Alerte push — sans elle, un job en échec la nuit n'est visible
+        # que dans job_status (perdu au redémarrage) ou les logs Railway.
+        alert_job_failure(job_id, e, elapsed)
     finally:
         # Force la libération mémoire après chaque job (DataFrames yfinance, pandas, etc.)
         collected = gc.collect()
@@ -248,6 +268,26 @@ def _summarize_result(result):
                 if k in ("status", "error", "updated", "total_checked", "nb_ranked",
                          "nb_opinions", "data_date", "message")}
     return str(result)[:200]
+
+def _poll_ai_opinions_with_alert(engine):
+    """
+    Job de polling batch + contrôle de fraîcheur (roadmap #19, point d).
+
+    Le signal `batch_avis_ia` existe depuis 6.12.2 mais restait en *pull* :
+    il fallait ouvrir /health-jobs ou la page Système pour le voir. Ici, le
+    job qui tourne déjà toutes les 30 min le consulte et alerte de lui-même.
+    Le contrôle est isolé dans son propre try/except : il ne doit jamais
+    faire échouer la récupération des avis, qui est l'objet du job.
+    """
+    res = poll_batch_opinions(engine)
+    try:
+        health = get_batch_jobs_health(engine)
+        if health.get("alerte"):
+            alert_batch_avis_bloque(health)
+    except Exception as e:
+        print(f"⚠️ Contrôle batch bloqué échoué : {e}")
+    return res
+
 
 @app.on_event("startup")
 def start_scheduler():
@@ -296,7 +336,7 @@ def start_scheduler():
     #     ⚠️ Était limité à sam+dim jusqu'en v6.12.1 : tout batch soumis
     #     manuellement en semaine (bouton dashboard / GET /generate-ai-opinion)
     #     restait en 'SOUMIS' indéfiniment — tokens payés, avis jamais récupérés.
-    scheduler.add_job(lambda: _run_job("poll_ai_opinions", poll_batch_opinions, engine),
+    scheduler.add_job(lambda: _run_job("poll_ai_opinions", _poll_ai_opinions_with_alert, engine),
                       CronTrigger(minute="*/30"),
                       id="poll_ai_opinions", replace_existing=True, misfire_grace_time=300)
 
@@ -375,7 +415,17 @@ def health_jobs():
         "running": running,
         "jobs": job_status,
         "batch_avis_ia": batch_health,
+        "alerting": alerting_status(),
     }
+
+@app.get("/test-alert")
+def test_alert():
+    """
+    Vérification de bout en bout du canal d'alerte (roadmap #19).
+    Retourne {"sent": false, "reason": "not_configured"} tant que
+    TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID ne sont pas posés sur Railway.
+    """
+    return send_test_alert()
 
 @app.get("/check-model")
 def check_model():
@@ -2104,6 +2154,14 @@ def compute_and_store_ranking(top_n: int = 20):
                 """), rec)
  
         print(f"✅ Ranking sauvegardé : {len(records)} tickers, date données {latest_date.date()}")
+
+        # (c) Alerte composition — filet en aval de l'audit post-sync.
+        # Le 16/05, 59 tickers EU non synchronisés ont produit un ranking
+        # 100 % US sans qu'aucune erreur ne soit levée.
+        alert_ranking_composition([r["zone"] for r in records],
+                                  nb_eligible=len(ranking),
+                                  data_date=latest_date.date())
+
         return {"status": "ok", "nb_ranked": len(records), "data_date": str(latest_date.date())}
  
     except Exception as e:

@@ -1,5 +1,5 @@
 # ============================================================
-# backtest_ranking.py — Backtest Momentum Ranking v4.0
+# backtest_ranking.py — Backtest Momentum Ranking v4.3
 # Trading Brain | VT-Source
 # ============================================================
 # Appel : GET /run-backtest?mode=ranking&top_n=5
@@ -61,6 +61,30 @@ PAYS_EU = {
     'Switzerland', 'Sweden', 'Denmark', 'Finland', 'Norway', 'Austria',
     'Portugal', 'Ireland', 'Luxembourg', 'United Kingdom'
 }
+
+
+def zone_priority_for(ticker: str, pays: str = None) -> list[str]:
+    """
+    Zone(s) de rattachement d'un ticker, par ordre de priorité.
+
+    Règle : la PLACE DE COTATION prime sur le pays du siège. Un ticker sans
+    suffixe Yahoo est coté NYSE/NASDAQ → zone US, quel que soit le pays
+    retourné par Yahoo Finance. Corrige les ADR (NXPI, ACN, APTV, LIN, TEL,
+    MTD…), sociétés US-listed malgré une incorporation européenne.
+
+    v4.3 (2026-09-01) : logique extraite de load_secteur_mapping() pour être
+    testable sans base de données (tests/test_zones_macro.py, roadmap #20).
+    Comportement strictement inchangé — 'Belgium' appartenant déjà à PAYS_EU,
+    le test redondant `pays == 'Belgium' or ...` a été supprimé.
+    """
+    pays = pays or ''
+    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+        return ['KR']                 # Corée : pas de fallback US/EU
+    if '.' not in ticker:
+        return ['US', 'EU']           # coté NYSE/NASDAQ
+    if pays in PAYS_EU:
+        return ['EU', 'US']
+    return ['US', 'EU']
 
 
 # ============================================================
@@ -128,22 +152,9 @@ def load_secteur_mapping() -> dict[str, dict]:
 
     mapping = {}
     for ticker, secteur, pays in rows:
-        pays = pays or ''
-        # Règle : un ticker sans suffixe Yahoo est coté au NYSE/NASDAQ → zone US,
-        # peu importe le pays du siège retourné par Yahoo Finance.
-        # Corrige les ADR comme NXPI (NL), ACN/AON/ETN/JCI/MDT/TEL/TT (IE),
-        # APTV/CB/MTD (CH), LIN/WTW (UK) — sociétés US-listed malgré leur
-        # incorporation européenne pour raisons fiscales.
-        is_us_listed = '.' not in ticker
-        if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-            zone_priority = ['KR']          # Corée : pas de fallback US/EU
-        elif is_us_listed:
-            zone_priority = ['US', 'EU']
-        elif pays == 'Belgium' or pays in PAYS_EU:
-            zone_priority = ['EU', 'US']
-        else:
-            zone_priority = ['US', 'EU']
-        mapping[ticker] = {"secteur": secteur, "zone_priority": zone_priority}
+        # Règle de zone : voir zone_priority_for() ci-dessus (v4.3).
+        mapping[ticker] = {"secteur": secteur,
+                           "zone_priority": zone_priority_for(ticker, pays)}
 
     return mapping
 

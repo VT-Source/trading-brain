@@ -21,12 +21,24 @@
 #                     (univers dérivé de tickers_info.monnaie) vers la
 #                     table taux_change. ON CONFLICT metadata : COALESCE
 #                     monnaie (gotcha tickers pré-insérés).
+# v1.6 (2026-09-01) — sync_prix_logic : l'audit post-sync des tickers en
+#                     retard déclenche désormais une alerte push
+#                     (roadmap #19, point b). Il n'écrivait jusqu'ici que
+#                     dans les logs Railway — c'est-à-dire nulle part le
+#                     jour de l'incident du 16/05.
 # ============================================================
 
 import time
 import pandas as pd
 import yfinance as yf
 from sqlalchemy import text
+
+# Import tolérant : sync.py doit rester importable sans alerting.py.
+try:
+    from alerting import alert_tickers_stale
+except Exception:
+    def alert_tickers_stale(*a, **k):
+        return {"sent": False, "reason": "module_absent"}
 
 
 # ============================================================
@@ -210,6 +222,9 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None, tic
                     print(f"      {t} → {d}")
                 if len(stale) > 30:
                     print(f"      ... et {len(stale) - 30} autre(s)")
+                # (b) Alerte push — seul signal qui aurait attrapé le 16/05.
+                # Seuil interne : 5 tickers (1-2 = feed cassé isolé).
+                alert_tickers_stale(stale, ref_d)
             else:
                 print(f"✅ Audit post-sync : tous les tickers à jour (≥ {ref_d}).")
         except Exception as e_audit:
