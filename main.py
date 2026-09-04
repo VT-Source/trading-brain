@@ -96,7 +96,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.13.0"
+APP_VERSION = "6.14.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -118,10 +118,16 @@ engine = create_engine(
 #   BB_lower → 20 jours
 #   vol_avg  → 20 jours
 #   ATR_14   → 14 jours (réel si prix_haut/prix_bas disponibles)
-# On charge 220 jours pour avoir la SMA_200 correcte + marge.
+# R4 (2026-09-04) : 220 jours CALENDAIRES ≈ 150 barres de bourse
+# (jours ouvrés - fériés), donc insuffisant pour une SMA_200 réelle —
+# celle écrite en incrémental était en pratique une SMA~150. Or ce
+# seuil sert à la fois de filtre d'entrée et de condition de sortie
+# (prix < SMA 200) : le moteur décidait sur un indicateur faux.
+# 320 jours calendaires ≈ 228 barres, marge suffisante au-dessus de 200
+# même les périodes chargées en jours fériés (Noël/nouvel an).
 # On ne sauvegarde que les 5 derniers jours (nouveaux / modifiés).
 # ============================================================
-INCREMENTAL_LOOKBACK_DAYS = 220
+INCREMENTAL_LOOKBACK_DAYS = 320
 INCREMENTAL_SAVE_DAYS     = 5
 
 # ============================================================
@@ -2239,7 +2245,11 @@ def run_analysis_logic(full: bool = False):
                 group['rsi_14'] = 100 - (100 / (1 + gain / (loss + 1e-9)))
 
                 # Moyennes mobiles
-                group['sma_200'] = price.rolling(200, min_periods=1).mean()
+                # R4 (2026-09-04) : min_periods=200 strict — avec min_periods=1,
+                # la moyenne était biaisée vers le prix courant tant que la fenêtre
+                # n'avait pas 200 barres (cf. note "Calculs rolling", CLAUDE.md).
+                # Lookback 320j (ci-dessus) garantit désormais assez de barres.
+                group['sma_200'] = price.rolling(200, min_periods=200).mean()
                 group['sma_50']  = price.rolling(50,  min_periods=1).mean()
 
                 # Bandes de Bollinger
