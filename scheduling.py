@@ -1,5 +1,5 @@
 # ============================================================
-# scheduling.py — Règles d'ordonnancement pures — Trading Brain v1.0
+# scheduling.py — Règles d'ordonnancement pures — Trading Brain v1.1
 # VT-Source/trading-brain
 # ============================================================
 # Règles de décision du pipeline nocturne, extraites de main.py pour être
@@ -48,6 +48,36 @@ def analysis_should_skip(job_status: dict | None) -> tuple[bool, str]:
                       "synchronisés (incident du 2026-09-07)")
 
     return False, ""
+
+
+def masque_barres_closes(dates, aujourd_hui) -> list[bool]:
+    """
+    Quelles barres correspondent à une séance TERMINÉE ?
+
+    Incident du 2026-09-07 : le pipeline tourne à 01h00 UTC, soit 10h00 KST
+    — le KRX est ouvert depuis une heure. yfinance renvoie alors la barre
+    du jour EN COURS pour les 10 tickers coréens : volume à 9-20 % de sa
+    médiane, donc RVOL effondré. Le RVOL pesant 25 % du score composite,
+    la zone KR disparaissait du ranking du lundi au vendredi et n'y
+    réapparaissait que le samedi, seul jour calculé sur données closes
+    (21 apparitions sur 39 en 60 jours, RVOL 1,06 le samedi contre 0,20
+    à 0,32 du mardi au jeudi).
+
+    La barre partielle était ensuite écrasée par la barre complète au run
+    suivant : le bug ne laissait aucune trace dans la table des prix, et
+    n'était visible que dans les snapshots de `ranking_hebdo`.
+
+    Règle : on ne stocke que des séances closes. La barre du jour D entre
+    en base, complète, au run de D+1. Vrai quel que soit le fuseau et quel
+    que soit le marché — contrairement à un décalage d'horaire, qui
+    redevient faux au prochain changement d'heure ou au prochain fuseau
+    ajouté à l'univers.
+
+    `dates` : itérable de datetime.date. `aujourd_hui` : datetime.date.
+    Retourne un masque booléen de même longueur, utilisable tel quel pour
+    filtrer un DataFrame.
+    """
+    return [d < aujourd_hui for d in dates]
 
 
 def analysis_should_follow_sync(job_status: dict | None) -> tuple[bool, str]:

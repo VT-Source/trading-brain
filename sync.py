@@ -26,12 +26,21 @@
 #                     (roadmap #19, point b). Il n'écrivait jusqu'ici que
 #                     dans les logs Railway — c'est-à-dire nulle part le
 #                     jour de l'incident du 16/05.
+# v1.7 (2026-09-07) — sync_prix_logic : rejet des barres datées du jour
+#                     courant (séance en cours). Le pipeline tourne à
+#                     01h00 UTC = 10h00 KST, KRX ouvert : les 10 tickers
+#                     coréens entraient avec un volume à ~14 % du normal,
+#                     ce qui effondrait leur RVOL (25 % du score) et les
+#                     effaçait du ranking en semaine. Règle dans
+#                     scheduling.py (`masque_barres_closes`), testée.
 # ============================================================
 
 import time
 import pandas as pd
 import yfinance as yf
 from sqlalchemy import text
+
+from scheduling import masque_barres_closes
 
 # Import tolérant : sync.py doit rester importable sans alerting.py.
 try:
@@ -165,6 +174,16 @@ def sync_prix_logic(engine, full: bool = False, period_override: str = None, tic
                     df_clean = df_yf[[c for c in cols if c in df_yf.columns]].dropna(
                         subset=["prix_cloture"]
                     )
+
+                    # v1.7 — On ne stocke que des séances CLOSES. Une barre
+                    # datée d'aujourd'hui est une séance en cours (cas KRX,
+                    # ouvert quand le pipeline tourne) : volume partiel, donc
+                    # RVOL faussé. Elle arrivera complète au run suivant.
+                    if not df_clean.empty:
+                        df_clean = df_clean[
+                            masque_barres_closes(df_clean["date"],
+                                                 pd.Timestamp.today().date())
+                        ]
 
                     if df_clean.empty:
                         continue
