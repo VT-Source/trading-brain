@@ -18,7 +18,6 @@ yfinance
 requests
 
 # --- Analyse Technique & Backtest ---
-pandas_ta
 vectorbt
 plotly<6.0.0
 
