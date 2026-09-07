@@ -49,6 +49,12 @@ except Exception as _e_alert:
     def send_test_alert(*a, **k):           return _NOOP_ALERT
     def alerting_status():                  return {"enabled": False, "configured": False}
 
+# --- Règles d'ordonnancement pures (garde-fou anti-chevauchement) ---
+# Import volontairement NON gardé, contrairement à alerting.py : un garde-fou
+# de sécurité qui disparaît en silence est pire que son absence. scheduling.py
+# n'a aucune dépendance externe — s'il manque, le démarrage doit échouer.
+from scheduling import analysis_should_follow_sync, analysis_should_skip
+
 try:
     from train_model import train_brain
 except ImportError:
@@ -96,7 +102,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.14.0"
+APP_VERSION = "6.15.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -225,7 +231,16 @@ def _auto_generate_opinions():
 # SCHEDULER INTÉGRÉ (BackgroundScheduler)
 # ============================================================
 
-scheduler = BackgroundScheduler(timezone="Europe/Brussels")
+# ⚠️ FUSEAU — constat du 2026-09-07 via /health-jobs : malgré la déclaration
+# `timezone="Europe/Brussels"` en place jusqu'ici, les 7 jobs du pipeline se
+# déclenchaient tous exactement +2h00 après l'heure annoncée, soit l'écart
+# UTC↔CEST. Les CronTrigger tournaient donc en UTC.
+# Décision (2026-09-07) : assumer l'UTC plutôt que de courir après la cause.
+# Les heures ci-dessous sont INCHANGÉES en pratique — seule la déclaration
+# devient conforme à ce que la prod fait déjà, et les commentaires cessent de
+# mentir. Corollaire : l'équivalent local suit l'heure d'été (UTC+2 en été,
+# UTC+1 en hiver). C'est l'UTC qui fait foi.
+scheduler = BackgroundScheduler(timezone="UTC")
 
 # --- Suivi santé des jobs scheduler ---
 job_status = {}
@@ -295,44 +310,87 @@ def _poll_ai_opinions_with_alert(engine):
     return res
 
 
+def _pipeline_prix_puis_analyse(engine):
+    """
+    Chaîne l'analyse sur la fin RÉELLE de la sync des prix.
+
+    Incident du 2026-09-07 : les deux jobs étaient planifiés à heure fixe,
+    30 min d'écart, sur la base d'une sync de ~5 min. La sync en prend
+    désormais ~33 : l'analyse démarrait pendant que sync_prix écrivait
+    encore dans actions_prix_historique. Comme la sync traite les tickers
+    dans l'ordre, les 28 derniers (V→Z) sortaient sans aucun indicateur —
+    et le job se terminait en « ok ».
+
+    Tout planning à heure fixe repose sur une durée qui dérive. Le chaînage
+    supprime le pari. Chaque étape garde son entrée propre dans job_status
+    (donc /health-jobs et les libellés du dashboard sont inchangés).
+    """
+    _run_job("sync_prix", sync_prix_logic, engine, full=False)
+
+    suivre, motif = analysis_should_follow_sync(job_status)
+    if not suivre:
+        # Mieux vaut pas d'indicateurs que des indicateurs sur prix partiels
+        # (même principe que la sma_200 NULL de R4, décision du 2026-09-04).
+        print(f"⏭️  Analyse non enchaînée : {motif}")
+        job_status["analyse"] = {
+            "status": "skipped",
+            "skipped_at": pd.Timestamp.now(tz="Europe/Brussels").isoformat(),
+            "reason": motif,
+        }
+        return
+
+    _run_job("analyse", run_analysis_logic, full=False)
+
+
 @app.on_event("startup")
 def start_scheduler():
     # Migration colonnes v1.2 (safe — ignore si déjà faites)
     if engine:
         _migrate_avis_ia_columns(engine)
 
-    # --- Taux de change (00h55, avant le pipeline data) — v6.11.0 ---
+    # ========================================================
+    # HORAIRES EN UTC (cf. bloc ATTENTION FUSEAU plus haut).
+    # Équivalent Bruxelles : +2h en heure d'été, +1h en heure d'hiver.
+    # ========================================================
+
+    # --- Taux de change (00h55 UTC = 02h55 été / 01h55 hiver) — v6.11.0 ---
     scheduler.add_job(lambda: _run_job("sync_fx", sync_taux_change_logic, engine, full=False),
                       CronTrigger(day_of_week="mon-sat", hour=0, minute=55),
                       id="sync_fx", replace_existing=True, misfire_grace_time=600)
 
     # --- Pipeline data nocturne (lun-sam) ---
-    scheduler.add_job(lambda: _run_job("sync_prix", sync_prix_logic, engine, full=False),
+    # 01h00 UTC = 03h00 été / 02h00 hiver. L'analyse n'a PLUS d'horaire
+    # propre : elle est enchaînée à la fin réelle de la sync des prix
+    # (v6.15.0, incident du 2026-09-07). Voir _pipeline_prix_puis_analyse.
+    scheduler.add_job(lambda: _pipeline_prix_puis_analyse(engine),
                       CronTrigger(day_of_week="mon-sat", hour=1, minute=0),
-                      id="sync_prix", replace_existing=True, misfire_grace_time=600)
-    scheduler.add_job(lambda: _run_job("analyse", run_analysis_logic, full=False),
-                      CronTrigger(day_of_week="mon-sat", hour=1, minute=30),
-                      id="analyse", replace_existing=True, misfire_grace_time=600)
+                      id="sync_prix_analyse", replace_existing=True, misfire_grace_time=600)
+
+    # --- ETF sectoriels (01h45 UTC = 03h45 été / 02h45 hiver) ---
+    # ⚠️ Démarre 45 min après la sync des prix, qui en prend ~33 : marge
+    # réelle ~12 min. À surveiller dans /health-jobs (duration_s de
+    # sync_prix) — c'est le prochain chevauchement candidat.
     scheduler.add_job(lambda: _run_job("sync_etf", sync_secteurs_etf_logic, engine, full=False),
                       CronTrigger(day_of_week="mon-sat", hour=1, minute=45),
                       id="sync_etf", replace_existing=True, misfire_grace_time=600)
+    # --- Metadata Yahoo (02h00 UTC = 04h00 été / 03h00 hiver) ---
     scheduler.add_job(lambda: _run_job("sync_metadata", sync_metadata_logic, engine),
                       CronTrigger(day_of_week="mon-sat", hour=2, minute=0),
                       id="sync_metadata", replace_existing=True, misfire_grace_time=600)
 
-    # --- Ranking quotidien (lun-sam 02h15) ---
+    # --- Ranking quotidien (02h15 UTC = 04h15 été / 03h15 hiver) ---
     # Lun-ven : ranking sur clôtures du jour-1
-    # Sam     : ranking sur clôtures du vendredi US (utilisé par l'AI samedi 06h00)
+    # Sam     : ranking sur clôtures du vendredi US (utilisé par l'AI samedi)
     scheduler.add_job(lambda: _run_job("compute_ranking", compute_and_store_ranking, top_n=20),
                       CronTrigger(day_of_week="mon-sat", hour=2, minute=15),
                       id="compute_ranking", replace_existing=True, misfire_grace_time=600)
 
-    # --- Suivi rendements quotidien (lun-sam 02h30) ---
+    # --- Suivi rendements quotidien (02h30 UTC = 04h30 été / 03h30 hiver) ---
     scheduler.add_job(lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
                       CronTrigger(day_of_week="mon-sat", hour=2, minute=30),
                       id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
 
-    # --- Avis IA auto top 5 : SOUMISSION du batch (samedi 06h00) ---
+    # --- Avis IA auto top 5 : SOUMISSION du batch (samedi 06h00 UTC = 08h00 été) ---
     scheduler.add_job(lambda: _run_job("ai_opinions", _auto_generate_opinions),
                       CronTrigger(day_of_week="sat", hour=6, minute=0),
                       id="ai_opinions", replace_existing=True, misfire_grace_time=600)
@@ -347,7 +405,8 @@ def start_scheduler():
                       id="poll_ai_opinions", replace_existing=True, misfire_grace_time=300)
 
     scheduler.start()
-    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 9 jobs planifiés (Europe/Brussels)")
+    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 8 jobs planifiés en UTC "
+          f"(9 étapes suivies : sync_prix et analyse partagent un job chaîné)")
 
 # ============================================================
 # ENDPOINTS API
@@ -2180,6 +2239,16 @@ def compute_and_store_ranking(top_n: int = 20):
 
 def run_analysis_logic(full: bool = False):
     if engine is None: return
+
+    # --- Garde-fou anti-chevauchement (incident du 2026-09-07) ---
+    # Le chaînage (_pipeline_prix_puis_analyse) supprime la course côté
+    # scheduler. Ce garde-fou couvre ce qu'il ne couvre pas : un appel
+    # manuel à /run-analysis ou /run-analysis-full pendant que la sync
+    # nocturne écrit encore. Règle pure et testée → scheduling.py.
+    skip, motif = analysis_should_skip(job_status)
+    if skip:
+        print(f"⏭️  Analyse annulée — {motif}")
+        return {"status": "skipped", "message": motif}
 
     mode = "COMPLET" if full else "INCRÉMENTAL"
     print(f"🚀 Démarrage Analyse v{APP_VERSION} — mode {mode}...")
