@@ -9,7 +9,10 @@
 # Sans DB, sans réseau.
 # ============================================================
 
-from scheduling import analysis_should_follow_sync, analysis_should_skip
+from datetime import date
+
+from scheduling import (analysis_should_follow_sync, analysis_should_skip,
+                        masque_barres_closes)
 
 
 # ------------------------------------------------------------
@@ -82,3 +85,36 @@ def test_n_enchaine_pas_sans_statut():
     assert analysis_should_follow_sync({})[0] is False
     assert analysis_should_follow_sync(None)[0] is False
     assert analysis_should_follow_sync({"sync_prix": {}})[0] is False
+
+
+# ------------------------------------------------------------
+# masque_barres_closes — rejet des séances en cours
+# ------------------------------------------------------------
+
+AUJOURDHUI = date(2026, 9, 7)
+
+
+def test_barre_du_jour_rejetee():
+    """LE cas KRX : à 01h00 UTC le marché coréen est ouvert depuis 1h."""
+    assert masque_barres_closes([AUJOURDHUI], AUJOURDHUI) == [False]
+
+
+def test_barres_passees_conservees():
+    veille = date(2026, 9, 4)
+    assert masque_barres_closes([veille], AUJOURDHUI) == [True]
+
+
+def test_serie_mixte():
+    """Cas réel : yfinance renvoie l'historique + la barre du jour en cours."""
+    dates = [date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 4), AUJOURDHUI]
+    assert masque_barres_closes(dates, AUJOURDHUI) == [True, True, True, False]
+
+
+def test_barre_future_rejetee():
+    """Ne devrait pas arriver, mais un fuseau mal géré côté feed le pourrait."""
+    demain = date(2026, 9, 8)
+    assert masque_barres_closes([demain], AUJOURDHUI) == [False]
+
+
+def test_serie_vide():
+    assert masque_barres_closes([], AUJOURDHUI) == []
