@@ -1,5 +1,8 @@
 # ============================================================
-# backtest_ranking.py — Backtest Momentum Ranking v4.3
+# backtest_ranking.py — Backtest Momentum Ranking v4.4
+# v4.4 (2026-09-07) : retrait du bloc inatteignable en fin de
+#   run_backtest_ranking_logic (dupliqué après le return) + import
+#   timedelta inutilisé. Aucun changement de comportement (R12).
 # Trading Brain | VT-Source
 # ============================================================
 # Appel : GET /run-backtest?mode=ranking&top_n=5
@@ -24,7 +27,6 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from sklearn.linear_model import LinearRegression
-from datetime import timedelta
 
 load_dotenv()
 
@@ -961,41 +963,6 @@ def run_backtest_ranking_logic(top_n: int = 5, k = None, macro: str = "off", sma
     print(f"{'='*60}")
     result_150 = run_hybrid_backtest(max_positions=top_n, sma_period=150, min_mom_r2=effective_mom_r2)
 
-    m200 = result_200["metriques"]
-    m150 = result_150["metriques"]
-    print(f"\n{'='*60}")
-    print(f"📋 COMPARATIF SMA TICKER")
-    print(f"{'='*60}")
-    print(f"   SMA 200 → Sharpe={m200['sharpe_ratio']} | Return={m200['total_return_pct']}% | MaxDD={m200['max_drawdown_pct']}% | Trades={m200['nb_trades']} | PF={m200['profit_factor']} | AvgDur={m200['avg_duration_days']}j")
-    print(f"   SMA 150 → Sharpe={m150['sharpe_ratio']} | Return={m150['total_return_pct']}% | MaxDD={m150['max_drawdown_pct']}% | Trades={m150['nb_trades']} | PF={m150['profit_factor']} | AvgDur={m150['avg_duration_days']}j")
-
-    best = "SMA 200" if m200["sharpe_ratio"] >= m150["sharpe_ratio"] else "SMA 150"
-    print(f"   → {best} wins on Sharpe")
-
-    return {
-        "comparison": {
-            "sma_200": m200,
-            "sma_150": m150,
-            "best": best,
-        },
-        "details": {
-            "sma_200": result_200,
-            "sma_150": result_150,
-        }
-    }
-
-    # Mode comparaison : tester SMA 200 et SMA 150
-    print(f"\n{'='*60}")
-    print(f"🔄 Test SMA 200 (baseline)")
-    print(f"{'='*60}")
-    result_200 = run_hybrid_backtest(max_positions=top_n, sma_period=200)
-
-    print(f"\n{'='*60}")
-    print(f"🔄 Test SMA 150")
-    print(f"{'='*60}")
-    result_150 = run_hybrid_backtest(max_positions=top_n, sma_period=150)
-
-    # Comparatif
     m200 = result_200["metriques"]
     m150 = result_150["metriques"]
     print(f"\n{'='*60}")
