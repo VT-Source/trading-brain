@@ -103,7 +103,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.17.0"
+APP_VERSION = "6.18.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -591,6 +591,14 @@ async def trigger_compute_ranking(background_tasks: BackgroundTasks, top_n: int 
         "status": "processing",
         "message": f"Calcul ranking lancé en arrière-plan (top {top_n})."
     }
+
+# --- Rattrapage du ranking sur une plage passée (roadmap #31) ---
+# L'endpoint vit dans backfill_api.py : main.py est repassé sous les 100 Ko
+# au prix du lot #5, et y rajouter un endpoint par lot reconstruirait le
+# problème. `engine` et `_run_job` sont injectés (motif ranking.py).
+# Import local assumé : garde la modification de main.py à un seul bloc.
+from backfill_api import creer_router_backfill
+app.include_router(creer_router_backfill(engine, _run_job))
 
 @app.get("/ranking-live")
 def ranking_live(top_n: int = 20):
