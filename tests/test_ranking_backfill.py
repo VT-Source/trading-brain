@@ -33,7 +33,8 @@ import pandas as pd
 import pytest
 
 import ranking
-from ranking import backfill_ranking, dates_a_backfiller, date_de_scoring
+from ranking import (backfill_ranking, dates_a_backfiller, date_de_scoring,
+                     valider_plage_backfill)
 
 
 # Le trou réel : job de ranking figé du 24 au 31/08/2026 (roadmap #25).
@@ -175,6 +176,98 @@ def test_les_indicateurs_sont_causaux():
         assert obtenu == pytest.approx(attendu, rel=1e-9, nan_ok=True), (
             f"{col} dépend de données postérieures à la date de scoring"
         )
+
+
+# ============================================================
+# valider_plage_backfill — la règle partagée endpoint / fonction
+# ============================================================
+
+AUJ = date(2026, 9, 8)
+
+
+def test_plage_correcte_ne_renvoie_aucun_message():
+    assert valider_plage_backfill(date(2026, 8, 24), date(2026, 8, 31), AUJ) is None
+
+
+def test_message_pour_plage_inversee():
+    assert "précéder" in valider_plage_backfill(date(2026, 8, 31),
+                                                date(2026, 8, 24), AUJ)
+
+
+def test_message_pour_plage_trop_large():
+    assert "maximum" in valider_plage_backfill(date(2026, 1, 1),
+                                               date(2026, 8, 31), AUJ)
+
+
+def test_message_pour_fin_non_passee():
+    """Classer aujourd'hui est le travail du job quotidien."""
+    assert "antérieure" in valider_plage_backfill(date(2026, 9, 1), AUJ, AUJ)
+    assert "antérieure" in valider_plage_backfill(date(2026, 9, 1),
+                                                  date(2026, 9, 9), AUJ)
+
+
+# ============================================================
+# Endpoint — délégation, pas de duplication
+# ============================================================
+
+def _appeler_endpoint(**params):
+    """
+    Appelle la fonction de route directement (ni serveur, ni client HTTP) et
+    retourne (réponse, tâches de fond programmées).
+    """
+    import asyncio
+    from backfill_api import creer_router_backfill
+
+    taches = []
+
+    class FausseBackgroundTasks:
+        def add_task(self, func, *args, **kwargs):
+            taches.append((func, args, kwargs))
+
+    router = creer_router_backfill(engine=object(), run_job=lambda *a, **k: None)
+    route = next(r for r in router.routes if r.path == "/backfill-ranking")
+    reponse = asyncio.run(route.endpoint(background_tasks=FausseBackgroundTasks(),
+                                         **params))
+    return reponse, taches
+
+
+def test_endpoint_refuse_une_date_non_iso_sans_rien_lancer():
+    reponse, taches = _appeler_endpoint(debut="24/08/2026", fin="2026-08-31")
+    assert reponse["status"] == "error"
+    assert taches == []
+
+
+def test_endpoint_et_fonction_appliquent_la_meme_regle():
+    """
+    Anti-#30 : l'endpoint et `backfill_ranking` doivent refuser les mêmes
+    plages avec le même message. S'ils divergent un jour, c'est ici que ça
+    se voit — pas en production.
+    """
+    debut, fin = date(2025, 1, 1), date(2025, 12, 31)   # trop large
+    reponse, taches = _appeler_endpoint(debut=str(debut), fin=str(fin))
+    direct = backfill_ranking(SENTINELLE, debut, fin)
+
+    assert reponse["status"] == "error" and direct["status"] == "error"
+    assert reponse["message"] == direct["message"]
+    assert taches == []
+
+
+def test_endpoint_simule_par_defaut():
+    """dry_run doit rester vrai sans paramètre : on ne réécrit pas par défaut."""
+    reponse, taches = _appeler_endpoint(debut="2026-08-24", fin="2026-08-31")
+
+    assert reponse["status"] == "processing"
+    assert reponse["mode"] == "dry_run"
+    assert len(taches) == 1
+    assert taches[0][2]["dry_run"] is True
+
+
+def test_endpoint_transmet_l_ecriture_demandee():
+    reponse, taches = _appeler_endpoint(debut="2026-08-24", fin="2026-08-31",
+                                        dry_run=False, overwrite=True)
+    assert reponse["mode"] == "ecriture"
+    assert taches[0][2]["dry_run"] is False
+    assert taches[0][2]["overwrite"] is True
 
 
 # ============================================================
