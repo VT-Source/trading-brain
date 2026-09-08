@@ -4,14 +4,12 @@ import os
 import re
 import json
 import traceback
-import time
 import joblib
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import date, timedelta
+from datetime import date
 from fastapi import FastAPI, BackgroundTasks
 from models_api import (
     PositionOpenPayload,
@@ -38,14 +36,15 @@ from dotenv import load_dotenv
 # Sans les variables TELEGRAM_*, le module est déjà un no-op silencieux.
 try:
     from alerting import (alert_job_failure, alert_batch_avis_bloque,
-                          alert_ranking_composition, alerting_status,
-                          send_test_alert)
+                          alert_ranking_composition, alert_fraicheur_places,
+                          alerting_status, send_test_alert)
 except Exception as _e_alert:
     print(f"⚠️ alerting.py indisponible ({_e_alert}) — alertes désactivées")
     _NOOP_ALERT = {"sent": False, "reason": "module_absent"}
     def alert_job_failure(*a, **k):         return _NOOP_ALERT
     def alert_batch_avis_bloque(*a, **k):   return _NOOP_ALERT
     def alert_ranking_composition(*a, **k): return _NOOP_ALERT
+    def alert_fraicheur_places(*a, **k):    return _NOOP_ALERT
     def send_test_alert(*a, **k):           return _NOOP_ALERT
     def alerting_status():                  return {"enabled": False, "configured": False}
 
@@ -54,6 +53,7 @@ except Exception as _e_alert:
 # de sécurité qui disparaît en silence est pire que son absence. scheduling.py
 # n'a aucune dépendance externe — s'il manque, le démarrage doit échouer.
 from scheduling import analysis_should_follow_sync, analysis_should_skip
+from freshness import diagnostic_fraicheur, derniere_seance_commune
 
 try:
     from train_model import train_brain
@@ -102,7 +102,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.15.0"
+APP_VERSION = "6.16.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -135,6 +135,30 @@ engine = create_engine(
 # ============================================================
 INCREMENTAL_LOOKBACK_DAYS = 320
 INCREMENTAL_SAVE_DAYS     = 5
+
+# ============================================================
+# GARDE-FOU DE FRAÎCHEUR PAR PLACE DE COTATION (roadmap #28)
+# ============================================================
+# Que faire quand une place de cotation n'est pas exploitable à la date
+# de classement (couverture partielle, ou absence de plus d'une séance) :
+#   observer — diagnostiquer, tracer, alerter, mais classer quand même.
+#              Mode de déploiement : on mesure le taux de fausses alertes
+#              sur données de prod avant de laisser la règle décider.
+#   exclure  — écarter les tickers des places douteuses et classer le reste.
+#   aligner  — écarter les places douteuses PUIS classer tout le monde à la
+#              dernière séance commune aux places saines. Seul mode qui
+#              supprime vraiment la comparaison inter-dates : un férié local
+#              (US fermés, Corée ouverte) laisse sinon le score comparer du
+#              04/09 américain à du 07/09 coréen, ce qui est légitime côté
+#              données mais reste une comparaison décalée d'une séance.
+#              Coût : le ranking recule d'une séance chaque jour férié local.
+#   refuser  — ne pas écrire de ranking du tout ce jour-là.
+# Piloté par variable d'environnement : basculer ne demande ni commit ni
+# upload de main.py, qui pèse plus de 100 Ko (cf. procédure GitHub).
+POLITIQUE_FRAICHEUR = os.getenv("FRAICHEUR_POLITIQUE", "observer").strip().lower()
+if POLITIQUE_FRAICHEUR not in ("observer", "exclure", "aligner", "refuser"):
+    print(f"⚠️ FRAICHEUR_POLITIQUE={POLITIQUE_FRAICHEUR!r} inconnue — repli sur 'observer'")
+    POLITIQUE_FRAICHEUR = "observer"
 
 # ============================================================
 # CALCUL INDICATEURS À LA VOLÉE — pour avis IA ad hoc
@@ -287,7 +311,8 @@ def _summarize_result(result):
         # Garder uniquement status/error/count keys
         return {k: v for k, v in result.items()
                 if k in ("status", "error", "updated", "total_checked", "nb_ranked",
-                         "nb_opinions", "data_date", "message")}
+                         "nb_opinions", "data_date", "message", "fraicheur",
+                         "nb_exclus")}
     return str(result)[:200]
 
 def _poll_ai_opinions_with_alert(engine):
@@ -2166,6 +2191,60 @@ def compute_and_store_ranking(top_n: int = 20):
             return {"error": "Aucune donnée disponible"}
  
         latest_date = max(all_dates)
+
+        # 4bis. Garde-fou de fraîcheur par place de cotation (roadmap #28)
+        #
+        # compute_composite_score accepte pour chaque ticker sa dernière barre
+        # disponible jusqu'à 5 jours d'écart, en silence (backtest_ranking.py
+        # l. 386-388). Le score composite compare donc des tickers arrêtés à
+        # des dates différentes — et comme la normalisation min-max est
+        # calculée sur l'ensemble des candidats, une place décalée ne fausse
+        # pas seulement ses propres lignes : elle déplace le score de tout le
+        # monde. Deux incidents en deux jours viennent de là (Corée trop tôt,
+        # Europe trop tard).
+        #
+        # La règle est pure et testée → freshness.py. Elle raisonne par PLACE
+        # et non par zone : une place porte un calendrier de bourse, pas une
+        # zone. Sans ce découpage, le 14 juillet (Paris fermé, Amsterdam et
+        # Bruxelles ouverts) deviendrait une fausse alerte annuelle.
+        dernieres_dates = {
+            t: df.index.max().date()
+            for t, df in ticker_data.items() if not df.empty
+        }
+        diagnostic = diagnostic_fraicheur(
+            dernieres_dates,
+            calendrier={d.date() for d in all_dates},
+            zones={t: get_ticker_zone(t, secteur_mapping) for t in ticker_data},
+        )
+        print(f"🕐 Fraîcheur : {diagnostic['resume']}")
+
+        if not diagnostic["ok"]:
+            # (e) Alerte push — l'alerte (b) sur tickers en retard a un seuil
+            # de 3 jours, sous lequel une séance manquante passait.
+            alert_fraicheur_places(diagnostic)
+
+            if POLITIQUE_FRAICHEUR == "refuser":
+                print("⏭️  Ranking non calculé — places arrêtées à des séances différentes")
+                return {"status": "skipped", "message": diagnostic["resume"],
+                        "fraicheur": diagnostic["resume"],
+                        "data_date": str(latest_date.date())}
+
+            if POLITIQUE_FRAICHEUR in ("exclure", "aligner"):
+                for t in diagnostic["tickers_exclus"]:
+                    ticker_data.pop(t, None)
+                print(f"✂️  {len(diagnostic['tickers_exclus'])} tickers écartés — "
+                      f"places : {', '.join(diagnostic['places_douteuses'])}")
+                if not ticker_data:
+                    return {"error": "Aucune place exploitable"}
+
+        if POLITIQUE_FRAICHEUR == "aligner":
+            # Reculer jusqu'à la dernière séance commune aux places saines.
+            # Règle pure et testée → freshness.derniere_seance_commune.
+            commune = derniere_seance_commune(diagnostic)
+            if commune and commune < latest_date.date():
+                print(f"↩️  Alignement : classement au {commune} "
+                      f"(dernière séance commune) au lieu du {latest_date.date()}")
+                latest_date = pd.Timestamp(commune)
  
         # 5. Calculer le ranking
         ranking = compute_composite_score(
@@ -2227,7 +2306,12 @@ def compute_and_store_ranking(top_n: int = 20):
                                   nb_eligible=len(ranking),
                                   data_date=latest_date.date())
 
-        return {"status": "ok", "nb_ranked": len(records), "data_date": str(latest_date.date())}
+        return {"status": "ok", "nb_ranked": len(records),
+                "data_date": str(latest_date.date()),
+                "fraicheur": diagnostic["resume"],
+                "nb_exclus": len(diagnostic["tickers_exclus"])
+                             if POLITIQUE_FRAICHEUR in ("exclure", "aligner")
+                             else 0}
  
     except Exception as e:
         print(f"❌ Erreur compute_and_store_ranking : {e}")
@@ -2383,7 +2467,12 @@ def run_analysis_logic(full: bool = False):
 
             # 6. Filtrage des lignes à sauvegarder
             if not full:
-                save_from  = pd.Timestamp.today() - pd.Timedelta(days=INCREMENTAL_SAVE_DAYS)
+                # .normalize() : sans lui, pd.Timestamp.today() porte l'heure
+                # courante et la borne, comparée à des dates à minuit, excluait
+                # le jour le plus ancien — 4 jours sauvegardés au lieu de 5
+                # (roadmap #26).
+                save_from  = (pd.Timestamp.today().normalize()
+                              - pd.Timedelta(days=INCREMENTAL_SAVE_DAYS))
                 df_to_save = df[pd.to_datetime(df['date']) >= save_from].copy()
             else:
                 df_to_save = df.copy()

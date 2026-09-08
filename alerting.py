@@ -2,6 +2,10 @@
 # alerting.py — Alerting actif (Telegram)
 # Trading Brain | VT-Source
 # ============================================================
+# v1.1 (2026-09-08) — Déclencheur (e) : places de cotation non
+#                     exploitables (roadmap #28). Le trou européen du
+#                     07/09 (64 tickers sur 65, une seule séance) passait
+#                     sous le seuil de 3 jours du déclencheur (b).
 # v1.0 (2026-09-01) — Roadmap Phase 1 #19.
 #
 # Objectif : passer de l'observabilité *pull* (/health-jobs, logs Railway)
@@ -41,7 +45,7 @@ import os
 import time
 import requests
 
-ALERTING_VERSION = "1.0"
+ALERTING_VERSION = "1.1"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
@@ -317,4 +321,45 @@ def alert_ranking_composition(zones: list, nb_eligible: int = None,
         corps,
         level="WARN",
         dedup_key="ranking_composition",
+    )
+
+
+def alert_fraicheur_places(diagnostic: dict) -> dict:
+    """
+    (e) Places de cotation non exploitables — appelé depuis
+    compute_and_store_ranking (roadmap #28).
+
+    Complète l'alerte (b) sur les tickers en retard, dont le seuil de 3 jours
+    laisse passer une séance manquante : le trou européen du 2026-09-07
+    (64 tickers EUR sur 65, une seule séance) était sous ce seuil et n'a
+    donc déclenché aucun signal.
+
+    `diagnostic` : sortie de freshness.diagnostic_fraicheur.
+    """
+    if not diagnostic or diagnostic.get("ok", True):
+        return {"sent": False, "reason": "fraicheur_ok"}
+
+    places = diagnostic.get("places", {})
+    lignes = []
+    for nom in diagnostic.get("places_douteuses", []):
+        info = places.get(nom, {})
+        lignes.append(
+            f"  • {nom} : {info.get('nb_a_jour')}/{info.get('nb_tickers')} tickers "
+            f"au {diagnostic.get('date_reference')} "
+            f"({info.get('verdict')}, dernière barre {info.get('derniere_date')})"
+        )
+
+    corps = "\n".join(lignes)
+    zones = diagnostic.get("zones_touchees") or []
+    if zones:
+        corps += f"\n\nZones concernées : {', '.join(zones)}"
+    corps += (f"\n{len(diagnostic.get('tickers_exclus', []))} tickers écartés du "
+              f"ranking — le score composite ne compare que des places arrêtées "
+              f"à la même séance.")
+
+    return send_alert(
+        "Fraîcheur des données — places non exploitables",
+        corps,
+        level="WARN",
+        dedup_key="fraicheur_places",
     )
