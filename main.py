@@ -1,12 +1,9 @@
-import io
 import gc
 import os
 import re
 import json
 import traceback
-import joblib
 import pandas as pd
-import numpy as np
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import date
@@ -36,15 +33,12 @@ from dotenv import load_dotenv
 # Sans les variables TELEGRAM_*, le module est déjà un no-op silencieux.
 try:
     from alerting import (alert_job_failure, alert_batch_avis_bloque,
-                          alert_ranking_composition, alert_fraicheur_places,
                           alerting_status, send_test_alert)
 except Exception as _e_alert:
     print(f"⚠️ alerting.py indisponible ({_e_alert}) — alertes désactivées")
     _NOOP_ALERT = {"sent": False, "reason": "module_absent"}
     def alert_job_failure(*a, **k):         return _NOOP_ALERT
     def alert_batch_avis_bloque(*a, **k):   return _NOOP_ALERT
-    def alert_ranking_composition(*a, **k): return _NOOP_ALERT
-    def alert_fraicheur_places(*a, **k):    return _NOOP_ALERT
     def send_test_alert(*a, **k):           return _NOOP_ALERT
     def alerting_status():                  return {"enabled": False, "configured": False}
 
@@ -52,8 +46,19 @@ except Exception as _e_alert:
 # Import volontairement NON gardé, contrairement à alerting.py : un garde-fou
 # de sécurité qui disparaît en silence est pire que son absence. scheduling.py
 # n'a aucune dépendance externe — s'il manque, le démarrage doit échouer.
-from scheduling import analysis_should_follow_sync, analysis_should_skip
-from freshness import diagnostic_fraicheur, derniere_seance_commune
+from scheduling import analysis_should_follow_sync
+
+# --- Logique métier extraite de main.py (roadmap #5, 2026-09-08) ---
+# Même règle d'import que scheduling.py : NON gardé. analysis.py et ranking.py
+# portent des décisions de trade — s'ils manquent, le démarrage doit échouer
+# bruyamment plutôt que de laisser tourner une API amputée de son pipeline.
+# ⚠️ DÉPLOIEMENT COUPLÉ : main.py + analysis.py + ranking.py, un seul commit.
+from analysis import (
+    run_analysis_logic,
+    INCREMENTAL_LOOKBACK_DAYS,
+    INCREMENTAL_SAVE_DAYS,
+)
+from ranking import compute_and_store_ranking, get_secteurs_en_force
 
 try:
     from train_model import train_brain
@@ -69,10 +74,8 @@ except ImportError:
 try:
     from backtest_ranking import (
         run_backtest_ranking_logic,
-        load_all_tickers,
         load_all_price_data,
         compute_all_indicators,
-        compute_composite_score,
         compute_adaptive_k,
         load_secteur_mapping,
         load_all_secteur_force,
@@ -85,10 +88,8 @@ except ImportError:
     def run_backtest_ranking_logic(**kwargs):
         return {"erreur": "backtest_ranking.py non trouvé"}
     # Stubs pour les fonctions individuelles
-    load_all_tickers = None
     load_all_price_data = None
     compute_all_indicators = None
-    compute_composite_score = None
     compute_adaptive_k = None
     load_secteur_mapping = None
     load_all_secteur_force = None
@@ -102,7 +103,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.16.0"
+APP_VERSION = "6.17.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -117,48 +118,7 @@ engine = create_engine(
     pool_recycle=1800,  # recycle connexions après 30 min (évite connexions zombies)
 ) if DATABASE_URL else None
 
-# ============================================================
-# Contexte nécessaire pour chaque indicateur glissant :
-#   SMA_200  → 200 jours
-#   RSI_14   → 14 jours
-#   BB_lower → 20 jours
-#   vol_avg  → 20 jours
-#   ATR_14   → 14 jours (réel si prix_haut/prix_bas disponibles)
-# R4 (2026-09-04) : 220 jours CALENDAIRES ≈ 150 barres de bourse
-# (jours ouvrés - fériés), donc insuffisant pour une SMA_200 réelle —
-# celle écrite en incrémental était en pratique une SMA~150. Or ce
-# seuil sert à la fois de filtre d'entrée et de condition de sortie
-# (prix < SMA 200) : le moteur décidait sur un indicateur faux.
-# 320 jours calendaires ≈ 228 barres, marge suffisante au-dessus de 200
-# même les périodes chargées en jours fériés (Noël/nouvel an).
-# On ne sauvegarde que les 5 derniers jours (nouveaux / modifiés).
-# ============================================================
-INCREMENTAL_LOOKBACK_DAYS = 320
-INCREMENTAL_SAVE_DAYS     = 5
 
-# ============================================================
-# GARDE-FOU DE FRAÎCHEUR PAR PLACE DE COTATION (roadmap #28)
-# ============================================================
-# Que faire quand une place de cotation n'est pas exploitable à la date
-# de classement (couverture partielle, ou absence de plus d'une séance) :
-#   observer — diagnostiquer, tracer, alerter, mais classer quand même.
-#              Mode de déploiement : on mesure le taux de fausses alertes
-#              sur données de prod avant de laisser la règle décider.
-#   exclure  — écarter les tickers des places douteuses et classer le reste.
-#   aligner  — écarter les places douteuses PUIS classer tout le monde à la
-#              dernière séance commune aux places saines. Seul mode qui
-#              supprime vraiment la comparaison inter-dates : un férié local
-#              (US fermés, Corée ouverte) laisse sinon le score comparer du
-#              04/09 américain à du 07/09 coréen, ce qui est légitime côté
-#              données mais reste une comparaison décalée d'une séance.
-#              Coût : le ranking recule d'une séance chaque jour férié local.
-#   refuser  — ne pas écrire de ranking du tout ce jour-là.
-# Piloté par variable d'environnement : basculer ne demande ni commit ni
-# upload de main.py, qui pèse plus de 100 Ko (cf. procédure GitHub).
-POLITIQUE_FRAICHEUR = os.getenv("FRAICHEUR_POLITIQUE", "observer").strip().lower()
-if POLITIQUE_FRAICHEUR not in ("observer", "exclure", "aligner", "refuser"):
-    print(f"⚠️ FRAICHEUR_POLITIQUE={POLITIQUE_FRAICHEUR!r} inconnue — repli sur 'observer'")
-    POLITIQUE_FRAICHEUR = "observer"
 
 # ============================================================
 # CALCUL INDICATEURS À LA VOLÉE — pour avis IA ad hoc
@@ -364,7 +324,8 @@ def _pipeline_prix_puis_analyse(engine):
         }
         return
 
-    _run_job("analyse", run_analysis_logic, full=False)
+    _run_job("analyse", run_analysis_logic, engine, job_status,
+             full=False, app_version=APP_VERSION)
 
 
 @app.on_event("startup")
@@ -406,7 +367,8 @@ def start_scheduler():
     # --- Ranking quotidien (02h15 UTC = 04h15 été / 03h15 hiver) ---
     # Lun-ven : ranking sur clôtures du jour-1
     # Sam     : ranking sur clôtures du vendredi US (utilisé par l'AI samedi)
-    scheduler.add_job(lambda: _run_job("compute_ranking", compute_and_store_ranking, top_n=20),
+    scheduler.add_job(lambda: _run_job("compute_ranking", compute_and_store_ranking,
+                                       engine, top_n=20),
                       CronTrigger(day_of_week="mon-sat", hour=2, minute=15),
                       id="compute_ranking", replace_existing=True, misfire_grace_time=600)
 
@@ -611,7 +573,7 @@ def get_secteurs_actifs_endpoint():
     Retourne les secteurs actuellement en force relative.
     Utilisé par le dashboard Streamlit (Onglet 1 & 3).
     """
-    secteurs = get_secteurs_en_force()
+    secteurs = get_secteurs_en_force(engine)
     return {
         "date"              : str(date.today()),
         "nb_secteurs_actifs": len(secteurs),
@@ -624,7 +586,7 @@ async def trigger_compute_ranking(background_tasks: BackgroundTasks, top_n: int 
     Lance le calcul du ranking en arrière-plan.
     Résultat stocké dans ranking_hebdo, lu par /ranking-live.
     """
-    background_tasks.add_task(compute_and_store_ranking, top_n=top_n)
+    background_tasks.add_task(compute_and_store_ranking, engine, top_n=top_n)
     return {
         "status": "processing",
         "message": f"Calcul ranking lancé en arrière-plan (top {top_n})."
@@ -1844,7 +1806,8 @@ async def trigger_fill_high_low(background_tasks: BackgroundTasks):
 
 @app.get("/run-analysis")
 async def trigger_analysis(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_analysis_logic, full=False)
+    background_tasks.add_task(run_analysis_logic, engine, job_status,
+                              full=False, app_version=APP_VERSION)
     return {
         "status" : "processing",
         "message": f"Analyse incrémentale lancée (contexte {INCREMENTAL_LOOKBACK_DAYS}j, sauvegarde {INCREMENTAL_SAVE_DAYS}j)."
@@ -1852,7 +1815,8 @@ async def trigger_analysis(background_tasks: BackgroundTasks):
 
 @app.get("/run-analysis-full")
 async def trigger_full_analysis(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_analysis_logic, full=True)
+    background_tasks.add_task(run_analysis_logic, engine, job_status,
+                              full=True, app_version=APP_VERSION)
     return {
         "status" : "processing",
         "message": "⚠️ Recalcul COMPLET lancé sur tout l'historique (action manuelle)."
@@ -2076,443 +2040,3 @@ async def trigger_backtest_ranking(
         "message": f"Backtest hybrid v4.1 lancé — top {top_n}, {label}.",
     }
  
-# ============================================================
-# CHARGEMENT DU MODÈLE DEPUIS POSTGRESQL
-# ============================================================
-
-def load_model_from_db():
-    """
-    Charge le modèle ML depuis models_store (PostgreSQL).
-    Résiste aux redéploiements Railway (filesystem éphémère).
-    Retourne (model, model_cols) ou (None, None) si absent.
-    """
-    if engine is None:
-        return None, None
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT model_data, columns_data, accuracy, updated_at
-                FROM models_store
-                WHERE model_name = 'trading_forest'
-            """)).fetchone()
-
-        if row:
-            model      = joblib.load(io.BytesIO(bytes(row[0])))
-            model_cols = joblib.load(io.BytesIO(bytes(row[1])))
-            print(f"✅ Modèle ML chargé depuis DB (précision : {round(float(row[2]) * 100, 1)}%, entraîné le {row[3].date()})")
-            return model, model_cols
-
-        print("⚠️ Aucun modèle trouvé en base — score_ia sera 0.0. Appeler /train-model.")
-        return None, None
-
-    except Exception as e:
-        print(f"❌ Erreur chargement modèle depuis DB : {e}")
-        return None, None
-
-# ============================================================
-# HELPER : Secteurs en force relative
-# ============================================================
-
-def get_secteurs_en_force() -> list[dict]:
-    """
-    Retourne la liste des secteurs Yahoo actuellement en force relative.
-    Interroge la vue v_secteurs_en_force (dernière date disponible).
-    Si la table est vide ou absente → retourne [] sans planter run_analysis_logic.
-    """
-    if engine is None:
-        return []
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT secteur_yahoo, zone, ticker_etf, indice_reference,
-                       date, ratio_force_relative, ratio_vs_mm50
-                FROM v_secteurs_en_force
-                ORDER BY zone, ratio_vs_mm50 DESC
-            """)).fetchall()
-
-        return [
-            {
-                "secteur_yahoo"       : r[0],
-                "zone"                : r[1],
-                "ticker_etf"          : r[2],
-                "indice_reference"    : r[3],
-                "date"                : str(r[4]),
-                "ratio_force_relative": float(r[5]) if r[5] is not None else None,
-                "ratio_vs_mm50"       : float(r[6]) if r[6] is not None else None,
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        print(f"⚠️ get_secteurs_en_force : {e} — retour liste vide.")
-        return []
-
-def compute_and_store_ranking(top_n: int = 20):
-    """
-    Calcule le ranking momentum sur tous les tickers et le persiste
-    dans ranking_hebdo. Appelé par le scheduler (lun-sam 02h15)
-    et par l'endpoint /compute-ranking.
-
-    NB : malgré le nom historique 'ranking_hebdo', la table contient
-    désormais un ranking journalier (1 calcul/jour ouvré + samedi).
-    Chaque ligne est identifiée par (date_calcul, ticker). Les avis IA
-    et décisions humaines restent agrégés par semaine via la clé
-    'semaine' (lundi), indépendante de date_calcul.
-
-    Durée estimée : 3-4 min sur 400 tickers.
-    """
-    if compute_composite_score is None:
-        print("❌ compute_and_store_ranking : backtest_ranking.py non disponible")
-        return {"error": "backtest_ranking.py non disponible"}
-    if engine is None:
-        print("❌ compute_and_store_ranking : engine non connecté")
-        return {"error": "engine non connecté"}
- 
-    try:
-        print("📊 Calcul ranking journalier...")
- 
-        # 1. Charger les tickers et données
-        all_tickers = load_all_tickers()
-        ticker_data = load_all_price_data(all_tickers)
- 
-        # 2. Calculer les indicateurs pour chaque ticker
-        for ticker in list(ticker_data.keys()):
-            ticker_data[ticker] = compute_all_indicators(ticker_data[ticker])
- 
-        # 3. Charger contexte sectoriel et macro
-        secteur_mapping = load_secteur_mapping()
-        force_data = load_all_secteur_force()
-        macro_data = load_macro_data()
- 
-        # 4. Trouver le dernier jour de trading disponible
-        all_dates = set()
-        for df in ticker_data.values():
-            all_dates.update(df.index)
-        if not all_dates:
-            return {"error": "Aucune donnée disponible"}
- 
-        latest_date = max(all_dates)
-
-        # 4bis. Garde-fou de fraîcheur par place de cotation (roadmap #28)
-        #
-        # compute_composite_score accepte pour chaque ticker sa dernière barre
-        # disponible jusqu'à 5 jours d'écart, en silence (backtest_ranking.py
-        # l. 386-388). Le score composite compare donc des tickers arrêtés à
-        # des dates différentes — et comme la normalisation min-max est
-        # calculée sur l'ensemble des candidats, une place décalée ne fausse
-        # pas seulement ses propres lignes : elle déplace le score de tout le
-        # monde. Deux incidents en deux jours viennent de là (Corée trop tôt,
-        # Europe trop tard).
-        #
-        # La règle est pure et testée → freshness.py. Elle raisonne par PLACE
-        # et non par zone : une place porte un calendrier de bourse, pas une
-        # zone. Sans ce découpage, le 14 juillet (Paris fermé, Amsterdam et
-        # Bruxelles ouverts) deviendrait une fausse alerte annuelle.
-        dernieres_dates = {
-            t: df.index.max().date()
-            for t, df in ticker_data.items() if not df.empty
-        }
-        diagnostic = diagnostic_fraicheur(
-            dernieres_dates,
-            calendrier={d.date() for d in all_dates},
-            zones={t: get_ticker_zone(t, secteur_mapping) for t in ticker_data},
-        )
-        print(f"🕐 Fraîcheur : {diagnostic['resume']}")
-
-        if not diagnostic["ok"]:
-            # (e) Alerte push — l'alerte (b) sur tickers en retard a un seuil
-            # de 3 jours, sous lequel une séance manquante passait.
-            alert_fraicheur_places(diagnostic)
-
-            if POLITIQUE_FRAICHEUR == "refuser":
-                print("⏭️  Ranking non calculé — places arrêtées à des séances différentes")
-                return {"status": "skipped", "message": diagnostic["resume"],
-                        "fraicheur": diagnostic["resume"],
-                        "data_date": str(latest_date.date())}
-
-            if POLITIQUE_FRAICHEUR in ("exclure", "aligner"):
-                for t in diagnostic["tickers_exclus"]:
-                    ticker_data.pop(t, None)
-                print(f"✂️  {len(diagnostic['tickers_exclus'])} tickers écartés — "
-                      f"places : {', '.join(diagnostic['places_douteuses'])}")
-                if not ticker_data:
-                    return {"error": "Aucune place exploitable"}
-
-        if POLITIQUE_FRAICHEUR == "aligner":
-            # Reculer jusqu'à la dernière séance commune aux places saines.
-            # Règle pure et testée → freshness.derniere_seance_commune.
-            commune = derniere_seance_commune(diagnostic)
-            if commune and commune < latest_date.date():
-                print(f"↩️  Alignement : classement au {commune} "
-                      f"(dernière séance commune) au lieu du {latest_date.date()}")
-                latest_date = pd.Timestamp(commune)
- 
-        # 5. Calculer le ranking
-        ranking = compute_composite_score(
-            ticker_data, latest_date, secteur_mapping, force_data, sma_period=200
-        )
- 
-        # 6. Enrichir et préparer les records
-        macro_regime = get_macro_regime(macro_data, latest_date)
-        today = date.today()
- 
-        records = []
-        for r in ranking[:top_n]:
-            ticker = r["ticker"]
-            zone = get_ticker_zone(ticker, secteur_mapping)
-            secteur = secteur_mapping.get(ticker, {}).get("secteur", "—")
-            k = compute_adaptive_k(r["atr_14"], r["prix"]) if r["atr_14"] > 0 else 3.0
- 
-            records.append({
-                "date_calcul":  today,
-                "rank":         r.get("rank", 0),
-                "ticker":       ticker,
-                "score":        round(r["score"], 4),
-                "mom_r2":       round(r["mom_r2"], 4),
-                "rvol":         round(r["rvol"], 2),
-                "obv_slope":    round(r["obv_slope"], 2),
-                "prix":         round(r["prix"], 2),
-                "sma_200":      round(r["sma_200"], 2),
-                "atr_14":       round(r["atr_14"], 2),
-                "k_adaptatif":  k,
-                "zone":         zone,
-                "secteur":      secteur,
-                "macro_regime": json.dumps(macro_regime),
-                "nb_eligible":  len(ranking),
-                "nb_total":     len(ticker_data),
-                "data_date":    latest_date.date(),
-            })
- 
-        # 7. Supprimer l'ancien ranking du jour et insérer
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM ranking_hebdo WHERE date_calcul = :d"), {"d": today})
-            for rec in records:
-                conn.execute(text("""
-                    INSERT INTO ranking_hebdo
-                        (date_calcul, rank, ticker, score, mom_r2, rvol, obv_slope,
-                         prix, sma_200, atr_14, k_adaptatif, zone, secteur,
-                         macro_regime, nb_eligible, nb_total, data_date)
-                    VALUES
-                        (:date_calcul, :rank, :ticker, :score, :mom_r2, :rvol, :obv_slope,
-                         :prix, :sma_200, :atr_14, :k_adaptatif, :zone, :secteur,
-                         CAST(:macro_regime AS jsonb), :nb_eligible, :nb_total, :data_date)
-                """), rec)
- 
-        print(f"✅ Ranking sauvegardé : {len(records)} tickers, date données {latest_date.date()}")
-
-        # (c) Alerte composition — filet en aval de l'audit post-sync.
-        # Le 16/05, 59 tickers EU non synchronisés ont produit un ranking
-        # 100 % US sans qu'aucune erreur ne soit levée.
-        alert_ranking_composition([r["zone"] for r in records],
-                                  nb_eligible=len(ranking),
-                                  data_date=latest_date.date())
-
-        return {"status": "ok", "nb_ranked": len(records),
-                "data_date": str(latest_date.date()),
-                "fraicheur": diagnostic["resume"],
-                "nb_exclus": len(diagnostic["tickers_exclus"])
-                             if POLITIQUE_FRAICHEUR in ("exclure", "aligner")
-                             else 0}
- 
-    except Exception as e:
-        print(f"❌ Erreur compute_and_store_ranking : {e}")
-        return {"error": str(e)}
-
-# ============================================================
-# LOGIQUE ANALYSE — INCRÉMENTALE ET COMPLÈTE
-# ============================================================
-
-def run_analysis_logic(full: bool = False):
-    if engine is None: return
-
-    # --- Garde-fou anti-chevauchement (incident du 2026-09-07) ---
-    # Le chaînage (_pipeline_prix_puis_analyse) supprime la course côté
-    # scheduler. Ce garde-fou couvre ce qu'il ne couvre pas : un appel
-    # manuel à /run-analysis ou /run-analysis-full pendant que la sync
-    # nocturne écrit encore. Règle pure et testée → scheduling.py.
-    skip, motif = analysis_should_skip(job_status)
-    if skip:
-        print(f"⏭️  Analyse annulée — {motif}")
-        return {"status": "skipped", "message": motif}
-
-    mode = "COMPLET" if full else "INCRÉMENTAL"
-    print(f"🚀 Démarrage Analyse v{APP_VERSION} — mode {mode}...")
-
-    try:
-        # 1. Liste des tickers
-        with engine.connect() as conn:
-            result      = conn.execute(text("SELECT DISTINCT ticker FROM actions_prix_historique"))
-            all_tickers = [row[0] for row in result]
-
-        if not all_tickers: return
-        print(f"   {len(all_tickers)} tickers trouvés en base.")
-
-        # 2. Chargement du modèle ML depuis PostgreSQL
-        model, model_cols = load_model_from_db()
-
-        # 3. Définition de la fenêtre de chargement
-        if full:
-            date_filter = ""
-            date_params = {}
-        else:
-            date_filter = "AND a.date >= :date_from"
-            date_params = {
-                "date_from": (pd.Timestamp.today() - pd.Timedelta(days=INCREMENTAL_LOOKBACK_DAYS)).date()
-            }
-
-        # 4. Traitement par chunks
-        chunk_size   = 50
-        total_chunks = (len(all_tickers) - 1) // chunk_size + 1
-
-        for i in range(0, len(all_tickers), chunk_size):
-            tickers_chunk = all_tickers[i:i + chunk_size]
-
-            # prix_haut et prix_bas inclus pour ATR réel (remplis par /fill-high-low)
-            query = text(f"""
-                SELECT a.id, a.ticker, a.date,
-                       a.prix_cloture, a.prix_ajuste, a.volume,
-                       a.prix_haut, a.prix_bas,
-                       t.secteur, t.market_cap, t.pe_ratio
-                FROM actions_prix_historique a
-                LEFT JOIN tickers_info t ON a.ticker = t.ticker
-                WHERE a.ticker IN :tickers
-                {date_filter}
-                ORDER BY a.ticker, a.date ASC
-            """)
-
-            params = {"tickers": tuple(tickers_chunk), **date_params}
-            df     = pd.read_sql(query, engine, params=params)
-            if df.empty: continue
-
-            df['prix_ajuste'] = df['prix_ajuste'].fillna(df['prix_cloture'])
-            df = df.dropna(subset=['prix_ajuste']).sort_values(['ticker', 'date'])
-
-            def compute_analysis_indicators(group):
-                if len(group) < 50: return group
-                price = group['prix_ajuste']
-                vol   = group['volume']
-
-                # RSI 14
-                delta = price.diff()
-                gain  = delta.where(delta > 0, 0).rolling(14).mean()
-                loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                group['rsi_14'] = 100 - (100 / (1 + gain / (loss + 1e-9)))
-
-                # Moyennes mobiles
-                # R4 (2026-09-04) : min_periods=200 strict — avec min_periods=1,
-                # la moyenne était biaisée vers le prix courant tant que la fenêtre
-                # n'avait pas 200 barres (cf. note "Calculs rolling", CLAUDE.md).
-                # Lookback 320j (ci-dessus) garantit désormais assez de barres.
-                group['sma_200'] = price.rolling(200, min_periods=200).mean()
-                group['sma_50']  = price.rolling(50,  min_periods=1).mean()
-
-                # Bandes de Bollinger
-                sma_20               = price.rolling(20).mean()
-                std_20               = price.rolling(20).std()
-                bb_upper             = sma_20 + (std_20 * 2)
-                group['bb_lower']    = sma_20 - (std_20 * 2)
-                bb_range             = (bb_upper - group['bb_lower']).replace(0, np.nan)
-                group['bb_position'] = (price - group['bb_lower']) / bb_range
-
-                # Volume moyen 20j
-                group['vol_avg_20'] = vol.rolling(20).mean()
-
-                # Features ML
-                group['rsi_slope']   = group['rsi_14'].diff(3)
-                group['vol_ratio']   = vol / (group['vol_avg_20'] + 1e-9)
-                group['dist_sma200'] = (price - group['sma_200']) / (group['sma_200'] + 1e-9)
-
-                # ATR 14 — réel (H-L) si disponible, approché (C-C) sinon
-                has_hl = (
-                    'prix_haut' in group.columns and
-                    'prix_bas'  in group.columns and
-                    group['prix_haut'].notna().any() and
-                    group['prix_bas'].notna().any()
-                )
-                if has_hl:
-                    prev_close = price.shift(1)
-                    tr = pd.concat([
-                        group['prix_haut'] - group['prix_bas'],
-                        (group['prix_haut'] - prev_close).abs(),
-                        (group['prix_bas']  - prev_close).abs()
-                    ], axis=1).max(axis=1)
-                else:
-                    tr = price.diff().abs()
-
-                group['atr_14'] = tr.rolling(14, min_periods=1).mean()
-
-                # Régime de marché
-                group['regime_marche'] = np.where(
-                    price > group['sma_50'] * 1.02, 'BULL',
-                    np.where(price < group['sma_50'] * 0.98, 'BEAR', 'NEUTRE')
-                )
-
-                # SIGNAL ACHAT v3.3 supprimé (mean-reversion empiriquement invalidée).
-                # L'entrée v4.1 se fait via le ranking momentum top 5
-                # (compute_and_store_ranking → ranking_hebdo).
-                # La colonne actions_prix_historique.signal_achat n'est plus mise à jour.
-                return group
-
-            df = df.groupby('ticker', group_keys=False).apply(compute_analysis_indicators)
-
-            # 5. Score ML
-            if model is not None:
-                feat_df = pd.get_dummies(df, columns=['secteur', 'regime_marche'])
-                for col in model_cols:
-                    if col not in feat_df.columns:
-                        feat_df[col] = 0
-                X_input            = feat_df[model_cols].fillna(0).replace([np.inf, -np.inf], 0)
-                df['confiance_ml'] = model.predict_proba(X_input)[:, 1]
-            else:
-                df['confiance_ml'] = 0.0
-
-            # 6. Filtrage des lignes à sauvegarder
-            if not full:
-                # .normalize() : sans lui, pd.Timestamp.today() porte l'heure
-                # courante et la borne, comparée à des dates à minuit, excluait
-                # le jour le plus ancien — 4 jours sauvegardés au lieu de 5
-                # (roadmap #26).
-                save_from  = (pd.Timestamp.today().normalize()
-                              - pd.Timedelta(days=INCREMENTAL_SAVE_DAYS))
-                df_to_save = df[pd.to_datetime(df['date']) >= save_from].copy()
-            else:
-                df_to_save = df.copy()
-
-            if df_to_save.empty:
-                continue
-
-            # 7. Sauvegarde — table temporaire unique par chunk
-            tmp_table    = f"_tmp_update_{i}"
-            cols_to_save = [
-                'id', 'rsi_14', 'sma_200', 'bb_lower', 'bb_position',
-                'vol_avg_20', 'regime_marche', 'confiance_ml',
-                'rsi_slope', 'vol_ratio', 'dist_sma200', 'atr_14'
-            ]
-            df_update = df_to_save[[c for c in cols_to_save if c in df_to_save.columns]].copy()
-            df_update.to_sql(tmp_table, engine, if_exists='replace', index=False)
-
-            with engine.begin() as conn:
-                conn.execute(text(f"""
-                    UPDATE actions_prix_historique a SET
-                        rsi_14        = t.rsi_14,
-                        sma_200       = t.sma_200,
-                        bb_lower      = t.bb_lower,
-                        bb_position   = t.bb_position,
-                        vol_avg_20    = t.vol_avg_20,
-                        regime_marche = t.regime_marche,
-                        score_ia      = t.confiance_ml,
-                        rsi_slope     = t.rsi_slope,
-                        vol_ratio     = t.vol_ratio,
-                        dist_sma200   = t.dist_sma200,
-                        atr_14        = t.atr_14
-                    FROM {tmp_table} t
-                    WHERE a.id = t.id
-                """))
-                conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
-
-            rows_saved = len(df_update)
-            print(f"🟢 Chunk {i // chunk_size + 1}/{total_chunks} — {rows_saved} lignes sauvegardées.")
-
-        print(f"🏁 Analyse {mode} terminée.")
-
-    except Exception as e:
-        print(f"❌ Erreur run_analysis_logic (full={full}) : {e}")
