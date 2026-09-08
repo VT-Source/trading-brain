@@ -224,6 +224,36 @@ def dates_a_backfiller(debut: date, fin: date, dates_existantes=(),
     return resultat
 
 
+def valider_plage_backfill(debut: date, fin: date, aujourd_hui: date = None):
+    """
+    Message d'erreur si la plage demandée est inacceptable, None si elle est
+    bonne. Pure : `aujourd_hui` est injectable pour les tests.
+
+    Partagée par `backfill_ranking` et par l'endpoint HTTP. Écrire ces règles
+    des deux côtés serait précisément ce que la roadmap #30 reproche déjà à
+    `evaluate_open_positions` : deux implémentations d'une même règle qui
+    divergent en silence. L'endpoint a besoin de répondre tout de suite
+    (l'appelant est devant son navigateur), la fonction a besoin de se
+    protéger même appelée d'ailleurs — une seule règle, deux appelants.
+    """
+    aujourd_hui = aujourd_hui or date.today()
+
+    if debut is None or fin is None:
+        return "dates manquantes"
+    if debut > fin:
+        return f"debut ({debut}) doit précéder fin ({fin})"
+    if (fin - debut).days > BACKFILL_MAX_JOURS:
+        return (f"plage de {(fin - debut).days} jours refusée "
+                f"(maximum {BACKFILL_MAX_JOURS})")
+    if fin >= aujourd_hui:
+        # Classer aujourd'hui est le travail du job quotidien ; classer demain
+        # n'a pas de sens. La borne évite aussi d'écraser la ligne du jour
+        # avec une version calculée à un autre moment de la journée.
+        return (f"fin doit être antérieure à aujourd'hui ({aujourd_hui}) — "
+                f"le classement du jour est le travail du job quotidien")
+    return None
+
+
 def date_de_scoring(dates_disponibles, cible: date = None,
                     inclure_seance_du_jour: bool = False):
     """
@@ -662,19 +692,10 @@ def backfill_ranking(engine, debut: date, fin: date, top_n: int = 20,
     if engine is None:
         return {"status": "error", "error": "engine non connecté",
                 "message": "backfill impossible : engine non connecté"}
-    if debut is None or fin is None or debut > fin:
-        return {"status": "error", "error": "plage invalide",
-                "message": f"plage invalide : {debut} → {fin}"}
-    if (fin - debut).days > BACKFILL_MAX_JOURS:
-        return {"status": "error", "error": "plage trop large",
-                "message": (f"plage de {(fin - debut).days} jours refusée "
-                            f"(maximum {BACKFILL_MAX_JOURS})")}
-    if fin >= date.today():
-        # Classer aujourd'hui, c'est le travail du job quotidien ; classer
-        # demain n'a pas de sens. La borne évite aussi d'écraser la ligne du
-        # jour avec une version calculée à un autre moment de la journée.
-        return {"status": "error", "error": "fin dans le futur",
-                "message": f"fin doit être antérieure à aujourd'hui ({date.today()})"}
+
+    probleme = valider_plage_backfill(debut, fin)
+    if probleme:
+        return {"status": "error", "error": "plage invalide", "message": probleme}
 
     try:
         existant = _ranking_existant(engine, debut, fin)
