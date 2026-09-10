@@ -45,8 +45,8 @@ except Exception as _e_alert:
 # --- Règles d'ordonnancement pures (garde-fou anti-chevauchement) ---
 # Import volontairement NON gardé, contrairement à alerting.py : un garde-fou
 # de sécurité qui disparaît en silence est pire que son absence. scheduling.py
-# n'a aucune dépendance externe — s'il manque, le démarrage doit échouer.
-from scheduling import analysis_should_follow_sync
+# n'a aucune dépendance tierce ni projet — s'il manque, le démarrage doit échouer.
+from scheduling import PIPELINE_NOCTURNE, peut_demarrer
 
 # --- Logique métier extraite de main.py (roadmap #5, 2026-09-08) ---
 # Même règle d'import que scheduling.py : NON gardé. analysis.py et ranking.py
@@ -103,7 +103,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.18.0"
+APP_VERSION = "6.19.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -295,37 +295,54 @@ def _poll_ai_opinions_with_alert(engine):
     return res
 
 
-def _pipeline_prix_puis_analyse(engine):
+def _pipeline_nocturne(engine):
     """
-    Chaîne l'analyse sur la fin RÉELLE de la sync des prix.
+    Exécute le pipeline nocturne dans l'ordre de ses dépendances de données.
 
-    Incident du 2026-09-07 : les deux jobs étaient planifiés à heure fixe,
-    30 min d'écart, sur la base d'une sync de ~5 min. La sync en prend
-    désormais ~33 : l'analyse démarrait pendant que sync_prix écrivait
-    encore dans actions_prix_historique. Comme la sync traite les tickers
-    dans l'ordre, les 28 derniers (V→Z) sortaient sans aucun indicateur —
-    et le job se terminait en « ok ».
+    Remplace six jobs à heure fixe (v6.19.0). Le chaînage sync_prix→analyse
+    de la v6.15.0 avait supprimé UN pari sur une durée ; les quatre étapes
+    suivantes reposaient encore dessus. Avec une sync passée de ~5 à ~33 min,
+    la marge avant sync_etf (01h45) était retombée à ~12 min : le même
+    mécanisme que l'incident du 2026-09-07, un cran plus loin dans la nuit.
 
-    Tout planning à heure fixe repose sur une durée qui dérive. Le chaînage
-    supprime le pari. Chaque étape garde son entrée propre dans job_status
-    (donc /health-jobs et les libellés du dashboard sont inchangés).
+    L'ordre et les dépendances sont déclarés dans scheduling.PIPELINE_NOCTURNE,
+    pas ici : main.py exécute un graphe, il ne le décrit pas.
+
+    Chaque étape garde son entrée propre dans job_status via _run_job, donc
+    /health-jobs et les libellés du dashboard sont inchangés. Une étape dont
+    une dépendance n'a pas abouti inscrit un `skipped` explicite qui NOMME la
+    dépendance fautive : un ranking absent se rattrape (backfill_ranking, #31),
+    un ranking calculé sur des données périmées se croit.
+
+    ⚠️ Contrepartie assumée : tout tient dans un processus. Une mort de
+    processus (OOM, redéploiement Railway) emporte les étapes suivantes, et
+    _run_job ne l'attrape pas — il ne voit que les exceptions.
     """
-    _run_job("sync_prix", sync_prix_logic, engine, full=False)
+    executables = {
+        "sync_prix":        lambda: _run_job("sync_prix", sync_prix_logic, engine, full=False),
+        "sync_etf":         lambda: _run_job("sync_etf", sync_secteurs_etf_logic, engine, full=False),
+        "sync_metadata":    lambda: _run_job("sync_metadata", sync_metadata_logic, engine),
+        "compute_ranking":  lambda: _run_job("compute_ranking", compute_and_store_ranking,
+                                             engine, top_n=20),
+        "suivi_rendements": lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
+        "analyse":          lambda: _run_job("analyse", run_analysis_logic, engine, job_status,
+                                             full=False, app_version=APP_VERSION),
+    }
 
-    suivre, motif = analysis_should_follow_sync(job_status)
-    if not suivre:
-        # Mieux vaut pas d'indicateurs que des indicateurs sur prix partiels
-        # (même principe que la sma_200 NULL de R4, décision du 2026-09-04).
-        print(f"⏭️  Analyse non enchaînée : {motif}")
-        job_status["analyse"] = {
-            "status": "skipped",
-            "skipped_at": pd.Timestamp.now(tz="Europe/Brussels").isoformat(),
-            "reason": motif,
-        }
-        return
+    for etape in PIPELINE_NOCTURNE:
+        demarrer, motif = peut_demarrer(etape, job_status)
+        if not demarrer:
+            # Mieux vaut pas de données que des données fausses — même
+            # principe que la sma_200 NULL de R4 (décision du 2026-09-04).
+            print(f"⏭️  Étape '{etape.id}' sautée : {motif}")
+            job_status[etape.id] = {
+                "status": "skipped",
+                "skipped_at": pd.Timestamp.now(tz="Europe/Brussels").isoformat(),
+                "reason": motif,
+            }
+            continue
 
-    _run_job("analyse", run_analysis_logic, engine, job_status,
-             full=False, app_version=APP_VERSION)
+        executables[etape.id]()
 
 
 @app.on_event("startup")
@@ -344,38 +361,24 @@ def start_scheduler():
                       CronTrigger(day_of_week="mon-sat", hour=0, minute=55),
                       id="sync_fx", replace_existing=True, misfire_grace_time=600)
 
-    # --- Pipeline data nocturne (lun-sam) ---
-    # 01h00 UTC = 03h00 été / 02h00 hiver. L'analyse n'a PLUS d'horaire
-    # propre : elle est enchaînée à la fin réelle de la sync des prix
-    # (v6.15.0, incident du 2026-09-07). Voir _pipeline_prix_puis_analyse.
-    scheduler.add_job(lambda: _pipeline_prix_puis_analyse(engine),
+    # --- Pipeline data nocturne (lun-sam) — v6.19.0 ---
+    # 01h00 UTC = 03h00 été / 02h00 hiver. UN SEUL horaire pour les six
+    # étapes : sync_prix → sync_etf → sync_metadata → compute_ranking →
+    # suivi_rendements → analyse. L'ordre vit dans PIPELINE_NOCTURNE
+    # (scheduling.py), pas ici.
+    #
+    # Ce qui disparaît : les horaires fixes de sync_etf (01h45),
+    # sync_metadata (02h00), compute_ranking (02h15) et suivi_rendements
+    # (02h30). Tous reposaient sur la durée de sync_prix, passée de ~5 à
+    # ~33 min — la marge avant sync_etf était retombée à ~12 min.
+    #
+    # Ce qui change dans l'ordre : `analyse` passe en DERNIER. Personne ne
+    # dépend d'elle (les trois chemins de décision recalculent leurs
+    # indicateurs), donc la placer avant le ranking retardait une décision
+    # derrière un calcul qui n'alimente que le ML et le backtest.
+    scheduler.add_job(lambda: _pipeline_nocturne(engine),
                       CronTrigger(day_of_week="mon-sat", hour=1, minute=0),
-                      id="sync_prix_analyse", replace_existing=True, misfire_grace_time=600)
-
-    # --- ETF sectoriels (01h45 UTC = 03h45 été / 02h45 hiver) ---
-    # ⚠️ Démarre 45 min après la sync des prix, qui en prend ~33 : marge
-    # réelle ~12 min. À surveiller dans /health-jobs (duration_s de
-    # sync_prix) — c'est le prochain chevauchement candidat.
-    scheduler.add_job(lambda: _run_job("sync_etf", sync_secteurs_etf_logic, engine, full=False),
-                      CronTrigger(day_of_week="mon-sat", hour=1, minute=45),
-                      id="sync_etf", replace_existing=True, misfire_grace_time=600)
-    # --- Metadata Yahoo (02h00 UTC = 04h00 été / 03h00 hiver) ---
-    scheduler.add_job(lambda: _run_job("sync_metadata", sync_metadata_logic, engine),
-                      CronTrigger(day_of_week="mon-sat", hour=2, minute=0),
-                      id="sync_metadata", replace_existing=True, misfire_grace_time=600)
-
-    # --- Ranking quotidien (02h15 UTC = 04h15 été / 03h15 hiver) ---
-    # Lun-ven : ranking sur clôtures du jour-1
-    # Sam     : ranking sur clôtures du vendredi US (utilisé par l'AI samedi)
-    scheduler.add_job(lambda: _run_job("compute_ranking", compute_and_store_ranking,
-                                       engine, top_n=20),
-                      CronTrigger(day_of_week="mon-sat", hour=2, minute=15),
-                      id="compute_ranking", replace_existing=True, misfire_grace_time=600)
-
-    # --- Suivi rendements quotidien (02h30 UTC = 04h30 été / 03h30 hiver) ---
-    scheduler.add_job(lambda: _run_job("suivi_rendements", update_suivi_rendements, engine),
-                      CronTrigger(day_of_week="mon-sat", hour=2, minute=30),
-                      id="suivi_rendements", replace_existing=True, misfire_grace_time=600)
+                      id="pipeline_nocturne", replace_existing=True, misfire_grace_time=600)
 
     # --- Avis IA auto top 5 : SOUMISSION du batch (samedi 06h00 UTC = 08h00 été) ---
     scheduler.add_job(lambda: _run_job("ai_opinions", _auto_generate_opinions),
@@ -392,8 +395,9 @@ def start_scheduler():
                       id="poll_ai_opinions", replace_existing=True, misfire_grace_time=300)
 
     scheduler.start()
-    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 8 jobs planifiés en UTC "
-          f"(9 étapes suivies : sync_prix et analyse partagent un job chaîné)")
+    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 4 jobs planifiés en UTC "
+          f"(9 étapes suivies : les 6 étapes du pipeline nocturne partagent "
+          f"un job chaîné, ordre déclaré dans scheduling.PIPELINE_NOCTURNE)")
 
 # ============================================================
 # ENDPOINTS API
