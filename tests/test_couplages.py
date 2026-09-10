@@ -20,6 +20,7 @@
 
 import ast
 import pathlib
+import sys
 
 import pytest
 
@@ -63,9 +64,18 @@ COUPLAGES = {
     "sync": {"dur": {"scheduling"}, "souple": {"alerting"}},
 }
 
-# Modules garantis SANS aucune dépendance, ni projet ni tierce partie.
-# C'est ce qui les rend testables sans DB, sans réseau et sans FastAPI —
-# et ce qui autorise `main.py` à importer `scheduling` sans garde.
+# Modules garantis sans dépendance TIERCE ni PROJET : bibliothèque standard
+# uniquement. C'est ce qui les rend testables sans DB, sans réseau et sans
+# FastAPI — et ce qui autorise `main.py` à importer `scheduling` sans garde,
+# puisque la stdlib est présente dans tout déploiement Python et ne peut
+# donc pas manquer.
+#
+# La règle a été DESSERRÉE au lot #33 (elle exigeait zéro import) pour que
+# scheduling.py puisse déclarer PIPELINE_NOCTURNE avec typing.NamedTuple.
+# Desserrer un test pour faire passer son propre code est un geste à
+# surveiller : ici il est délibéré, et la propriété qui compte — « l'import
+# ne peut pas échouer » — est préservée telle quelle. Une dépendance tierce
+# (pandas, sqlalchemy, fastapi) reste interdite et fait toujours rougir.
 MODULES_AUTONOMES = {"scheduling", "freshness"}
 
 # `dashboard.py` ne parle à `main.py` qu'en HTTP. Couplage de CONTRAT :
@@ -185,18 +195,23 @@ def test_aucun_couplage_non_declare():
 @pytest.mark.parametrize("module", sorted(MODULES_AUTONOMES))
 def test_modules_autonomes_sans_dependance(module):
     """
-    `scheduling` et `freshness` n'importent rien du tout.
+    `scheduling` et `freshness` n'importent que la bibliothèque standard.
 
     C'est la propriété qui les rend testables sans DB, sans réseau et sans
-    FastAPI. Le jour où l'un d'eux importe quoi que ce soit, la raison même
-    de son extraction disparaît — et, pour `scheduling`, la justification de
-    son import non gardé dans main.py avec.
+    FastAPI. Le jour où l'un d'eux importe une dépendance tierce, la raison
+    même de son extraction disparaît — et, pour `scheduling`, la
+    justification de son import non gardé dans main.py avec : un module qui
+    peut échouer à l'import ne peut pas servir de garde-fou.
     """
-    importes = tous_imports(module)
-    assert not importes, (
-        f"{module}.py doit rester sans dépendance, or il importe "
-        f"{sorted(importes)}. Si l'ajout est délibéré, c'est une décision "
-        f"d'architecture à arbitrer, pas un détail d'implémentation."
+    hors_stdlib = {
+        nom for nom in tous_imports(module)
+        if nom not in sys.stdlib_module_names
+    }
+    assert not hors_stdlib, (
+        f"{module}.py ne doit dépendre que de la bibliothèque standard, or "
+        f"il importe {sorted(hors_stdlib)}. Si l'ajout est délibéré, c'est "
+        f"une décision d'architecture à arbitrer, pas un détail "
+        f"d'implémentation."
     )
 
 
