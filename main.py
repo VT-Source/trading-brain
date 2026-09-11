@@ -98,12 +98,22 @@ except ImportError:
     get_ticker_zone = None
     get_secteur_force_for_ticker = None
 
+# --- Sonde de publication Yahoo (roadmap #35, 2026-09-11) ---
+# Mesure TEMPORAIRE de l'heure à laquelle Yahoo fournit la séance J, par place.
+# Import GARDÉ : la sonde ne porte aucune décision, son absence ne doit jamais
+# empêcher l'API de démarrer. Inerte sans la variable SONDE_PUBLICATION=on.
+try:
+    from sonde import enregistrer_sonde
+except Exception as _e_sonde:
+    print(f"⚠️ sonde.py indisponible ({_e_sonde}) — sonde de publication désactivée")
+    enregistrer_sonde = None
+
 load_dotenv()
 
 app = FastAPI()
 
 # --- VERSION ---
-APP_VERSION = "6.19.0"
+APP_VERSION = "6.20.0"
 
 # --- CONFIGURATION DATABASE ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -394,8 +404,15 @@ def start_scheduler():
                       CronTrigger(minute="*/30"),
                       id="poll_ai_opinions", replace_existing=True, misfire_grace_time=300)
 
+    # --- Sonde de publication Yahoo (toutes les heures à :20 UTC) — v6.20.0, #35 ---
+    #     TEMPORAIRE, et inerte sans SONDE_PUBLICATION=on. Hors pipeline et
+    #     hors _run_job : aucune alerte, aucune clé dans /health-jobs. Se saute
+    #     d'elle-même tant qu'une étape du pipeline est « running ».
+    if enregistrer_sonde is not None:
+        enregistrer_sonde(scheduler, engine, job_status)
+
     scheduler.start()
-    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — 4 jobs planifiés en UTC "
+    print(f"⏰ Scheduler démarré (v{APP_VERSION}) — {len(scheduler.get_jobs())} jobs planifiés en UTC "
           f"(9 étapes suivies : les 6 étapes du pipeline nocturne partagent "
           f"un job chaîné, ordre déclaré dans scheduling.PIPELINE_NOCTURNE)")
 
