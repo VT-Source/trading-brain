@@ -56,11 +56,15 @@ COUPLAGES = {
             "scheduling",
             "sync",
         },
-        "souple": {"alerting", "backtest", "backtest_ranking", "train_model"},
+        "souple": {"alerting", "backtest", "backtest_ranking", "sonde", "train_model"},
     },
     "analysis": {"dur": {"scheduling"}, "souple": set()},
     "backfill_api": {"dur": {"ranking"}, "souple": set()},
     "ranking": {"dur": {"freshness"}, "souple": {"alerting", "backtest_ranking"}},
+    # `sonde` (#35, temporaire) : gardée dans main.py — une mesure ne doit pas
+    # pouvoir empêcher le démarrage. Sa place de cotation est vérifiée CONTRE
+    # freshness par test, sans import, pour ne créer aucun couplage de plus.
+    "sonde": {"dur": {"scheduling"}, "souple": set()},
     "sync": {"dur": {"scheduling"}, "souple": {"alerting"}},
 }
 
