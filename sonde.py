@@ -1,8 +1,15 @@
 # ============================================================
-# sonde.py — Sonde de publication Yahoo — Trading Brain v1.0
+# sonde.py — Sonde de publication Yahoo — Trading Brain v1.1
 # VT-Source/trading-brain
 # ============================================================
 # Mesure TEMPORAIRE (roadmap #35, décision du 2026-09-11).
+#
+# v1.1 (2026-09-11, #35b) — avant toute activation : ajout de
+#   `derniere_date_close`, la date que sync_prix aurait réellement stockée
+#   (clôture valide ET séance close, via scheduling.masque_barres_closes).
+#   Sans elle, pendant qu'une place cote, la barre en cours du jour devenait
+#   la dernière ligne et masquait l'état de la veille — la v1.0 aurait
+#   mesuré la présence de la séance EN COURS, pas la publication de J.
 #
 # Constat : au run de 01h00 UTC, Yahoo ne renvoie pas encore la séance de la
 # veille pour la plupart des actions US et européennes (la Corée, elle, est
@@ -36,7 +43,7 @@ from typing import NamedTuple
 
 import pandas as pd
 
-from scheduling import PIPELINE_NOCTURNE
+from scheduling import PIPELINE_NOCTURNE, masque_barres_closes
 
 VARIABLE_ACTIVATION = "SONDE_PUBLICATION"
 JOB_ID = "sonde_publication"
@@ -101,6 +108,7 @@ DDL_SONDE = """
         type_instrument       VARCHAR(10)      NOT NULL,
         derniere_date_brute   DATE,
         derniere_date_valide  DATE,
+        derniere_date_close   DATE,
         derniere_cloture      DOUBLE PRECISION,
         dernier_volume        DOUBLE PRECISION,
         nb_barres             INTEGER          NOT NULL DEFAULT 0,
@@ -111,10 +119,12 @@ DDL_SONDE = """
 INSERT_SONDE = """
     INSERT INTO sonde_publication
         (sonde_at, ticker, place, type_instrument, derniere_date_brute,
-         derniere_date_valide, derniere_cloture, dernier_volume, nb_barres, erreur)
+         derniere_date_valide, derniere_date_close, derniere_cloture,
+         dernier_volume, nb_barres, erreur)
     VALUES
         (:sonde_at, :ticker, :place, :type_instrument, :derniere_date_brute,
-         :derniere_date_valide, :derniere_cloture, :dernier_volume, :nb_barres, :erreur)
+         :derniere_date_valide, :derniere_date_close, :derniere_cloture,
+         :dernier_volume, :nb_barres, :erreur)
 """
 
 
@@ -152,25 +162,34 @@ def _en_float(valeur):
     return None if math.isnan(f) else f
 
 
-def resumer_reponse(df) -> dict:
+def resumer_reponse(df, aujourd_hui) -> dict:
     """
     Résume une réponse yf.download en une ligne de mesure.
 
     Applique la même normalisation que sync_prix_logic (colonnes MultiIndex
-    aplaties, `Date` → datetime.date) mais PAS son `dropna` sur la clôture :
-    on veut voir ce que Yahoo renvoie, y compris une dernière ligne sans
-    clôture que la sync écarterait sans rien dire. D'où deux dates :
+    aplaties, `Date` → datetime.date). Trois dates, de la plus brute à celle
+    qui compte :
 
       - derniere_date_brute  : dernière ligne renvoyée, clôture ou non
-      - derniere_date_valide : dernière ligne avec une clôture exploitable —
-                               c'est celle qu'aurait retenue la sync
+      - derniere_date_valide : dernière ligne avec une clôture exploitable
+      - derniere_date_close  : dernière ligne avec une clôture exploitable ET
+                               une séance close, selon la règle même de
+                               sync_prix (scheduling.masque_barres_closes).
+                               C'est la date que la sync aurait stockée —
+                               la seule sur laquelle raisonner.
 
-    `derniere_cloture` et `dernier_volume` sont ceux de la ligne brute : une
-    barre de séance en cours (KRX à 10h KST) se reconnaît à son volume.
+    Pourquoi la troisième (v1.1) : pendant qu'une place cote, yfinance
+    renvoie la barre EN COURS du jour. La dernière ligne devient alors la
+    séance J+1 partielle et masque l'état de J, que la sync, elle, n'aurait
+    pas vu. `dernier_volume` reste celui de la ligne brute : une barre en
+    cours se reconnaît à son volume.
+
+    `aujourd_hui` : date UTC du passage (datetime.date).
     """
     vide = {
         "derniere_date_brute": None,
         "derniere_date_valide": None,
+        "derniere_date_close": None,
         "derniere_cloture": None,
         "dernier_volume": None,
         "nb_barres": 0,
@@ -187,10 +206,12 @@ def resumer_reponse(df) -> dict:
     df = df.assign(_date=pd.to_datetime(df["Date"]).dt.date).sort_values("_date")
     brute = df.iloc[-1]
     valides = df[df["Close"].notna()]
+    closes = valides[masque_barres_closes(valides["_date"], aujourd_hui)]
 
     return {
         "derniere_date_brute": brute["_date"],
         "derniere_date_valide": valides["_date"].iloc[-1] if not valides.empty else None,
+        "derniere_date_close": closes["_date"].iloc[-1] if not closes.empty else None,
         "derniere_cloture": _en_float(brute["Close"]),
         "dernier_volume": _en_float(brute["Volume"]) if "Volume" in df.columns else None,
         "nb_barres": int(len(df)),
@@ -228,14 +249,17 @@ def executer_sonde(engine, job_status, telecharger=None, maintenant=None,
                 return yf.download(ticker, **PARAMETRES_TELECHARGEMENT)
 
         sonde_at = maintenant or datetime.now(timezone.utc)
+        # Jour de référence de la règle « séance close » : la date UTC du
+        # passage, comme sync_prix (pd.Timestamp.today() sur un conteneur UTC).
+        aujourd_hui = sonde_at.astimezone(timezone.utc).date()
         lignes = []
         for i, instrument in enumerate(INSTRUMENTS_SONDE):
             if i and pause_s:
                 time.sleep(pause_s)
             try:
-                mesure = resumer_reponse(telecharger(instrument.ticker))
+                mesure = resumer_reponse(telecharger(instrument.ticker), aujourd_hui)
             except Exception as e:
-                mesure = {**resumer_reponse(None), "erreur": f"exception : {e}"[:500]}
+                mesure = {**resumer_reponse(None, aujourd_hui), "erreur": f"exception : {e}"[:500]}
             lignes.append({
                 "sonde_at": sonde_at,
                 "ticker": instrument.ticker,
@@ -251,9 +275,9 @@ def executer_sonde(engine, job_status, telecharger=None, maintenant=None,
             conn.execute(text(INSERT_SONDE), lignes)
 
         resume = " | ".join(
-            f"{l['ticker']}→{l['derniere_date_valide'] or 'ERR'}" for l in lignes
+            f"{l['ticker']}→{l['derniere_date_close'] or 'ERR'}" for l in lignes
         )
-        print(f"🛰️ Sonde de publication {sonde_at:%Y-%m-%d %H:%M} UTC — {resume}")
+        print(f"🛰️ Sonde de publication {sonde_at:%Y-%m-%d %H:%M} UTC (séances closes) — {resume}")
         return {
             "status": "ok",
             "nb_lignes": len(lignes),
