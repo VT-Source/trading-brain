@@ -17,7 +17,7 @@ import pathlib
 import re
 import sys
 import types
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,9 @@ from freshness import place_de_cotation
 from scheduling import PIPELINE_NOCTURNE
 
 RACINE = pathlib.Path(__file__).resolve().parent.parent
+
+# Jour UTC des passages simulés : la séance du 11/09 est « en cours ».
+AUJOURDHUI = date(2026, 9, 11)
 
 
 # ------------------------------------------------------------
@@ -127,20 +130,22 @@ def _reponse(dates, clotures, volumes=None, multi_index=False, ticker="AAPL"):
 
 @pytest.mark.parametrize("df", [None, pd.DataFrame()])
 def test_reponse_vide(df):
-    r = sonde.resumer_reponse(df)
+    r = sonde.resumer_reponse(df, AUJOURDHUI)
     assert r["erreur"] == "réponse vide"
     assert r["nb_barres"] == 0
     assert r["derniere_date_brute"] is None and r["derniere_date_valide"] is None
+    assert r["derniere_date_close"] is None
 
 
 @pytest.mark.parametrize("multi_index", [False, True])
 def test_reponse_nominale(multi_index):
     df = _reponse(["2026-09-08", "2026-09-09", "2026-09-10"], [10.0, 11.0, 12.5],
                   volumes=[100.0, 200.0, 300.0], multi_index=multi_index)
-    r = sonde.resumer_reponse(df)
+    r = sonde.resumer_reponse(df, AUJOURDHUI)
     assert r == {
         "derniere_date_brute": date(2026, 9, 10),
         "derniere_date_valide": date(2026, 9, 10),
+        "derniere_date_close": date(2026, 9, 10),
         "derniere_cloture": 12.5,
         "dernier_volume": 300.0,
         "nb_barres": 3,
@@ -152,25 +157,72 @@ def test_reponse_nominale(multi_index):
 def test_derniere_cloture_nan_separe_brute_et_valide():
     """Le cas que le dropna de sync_prix rendrait invisible."""
     df = _reponse(["2026-09-08", "2026-09-09", "2026-09-10"], [10.0, 11.0, np.nan])
-    r = sonde.resumer_reponse(df)
+    r = sonde.resumer_reponse(df, AUJOURDHUI)
     assert r["derniere_date_brute"] == date(2026, 9, 10)
     assert r["derniere_date_valide"] == date(2026, 9, 9)
+    assert r["derniere_date_close"] == date(2026, 9, 9)
     assert r["derniere_cloture"] is None
     assert r["erreur"] is None
 
 
 def test_aucune_cloture_valide():
-    r = sonde.resumer_reponse(_reponse(["2026-09-09", "2026-09-10"], [np.nan, np.nan]))
+    r = sonde.resumer_reponse(_reponse(["2026-09-09", "2026-09-10"], [np.nan, np.nan]), AUJOURDHUI)
     assert r["derniere_date_brute"] == date(2026, 9, 10)
     assert r["derniere_date_valide"] is None
+    assert r["derniere_date_close"] is None
 
 
 def test_colonnes_inattendues():
     df = pd.DataFrame({"Prix": [1.0]},
                       index=pd.DatetimeIndex(pd.to_datetime(["2026-09-10"]), name="Date"))
-    r = sonde.resumer_reponse(df)
+    r = sonde.resumer_reponse(df, AUJOURDHUI)
     assert r["erreur"].startswith("colonnes inattendues")
     assert r["nb_barres"] == 0
+
+
+# ------------------------------------------------------------
+# Séance close (v1.1, #35b) — ce que sync_prix aurait stocké
+# ------------------------------------------------------------
+def test_barre_du_jour_exclue_de_la_date_close():
+    """
+    Place ouverte pendant le passage : yfinance renvoie la séance en cours.
+    La date brute et la date valide la montrent ; la date close, non.
+    """
+    df = _reponse(["2026-09-09", "2026-09-10", "2026-09-11"], [10.0, 11.0, 11.4],
+                  volumes=[1e6, 1e6, 1.4e5])
+    r = sonde.resumer_reponse(df, AUJOURDHUI)
+    assert r["derniere_date_brute"] == date(2026, 9, 11)
+    assert r["derniere_date_valide"] == date(2026, 9, 11)
+    assert r["derniere_date_close"] == date(2026, 9, 10)
+    assert r["dernier_volume"] == 1.4e5   # la barre en cours reste reconnaissable
+
+
+def test_barre_en_cours_ne_masque_pas_une_seance_absente():
+    """
+    Le défaut de la v1.0 : séance du 10/09 non publiée, barre en cours du
+    11/09 présente. La dernière ligne disait « à jour » ; la sync, elle,
+    n'aurait eu que le 09/09.
+    """
+    df = _reponse(["2026-09-08", "2026-09-09", "2026-09-11"], [10.0, 11.0, 11.4])
+    r = sonde.resumer_reponse(df, AUJOURDHUI)
+    assert r["derniere_date_valide"] == date(2026, 9, 11)
+    assert r["derniere_date_close"] == date(2026, 9, 9)
+
+
+def test_regle_de_seance_close_unique():
+    """
+    La règle « séance close » ne s'écrit qu'une fois : sonde et sync_prix
+    appellent la même fonction de scheduling.py.
+    """
+    import scheduling
+    assert sonde.masque_barres_closes is scheduling.masque_barres_closes
+
+    arbre = ast.parse((RACINE / "sonde.py").read_text(encoding="utf-8"))
+    appels = {
+        n.func.id for n in ast.walk(_fonction(arbre, "resumer_reponse"))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "masque_barres_closes" in appels
 
 
 # ------------------------------------------------------------
@@ -270,6 +322,37 @@ def test_passage_nominal_une_ligne_par_instrument(sqlalchemy_disponible):
         assert set(ligne) == attendus
         assert ligne["sonde_at"] == MAINTENANT
         assert ligne["derniere_date_valide"] == date(2026, 9, 10)
+        assert ligne["derniere_date_close"] == date(2026, 9, 10)
+
+    # La colonne existe dans le DDL, sinon l'INSERT échouerait en prod.
+    for colonne in attendus:
+        assert colonne in sonde.DDL_SONDE
+
+
+def test_passage_pendant_une_seance_ouverte(sqlalchemy_disponible):
+    """Barre en cours du 11/09 renvoyée à 13h20 UTC le 11/09 : exclue."""
+    def telecharger(ticker):
+        return _reponse(["2026-09-09", "2026-09-10", "2026-09-11"], [1.0, 2.0, 2.1], ticker=ticker)
+
+    engine = _EngineFactice()
+    sonde.executer_sonde(engine, {}, telecharger=telecharger, maintenant=MAINTENANT, pause_s=0)
+    for ligne in engine.journal[1][1]:
+        assert ligne["derniere_date_valide"] == date(2026, 9, 11)
+        assert ligne["derniere_date_close"] == date(2026, 9, 10)
+
+
+def test_le_jour_de_reference_est_le_jour_utc_du_passage(sqlalchemy_disponible):
+    """
+    00h20 à Bruxelles le 11/09 = 22h20 UTC le 10/09 : pour sync_prix,
+    qui raisonne en UTC, la séance du 10/09 est encore « du jour ».
+    """
+    bruxelles_ete = timezone(timedelta(hours=2))
+    engine = _EngineFactice()
+    sonde.executer_sonde(engine, {}, telecharger=_telecharger_ok,
+                         maintenant=datetime(2026, 9, 11, 0, 20, tzinfo=bruxelles_ete),
+                         pause_s=0)
+    for ligne in engine.journal[1][1]:
+        assert ligne["derniere_date_close"] == date(2026, 9, 9)
 
 
 def test_une_exception_sur_un_instrument_n_arrete_pas_le_passage(sqlalchemy_disponible):
